@@ -19,5 +19,8 @@ dirs = "5"
 # https://github.com/ProtonVPN/proton-vpn-cli
 proton-srp = { version = "0.8", features = ["pgpinternal"] }
 
+[dev-dependencies]
+base64 = "0.22"
+
 [profile.release]
 # dev tool; keep default.

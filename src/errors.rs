@@ -10,7 +10,7 @@ pub enum ProtonError {
     Auth,
 
     #[error("SRP error: {0}")]
-    Srp(String),
+    Srp(#[from] proton_srp::SRPError),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

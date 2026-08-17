@@ -50,13 +50,39 @@ pub struct AuthInfo {
 /// `POST /auth/v4/authenticate` response.
 #[derive(Debug, Deserialize)]
 pub struct AuthResponse {
+    #[serde(rename = "AccessToken")]
     pub access_token: Option<String>,
+    #[serde(rename = "RefreshToken")]
     pub refresh_token: Option<String>,
+    #[serde(rename = "UID")]
     pub uid: Option<String>,
     #[serde(rename = "ResponseCode")]
     pub response_code: Option<i32>,
     #[serde(rename = "Error")]
     pub error: Option<String>,
+    // Present only when the server chooses to send its proof; we verify it against the
+    // expected server proof computed during `prove`.
+    #[serde(rename = "ServerProof", default)]
+    pub server_proof: Option<String>,
+}
+
+/// Map the raw `ServerDto.features` bitmask into `VPNServer.features` strings.
+///
+/// `ServerDto.features` is an `i32` bitmask (1 = P2P, 8 = TOR). When the server is a
+/// Secure Core node (`IsSecureCore`), append `"secure-core"`. `find_servers` matches these
+/// strings case-insensitively.
+pub fn features_to_strings(features: i32, is_secure_core: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    if features & 1 != 0 {
+        out.push("p2p".to_string());
+    }
+    if features & 8 != 0 {
+        out.push("tor".to_string());
+    }
+    if is_secure_core {
+        out.push("secure-core".to_string());
+    }
+    out
 }
 
 /// `GET /vpn/v2/account` -> `VPN` sub-object.
