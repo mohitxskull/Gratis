@@ -1,1 +1,0 @@
-/home/skull/Projects/gratis/target/debug/libproton_proxy.rlib: /home/skull/Projects/gratis/src/client.rs /home/skull/Projects/gratis/src/credentials.rs /home/skull/Projects/gratis/src/errors.rs /home/skull/Projects/gratis/src/lib.rs /home/skull/Projects/gratis/src/models.rs /home/skull/Projects/gratis/src/srp.rs /home/skull/Projects/gratis/src/wireguard.rs
