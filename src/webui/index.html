@@ -12,7 +12,7 @@
   th { background: #f2f2f2; }
   button { cursor: pointer; padding: 0.2rem 0.6rem; }
   input { padding: 0.3rem; margin-right: 0.5rem; }
-  #login-status, #msg { font-size: 0.85rem; margin-top: 0.4rem; min-height: 1.2em; }
+  #msg { font-size: 0.85rem; margin-top: 0.4rem; min-height: 1.2em; }
   .err { color: #b00020; }
   .ok { color: #067d17; }
   code { background: #f2f2f2; padding: 0.1rem 0.3rem; }
@@ -20,14 +20,7 @@
 </head>
 <body>
 <h1>proton-proxy</h1>
-
-<h2>Login</h2>
-<form id="login-form">
-  <input type="email" id="email" placeholder="email" required>
-  <input type="password" id="password" placeholder="password" required>
-  <button type="submit">Log in</button>
-</form>
-<div id="login-status"></div>
+<p style="font-size:0.85rem;color:#555">Logged in automatically from <code>.env</code> at startup.</p>
 
 <h2>Locations</h2>
 <button id="refresh-locations">Refresh locations</button>
@@ -62,29 +55,6 @@ async function api(path, opts) {
   }
   return body;
 }
-
-document.getElementById('login-form').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const email = document.getElementById('email').value;
-  const password = document.getElementById('password').value;
-  const statusEl = document.getElementById('login-status');
-  statusEl.textContent = 'Logging in...';
-  statusEl.className = '';
-  try {
-    await api('/api/login', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ email, password }),
-    });
-    statusEl.textContent = 'Logged in.';
-    statusEl.className = 'ok';
-    await loadLocations();
-    await loadTunnels();
-  } catch (err) {
-    statusEl.textContent = 'Login failed: ' + err.message;
-    statusEl.className = 'err';
-  }
-});
 
 async function loadLocations() {
   const tbody = document.querySelector('#locations-table tbody');
@@ -171,6 +141,9 @@ function escapeHtml(s) {
 document.getElementById('refresh-locations').addEventListener('click', loadLocations);
 document.getElementById('refresh-tunnels').addEventListener('click', loadTunnels);
 
+// Login already happened automatically at daemon startup (see .env note above), so load both
+// tables immediately rather than waiting for a login form submit.
+loadLocations();
 loadTunnels();
 </script>
 </body>

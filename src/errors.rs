@@ -26,6 +26,9 @@ pub enum ProtonError {
 
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+
+    #[error("tunnel error: {0}")]
+    Tunnel(#[from] wireguard_netstack::Error),
 }
 
 pub type Result<T> = std::result::Result<T, ProtonError>;

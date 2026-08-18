@@ -46,13 +46,14 @@ async fn spawn_echo_server() -> u16 {
     port
 }
 
-/// Start the SOCKS5 proxy bound to `interface`, returning the port it is listening on.
-async fn spawn_proxy(interface: &str) -> u16 {
+/// Start the SOCKS5 proxy against a loopback test tunnel (no WireGuard/root involved — see
+/// `wireguard::Tunnel::loopback_for_testing`), returning the port it is listening on.
+async fn spawn_proxy() -> u16 {
     let port = free_port();
     let listen_addr = format!("127.0.0.1:{port}");
-    let interface = interface.to_string();
+    let tunnel = std::sync::Arc::new(proton_proxy::wireguard::Tunnel::loopback_for_testing());
     tokio::spawn(async move {
-        let _ = proton_proxy::socks5::run_socks5(&listen_addr, &interface).await;
+        let _ = proton_proxy::socks5::run_socks5(&listen_addr, tunnel).await;
     });
 
     // Give the listener a moment to bind before clients try to connect.
@@ -110,7 +111,7 @@ async fn socks5_request(stream: &mut TcpStream, cmd: u8, target_port: u16) -> u8
 #[tokio::test]
 async fn socks5_relays_tcp_and_survives_idle() {
     let echo_port = spawn_echo_server().await;
-    let proxy_port = spawn_proxy("lo").await;
+    let proxy_port = spawn_proxy().await;
 
     let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
     socks5_handshake(&mut client).await;
@@ -140,7 +141,7 @@ async fn socks5_relays_tcp_and_survives_idle() {
 #[tokio::test]
 async fn socks5_rejects_unsupported_command() {
     let echo_port = spawn_echo_server().await;
-    let proxy_port = spawn_proxy("lo").await;
+    let proxy_port = spawn_proxy().await;
 
     let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
     socks5_handshake(&mut client).await;

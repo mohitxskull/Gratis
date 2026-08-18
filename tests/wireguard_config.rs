@@ -1,13 +1,9 @@
-//! WireGuard config generation + active-tunnel state persistence tests (Task 03, updated
-//! after live-account verification revealed the original server-list/credential model was
-//! wrong — see `models.rs`/`wireguard.rs` doc comments for what changed and why).
-//!
-//! No root privileges and no live WireGuard interface are required: these tests exercise
-//! `generate_config`'s output string and the SQLite-backed `credentials::Store` directly,
-//! against a tempdir DB path (never the real `~/.config/proton-proxy/` directory).
+//! WireGuard tunnel + active-tunnel state persistence tests, updated for the userspace
+//! WireGuard redesign (no more `sudo wg-quick`/text config generation — see `wireguard.rs`'s
+//! doc comment for why). No root privileges and no live WireGuard interface are required.
 use proton_proxy::credentials::Store;
 use proton_proxy::models::{PhysicalServer, VPNCredentials, VPNServer};
-use proton_proxy::wireguard::{CLIENT_ADDRESS, WG_PORT, generate_config, interface_name};
+use proton_proxy::wireguard::{CLIENT_ADDRESS, Tunnel, interface_name};
 
 const TEST_CERT_PEM: &str =
     "-----BEGIN CERTIFICATE-----\ntest-only-placeholder\n-----END CERTIFICATE-----";
@@ -26,8 +22,6 @@ fn test_server() -> VPNServer {
         physical: vec![PhysicalServer {
             entry_ip: "203.0.113.9".into(),
             domain: "node1.us.protonvpn.net".into(),
-            // Deliberately distinct from `entry_ip` so a test that accidentally reads the
-            // wrong field is caught immediately.
             x25519_public_key: "SERVERPUBKEYBASE64==".into(),
             enabled: true,
         }],
@@ -46,67 +40,41 @@ fn test_creds() -> VPNCredentials {
 }
 
 #[test]
-fn config_has_correct_peer_public_key_not_ip() {
-    let server = test_server();
-    let creds = test_creds();
-    let iface = interface_name("us");
-
-    let config = generate_config(&server, &creds, &iface).expect("generate_config");
-
-    assert!(
-        config.contains("PublicKey = SERVERPUBKEYBASE64=="),
-        "config must use the physical server's real X25519 pubkey field:\n{config}"
-    );
-    assert!(
-        !config.contains("PublicKey = 203.0.113.9"),
-        "config must NEVER use entry_ip as the peer public key:\n{config}"
-    );
-    assert!(
-        config.contains(&format!("Endpoint = 203.0.113.9:{WG_PORT}")),
-        "Endpoint must be the picked physical server's entry_ip:{WG_PORT}:\n{config}"
-    );
-    assert!(
-        config.contains("AllowedIPs = 0.0.0.0/0, ::/0"),
-        "AllowedIPs must route everything through the tunnel:\n{config}"
-    );
-    assert!(
-        config.contains("Table = off"),
-        "this is a split tunnel: Table = off must be present:\n{config}"
-    );
+fn interface_name_is_a_stable_lowercase_label() {
+    assert_eq!(interface_name("US"), "proton-us");
+    assert_eq!(interface_name("us"), "proton-us");
 }
 
 #[test]
-fn config_uses_fixed_client_address() {
-    // Flagged gap #3's earlier resolution (deriving the client address from the account
-    // certificate's X.509 SAN) was a best-effort guess made without a live account. Verified
-    // against a live login + the official client's source: every Proton WireGuard connection
-    // uses the same fixed address, not anything derived per-account.
-    let server = test_server();
-    let creds = test_creds();
-    let iface = interface_name("us");
-
-    let config = generate_config(&server, &creds, &iface).expect("generate_config");
-
+fn client_address_is_the_fixed_proton_address() {
+    // Verified against proton.vpn.backend.networkmanager.protocol.wireguard.wireguard:
+    // every Proton WireGuard connection uses this fixed address, never anything derived
+    // per-account or per-connection.
     assert_eq!(CLIENT_ADDRESS, "10.2.0.2");
-    assert!(
-        config.contains("Address = 10.2.0.2/32"),
-        "[Interface] Address must be the fixed CLIENT_ADDRESS:\n{config}"
-    );
-    assert!(
-        !config.contains("Address = 10.8.0.1"),
-        "config must not fall back to the old hardcoded 10.8.0.1/24:\n{config}"
-    );
 }
 
-#[test]
-fn generate_config_errors_without_a_physical_server() {
+#[tokio::test]
+async fn tunnel_connect_errors_without_a_physical_server() {
     let mut server = test_server();
     server.physical.clear();
     let creds = test_creds();
-    let iface = interface_name("us");
 
-    let err = generate_config(&server, &creds, &iface).unwrap_err();
+    let Err(err) = Tunnel::connect(&server, &creds).await else {
+        panic!("expected an error")
+    };
     assert!(format!("{err}").contains("no physical servers"));
+}
+
+#[tokio::test]
+async fn tunnel_connect_errors_on_malformed_key() {
+    let server = test_server();
+    let mut creds = test_creds();
+    creds.wg_private_key = "not valid base64!!".into();
+
+    let Err(err) = Tunnel::connect(&server, &creds).await else {
+        panic!("expected an error")
+    };
+    assert!(format!("{err}").contains("invalid base64 key"));
 }
 
 #[test]

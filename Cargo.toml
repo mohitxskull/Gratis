@@ -19,8 +19,6 @@ dirs = "5"
 # https://github.com/ProtonVPN/proton-vpn-cli
 proton-srp = { version = "0.8", features = ["pgpinternal"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-x509-parser = "0.16"
-socket2 = { version = "0.5", features = ["all"] }
 axum = "0.7"
 # WHY: the WireGuard client identity is generated locally, never issued by the server (Proton
 # hands back a signed certificate for a client-supplied public key, not a private key) —
@@ -29,13 +27,19 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.10"
+# WHY: verified live (raw handshake + real HTTP request/response through a tunnel built with
+# this exact key/config shape) that Proton routes real internet traffic through a bare
+# WireGuard session with no additional "Local Agent" step. This lets the daemon speak
+# WireGuard entirely in-process — no root, no `sudo wg-quick`, no real network interface, no
+# `SO_BINDTODEVICE` — which is a much better fit for "just run the binary" than the
+# root-requiring design the plan originally specified.
+wireguard-netstack = "0.3"
+async-trait = "0.1"
 
 [dev-dependencies]
 base64 = "0.22"
 tempfile = "3"
 tower = { version = "0.4", features = ["util"] }
-boringtun = "0.7"
-etherparse = "0.21"
 
 [profile.release]
 # dev tool; keep default.

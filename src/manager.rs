@@ -1,26 +1,37 @@
-//! Ties together auth (Task 02: `client.rs`), WireGuard (Task 03: `wireguard.rs`), the SOCKS5
-//! proxy (Task 04: `socks5.rs`), and persisted credentials/state (`credentials.rs`) into a
+//! Ties together auth (`client.rs`), the userspace WireGuard tunnel (`wireguard.rs`), the
+//! SOCKS5 proxy (`socks5.rs`), and persisted credentials/state (`credentials.rs`) into a
 //! per-location tunnel manager used by the control API (`src/api.rs`).
+//!
+//! ## No-root architecture
+//!
+//! Tunnels here are in-process userspace WireGuard sessions (see `wireguard.rs`), not real
+//! kernel network interfaces brought up via `sudo wg-quick`. A tunnel is exactly as
+//! long-lived as the `Arc<Tunnel>` referencing it and cannot outlive the daemon process — so
+//! there is no "leaked interface" failure mode, no privileged `is_up` check, and no boot
+//! reconciliation of stale kernel state to get wrong. `stop()` and process exit both simply
+//! drop the tunnel.
 //!
 //! ## Restore-on-startup design decision
 //!
-//! `credentials::load_credentials()` returns a `VPNCredentials` (username/password/certificate/
+//! `credentials::load_credentials()` returns a `VPNCredentials` (username/certificate/
 //! WireGuard keypair) — it does **not** persist a session access token or the Proton server
 //! list. `ProtonVPNClient::find_servers` operates on an in-memory `server_list` that is only
 //! populated by an authenticated `fetch_servers()` call, and `fetch_servers()` requires a bearer
 //! token from a live `login()`. There is therefore no way to serve `/api/locations` or `start()`
 //! from persisted state alone without re-authenticating against the API.
 //!
-//! We take option (b) from the task brief: saved credentials are informational only at
-//! startup (`TunnelManager::has_saved_credentials` lets `main.rs` log "credentials found, but a
-//! fresh login is still required"); `list_locations`/`start` always require an in-process
-//! `login()` (via `POST /api/login`) to populate `client` with a fresh token + server list.
-//! `POST /api/login` remains the single, always-working primary path.
+//! Saved credentials are informational only at startup (`TunnelManager::has_saved_credentials`
+//! lets `main.rs` log "credentials found, but a fresh login is still required");
+//! `list_locations`/`start` always require an in-process `login()` (via `POST /api/login`) to
+//! populate `client` with a fresh token + server list. `POST /api/login` remains the single,
+//! always-working primary path.
 use crate::client::ProtonVPNClient;
 use crate::credentials;
 use crate::errors::*;
+use crate::models::{VPNCredentials, VPNServer};
 use crate::socks5;
-use crate::wireguard;
+use crate::wireguard::{self, SharedTunnel, Tunnel};
+use async_trait::async_trait;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -30,60 +41,53 @@ use tokio::task::JoinHandle;
 
 /// Seam for testing `TunnelManager` without root/live WireGuard/network access.
 ///
-/// `wireguard::up`/`down` are free functions (not trait objects), and `socks5::run_socks5`
-/// binds a real listener and runs forever. To unit-test `TunnelManager`'s bookkeeping
-/// (`manager_start_stop_tracks_state`) without any of that, the manager is generic over this
-/// trait: production code uses `RealDriver` (which just calls through to `wireguard`/
-/// `socks5`), and tests use a `FakeDriver` that records calls and spawns an inert task instead
-/// of a real SOCKS5 listener.
+/// Production code uses `RealDriver` (which just calls through to `wireguard`/`socks5`), and
+/// tests use a `FakeDriver` that records calls and spawns an inert task instead of a real
+/// tunnel/SOCKS5 listener.
+#[async_trait]
 pub trait TunnelDriver: Send + Sync {
-    /// Bring the WireGuard interface up. Blocking (shells to `sudo wg-quick`); callers must
-    /// run this inside `spawn_blocking`.
-    fn wg_up(&self, interface: &str, config: &str) -> Result<()>;
-
-    /// Tear the WireGuard interface down. Blocking; same calling convention as `wg_up`.
-    fn wg_down(&self, interface: &str) -> Result<()>;
-
-    /// Whether `interface` currently has a live WireGuard device. Blocking; same calling
-    /// convention as `wg_up`/`wg_down`. Used by `stop()` to make teardown idempotent against
-    /// an interface that's already down (e.g. torn down externally, or by boot reconciliation
-    /// in a previous process).
-    fn is_up(&self, interface: &str) -> bool;
+    /// Bring up a userspace WireGuard tunnel to `server`, using `creds`.
+    async fn connect_tunnel(
+        &self,
+        server: &VPNServer,
+        creds: &VPNCredentials,
+    ) -> Result<SharedTunnel>;
 
     /// Spawn whatever serves this location's SOCKS5 proxy, returning its `JoinHandle` so the
     /// manager can `abort()` it on `stop()`.
-    fn spawn_socks5(&self, listen_addr: String, interface: String) -> JoinHandle<()>;
+    fn spawn_socks5(&self, listen_addr: String, tunnel: SharedTunnel) -> JoinHandle<()>;
 }
 
-/// Production driver: shells to real `wg-quick` and binds a real SOCKS5 listener.
+/// Production driver: brings up a real userspace WireGuard tunnel and binds a real SOCKS5
+/// listener.
 pub struct RealDriver;
 
+#[async_trait]
 impl TunnelDriver for RealDriver {
-    fn wg_up(&self, interface: &str, config: &str) -> Result<()> {
-        wireguard::up(interface, config)
+    async fn connect_tunnel(
+        &self,
+        server: &VPNServer,
+        creds: &VPNCredentials,
+    ) -> Result<SharedTunnel> {
+        let tunnel = Tunnel::connect(server, creds).await?;
+        Ok(Arc::new(tunnel))
     }
 
-    fn wg_down(&self, interface: &str) -> Result<()> {
-        wireguard::down(interface)
-    }
-
-    fn is_up(&self, interface: &str) -> bool {
-        wireguard::is_up(interface)
-    }
-
-    fn spawn_socks5(&self, listen_addr: String, interface: String) -> JoinHandle<()> {
+    fn spawn_socks5(&self, listen_addr: String, tunnel: SharedTunnel) -> JoinHandle<()> {
         tokio::spawn(async move {
-            if let Err(err) = socks5::run_socks5(&listen_addr, &interface).await {
-                // Secrets are never in scope here (listen_addr/interface only); safe to log.
-                eprintln!("socks5 listener on {listen_addr} ({interface}) exited: {err}");
+            if let Err(err) = socks5::run_socks5(&listen_addr, tunnel).await {
+                eprintln!("socks5 listener on {listen_addr} exited: {err}");
             }
         })
     }
 }
 
-/// A tracked, running tunnel: the WireGuard interface it uses, the SOCKS5 port it's bound to,
-/// and the `JoinHandle` of the task serving that SOCKS5 proxy.
+/// A tracked, running tunnel: the shared handle to it, the SOCKS5 port it's bound to, the
+/// display label (`GET /api/tunnels`'s `interface` field — no longer a real OS interface, see
+/// the module doc comment), and the `JoinHandle` of the task serving that SOCKS5 proxy.
 struct TunnelHandle {
+    #[allow(dead_code)] // held only to keep the tunnel alive until this handle is dropped
+    tunnel: SharedTunnel,
     interface: String,
     socks_port: u16,
     task: JoinHandle<()>,
@@ -104,23 +108,25 @@ pub struct TunnelInfo {
     pub location: String,
     pub interface: String,
     pub socks_port: u16,
-    /// Whether the SOCKS5 task backing this tunnel is still running. Derived from
-    /// `JoinHandle::is_finished()` rather than shelling out to `wg show` (`wireguard::is_up`)
-    /// on every poll — it's in-process, free, and good enough for the admin UI's purposes; a
-    /// tunnel whose WireGuard interface died independently of its SOCKS5 task would still show
-    /// `connected: true` here (a known limitation, documented rather than silently assumed
-    /// away).
+    /// Whether the SOCKS5 task backing this tunnel is still running, derived from
+    /// `JoinHandle::is_finished()`.
     pub connected: bool,
 }
 
-/// Permissive account tier used for `find_servers`'s `user_tier` filter: `client.rs`/
-/// `models.rs` don't currently surface the account's actual tier anywhere the manager can read
-/// it (Task 02's `VPNCredentials`/`AccountResponse` don't carry it), so we pass the maximum
-/// possible tier to effectively disable the tier filter. This means `start()` may pick servers
-/// above the account's actual entitlement if Proton's `/vpn/v1/servers` response includes them
-/// (it may not — free-tier accounts likely only see servers they can use) — documented as a
-/// known gap for a future task once the account response's plan/tier field is confirmed.
-const PERMISSIVE_TIER: i32 = i32::MAX;
+/// Account tier used for `find_servers`'s `user_tier` filter.
+///
+/// `client.rs`/`models.rs` don't currently surface the account's actual tier anywhere the
+/// manager can read it. This was previously `i32::MAX` (disabling the filter entirely) — **
+/// confirmed live to be a real bug, not just a theoretical gap**: with the filter disabled,
+/// `find_servers` picks the globally lowest-load server regardless of tier, which for a
+/// free-tier test account selected a tier-2 (paid) server. The WireGuard handshake succeeded
+/// (it authenticates by keypair, not by tier), but Proton silently dropped all subsequent
+/// data traffic — the symptom was indistinguishable from a relay bug (TCP connects, a write
+/// succeeds, no response ever arrives) until traced back to the server selection. Defaulting
+/// to `0` (free tier) is the safe, conservative choice: it never selects a server above what
+/// every account is entitled to, at the cost of paid-tier accounts not getting access to
+/// plus-tier servers until the real account tier is threaded through from the API.
+const PERMISSIVE_TIER: i32 = 0;
 
 pub struct TunnelManager {
     client: AsyncMutex<Option<ProtonVPNClient>>,
@@ -133,17 +139,16 @@ pub struct TunnelManager {
     next_port_index: AtomicU16,
     driver: Arc<dyn TunnelDriver>,
     /// Per-location async locks serializing `start()`/`stop()` for a given location, so the
-    /// whole `wg_up -> credentials::set_active -> spawn_socks5 -> tunnels.insert` sequence
-    /// (and the mirrored `stop()` sequence) is atomic with respect to concurrent calls for the
-    /// *same* location — see `location_lock`. Distinct locations proceed independently: each
-    /// gets its own `tokio::sync::Mutex`. Entries are never removed once created (the key
-    /// space is bounded by the small, roughly-fixed set of country codes Proton exposes, so
-    /// this is a deliberate, harmless simplification rather than an unbounded leak).
+    /// whole `connect_tunnel -> credentials::set_active -> spawn_socks5 -> tunnels.insert`
+    /// sequence (and the mirrored `stop()` sequence) is atomic with respect to concurrent
+    /// calls for the *same* location. Distinct locations proceed independently. Entries are
+    /// never removed once created (the key space is bounded by the small, roughly-fixed set
+    /// of country codes Proton exposes).
     start_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
 }
 
 impl TunnelManager {
-    /// Build a manager using the real WireGuard/SOCKS5 driver.
+    /// Build a manager using the real tunnel/SOCKS5 driver.
     pub fn new(socks_base_port: u16) -> Self {
         Self::with_driver(socks_base_port, Arc::new(RealDriver))
     }
@@ -178,8 +183,8 @@ impl TunnelManager {
         credentials::load_credentials().is_ok()
     }
 
-    /// Authenticate via SRP (Task 02), fetch the server list, persist credentials, and store
-    /// the live client for `list_locations`/`start` to use.
+    /// Authenticate via SRP, fetch the server list, persist credentials, and store the live
+    /// client for `list_locations`/`start` to use.
     pub async fn login(&self, email: &str, password: &str) -> Result<()> {
         let mut client = ProtonVPNClient::new(email);
         let creds = client.login(email, password).await?;
@@ -220,16 +225,6 @@ impl TunnelManager {
 
     /// Normalize a caller-supplied `location` (country code) to the canonical form used as the
     /// `tunnels`/`start_locks`/`active_tunnels` key: uppercase, exactly two ASCII letters.
-    ///
-    /// Fixes finding #5: `find_servers` already compares country codes case-insensitively, but
-    /// without this, `"US"` and `"us"` would be tracked as two distinct entries (two distinct
-    /// per-location locks, two distinct map keys) that both resolve to the same
-    /// `wireguard::interface_name` (which lowercases internally) — the second `wg-quick up`
-    /// for that interface then fails, silently defeating the double-start protection
-    /// `location_lock` provides. Validating the shape here also means an invalid value (e.g.
-    /// `"../../x"`) is rejected before it ever reaches `wireguard::interface_name`/
-    /// `wireguard::config_path`, rather than being incidentally blocked only because it happens
-    /// to match no server's `country_code`.
     fn normalize_location(location: &str) -> Result<String> {
         let upper = location.to_ascii_uppercase();
         if upper.len() == 2 && upper.bytes().all(|b| b.is_ascii_alphabetic()) {
@@ -252,13 +247,10 @@ impl TunnelManager {
             return Ok(port);
         }
 
-        // Serialize the whole wg_up -> set_active -> spawn -> insert sequence per location so
-        // two concurrent `start()` calls for a location that isn't tracked yet (e.g. a
-        // double-clicked "Start" button in the web UI, which has no in-flight guard) can't
-        // both bring the WireGuard interface up and both write a `credentials::set_active`
-        // row keyed by the same location — whichever write landed second used to silently win
-        // in SQLite regardless of which racer's in-memory `TunnelHandle` ended up tracked.
-        // Distinct locations use distinct locks and are unaffected.
+        // Serialize the whole connect_tunnel -> set_active -> spawn -> insert sequence per
+        // location so two concurrent `start()` calls for a location that isn't tracked yet
+        // (e.g. a double-clicked "Start" button in the web UI) can't both bring a tunnel up
+        // and both write a `credentials::set_active` row keyed by the same location.
         let lock = self.location_lock(location);
         let _guard = lock.lock().await;
 
@@ -286,50 +278,31 @@ impl TunnelManager {
             (server, creds)
         };
 
-        let interface = wireguard::interface_name(location);
-        let config = wireguard::generate_config(&server, &creds, &interface)?;
-
-        let driver = self.driver.clone();
-        let up_interface = interface.clone();
-        tokio::task::spawn_blocking(move || driver.wg_up(&up_interface, &config))
-            .await
-            .map_err(|e| ProtonError::Config(format!("wg up task panicked: {e}")))??;
+        let tunnel = self.driver.connect_tunnel(&server, &creds).await?;
 
         let idx = self.next_port_index.fetch_add(1, Ordering::SeqCst);
         let socks_port = self.socks_base_port + idx;
+        let interface = wireguard::interface_name(location);
 
-        // Record the active tunnel in the persisted store first (so `list_active`/other
-        // process invocations see it as soon as WireGuard is up), then spawn the proxy.
+        // Record the active tunnel in the persisted store first, then spawn the proxy.
         //
-        // Fixes finding #4: if this fails (disk full, DB locked, permissions) `wg_up` above
-        // has already succeeded, so without cleanup the interface would be left up with
-        // nothing tracked/persisted for it — a leak `stop()` can never find, since nothing is
-        // tracked for this location. Best-effort bring the interface back down before
-        // propagating the original error; a cleanup failure is logged but never masks it.
-        if let Err(err) = credentials::set_active(location, &interface, socks_port) {
-            let driver = self.driver.clone();
-            let cleanup_interface = interface.clone();
-            match tokio::task::spawn_blocking(move || driver.wg_down(&cleanup_interface)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(cleanup_err)) => eprintln!(
-                    "proton-proxy: failed to clean up interface {interface} after start() failed for location {location}: {cleanup_err}"
-                ),
-                Err(join_err) => eprintln!(
-                    "proton-proxy: cleanup task panicked after start() failed for location {location}: {join_err}"
-                ),
-            }
-            return Err(err);
-        }
+        // If this fails (disk full, DB locked, permissions), nothing else has happened yet
+        // that needs cleanup: `tunnel` is our only reference to it, so returning here simply
+        // drops it — its background tasks abort via `Drop` (see `wireguard::SharedTunnel`'s
+        // doc comment). Unlike the old `sudo wg-quick`-based design, there is no real
+        // interface that could be left up with nothing tracking it.
+        credentials::set_active(location, &interface, socks_port)?;
 
         let listen_addr = format!("127.0.0.1:{socks_port}");
-        let task = self.driver.spawn_socks5(listen_addr, interface.clone());
+        let task = self.driver.spawn_socks5(listen_addr, tunnel.clone());
 
         // No race to check for here any more: `_guard` has held this location's lock for the
-        // entire `wg_up -> set_active -> spawn` sequence above, so no concurrent `start()` for
-        // `location` could have run any of it in the meantime.
+        // entire sequence above, so no concurrent `start()` for `location` could have run any
+        // of it in the meantime.
         self.tunnels.lock().unwrap().insert(
             location.to_string(),
             TunnelHandle {
+                tunnel,
                 interface,
                 socks_port,
                 task,
@@ -348,60 +321,27 @@ impl TunnelManager {
 
     /// Tear down the tunnel + SOCKS5 proxy for `location`.
     ///
-    /// Fixes finding #2: state (the in-memory `TunnelHandle` and the persisted
-    /// `active_tunnels` row) is only dropped *after* teardown is confirmed, not before. The
-    /// old ordering removed the handle and aborted the SOCKS5 task before the fallible
-    /// `wg_down` call ran; if `wg_down` failed for any reason, the tunnel was permanently
-    /// orphaned — no handle to retry with, no way back except manual intervention. Now, if
-    /// `wg_down` fails, the tunnel is left tracked (still marked up) and the error is
-    /// propagated so the caller can retry `stop()`.
-    ///
-    /// Also idempotent against an interface that's already down (e.g. torn down externally, or
-    /// by a previous process's boot reconciliation that didn't get to clear the DB row): checks
-    /// `driver.is_up` first, and treats "already down" as a no-op success rather than erroring.
+    /// Unlike the old `sudo wg-quick`-based design, teardown cannot fail: there is no external
+    /// process to shell out to. Aborting the SOCKS5 task and dropping the tunnel's last
+    /// `Arc` reference is teardown.
     pub async fn stop(&self, location: &str) -> Result<()> {
         let location = Self::normalize_location(location)?;
         let location = location.as_str();
 
         // Shares the same per-location lock `start()` uses, so a `stop()` racing a `start()`
-        // for the same location can't interleave with the latter's wg_up/set_active/spawn
+        // for the same location can't interleave with the latter's connect/set_active/spawn
         // sequence.
         let lock = self.location_lock(location);
         let _guard = lock.lock().await;
 
-        let interface = {
-            let tunnels = self.tunnels.lock().unwrap();
-            match tunnels.get(location) {
-                Some(handle) => handle.interface.clone(),
-                None => {
-                    return Err(ProtonError::Config(format!(
-                        "no active tunnel for location {location}"
-                    )));
-                }
-            }
+        let handle = self.tunnels.lock().unwrap().remove(location);
+        let Some(handle) = handle else {
+            return Err(ProtonError::Config(format!(
+                "no active tunnel for location {location}"
+            )));
         };
-
-        let driver = self.driver.clone();
-        let check_interface = interface.clone();
-        let is_up = tokio::task::spawn_blocking(move || driver.is_up(&check_interface))
-            .await
-            .map_err(|e| ProtonError::Config(format!("wg is_up task panicked: {e}")))?;
-
-        if is_up {
-            let driver = self.driver.clone();
-            let down_interface = interface.clone();
-            // If this fails, deliberately return *before* touching `self.tunnels` or the DB
-            // below: the tunnel stays tracked so the caller can retry.
-            tokio::task::spawn_blocking(move || driver.wg_down(&down_interface))
-                .await
-                .map_err(|e| ProtonError::Config(format!("wg down task panicked: {e}")))??;
-        }
-
-        // Teardown confirmed (or was already a no-op because the interface was already down):
-        // only now is it safe to drop in-memory/persisted state.
-        if let Some(handle) = self.tunnels.lock().unwrap().remove(location) {
-            handle.task.abort();
-        }
+        handle.task.abort();
+        drop(handle); // drops the tunnel's Arc reference; background tasks abort via Drop
 
         credentials::clear_active(location)?;
         Ok(())
@@ -431,49 +371,34 @@ mod tests {
     /// concurrently on separate OS threads by default. Every test below that points
     /// `credentials::*`'s free functions (which read `HOME`/`XDG_CONFIG_HOME` on every call)
     /// at a scratch tempdir must hold this lock for its *entire* body — not just while calling
-    /// `env::set_var` — so no two such tests interleave (one test's tempdir could otherwise be
-    /// torn down, or its env vars overwritten, mid another test's `credentials::set_active`/
-    /// `list_active` call). A `tokio::sync::Mutex` (not `std::sync::Mutex`) is used
-    /// specifically so the guard can be held safely across `.await` points.
+    /// `env::set_var` — so no two such tests interleave. A `tokio::sync::Mutex` (not
+    /// `std::sync::Mutex`) is used specifically so the guard can be held safely across `.await`
+    /// points.
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    /// Records `wg_up`/`wg_down`/`is_up` calls (no real WireGuard) and spawns an inert task
+    /// Records `connect_tunnel` calls (no real WireGuard/network) and spawns an inert task
     /// instead of a real SOCKS5 listener, so `TunnelManager` bookkeeping can be tested without
-    /// root.
-    ///
-    /// Configurable so tests can simulate the failure modes findings #2/#4 fixed: `fail_down`
-    /// makes `wg_down` return `Err` (simulating a hung `sudo`/a `wg-quick down` failure), and
-    /// `already_down` lets a test mark specific interfaces as already-torn-down so `is_up`
-    /// reports `false` for them (simulating an interface that died externally).
+    /// root or network access.
     #[derive(Default)]
     struct FakeDriver {
-        up_calls: Mutex<Vec<String>>,
-        down_calls: Mutex<Vec<String>>,
-        fail_down: std::sync::atomic::AtomicBool,
-        already_down: Mutex<std::collections::HashSet<String>>,
+        connect_calls: Mutex<Vec<String>>,
     }
 
+    #[async_trait]
     impl TunnelDriver for FakeDriver {
-        fn wg_up(&self, interface: &str, _config: &str) -> Result<()> {
-            self.up_calls.lock().unwrap().push(interface.to_string());
-            Ok(())
+        async fn connect_tunnel(
+            &self,
+            server: &VPNServer,
+            _creds: &VPNCredentials,
+        ) -> Result<SharedTunnel> {
+            self.connect_calls
+                .lock()
+                .unwrap()
+                .push(server.country_code.clone());
+            Ok(Arc::new(Tunnel::loopback_for_testing()))
         }
 
-        fn wg_down(&self, interface: &str) -> Result<()> {
-            self.down_calls.lock().unwrap().push(interface.to_string());
-            if self.fail_down.load(Ordering::SeqCst) {
-                return Err(ProtonError::Config(
-                    "simulated wg-quick down failure".into(),
-                ));
-            }
-            Ok(())
-        }
-
-        fn is_up(&self, interface: &str) -> bool {
-            !self.already_down.lock().unwrap().contains(interface)
-        }
-
-        fn spawn_socks5(&self, _listen_addr: String, _interface: String) -> JoinHandle<()> {
+        fn spawn_socks5(&self, _listen_addr: String, _tunnel: SharedTunnel) -> JoinHandle<()> {
             tokio::spawn(async {
                 // Stand in for `run_socks5`'s infinite accept loop: never returns on its own,
                 // only via `abort()`, matching the real driver's task shape.
@@ -483,24 +408,19 @@ mod tests {
     }
 
     fn test_manager() -> TunnelManager {
-        // Use a scratch HOME so credentials::set_active/clear_active (which hit the real
-        // `~/.config/proton-proxy/proton-proxy.db`) don't touch the developer's actual store.
         TunnelManager::with_driver(11000, Arc::new(FakeDriver::default()))
     }
 
     /// Directly exercises the tunnel-tracking bookkeeping without going through `start()`'s
-    /// network/login path (which needs a live client) — this is the "lower-level test-only
-    /// bypass" seam variant, layered on top of the `TunnelDriver` injection so the WireGuard
-    /// and SOCKS5 side effects are faked too.
+    /// network/login path (which needs a live client): inserts a tunnel directly through the
+    /// same private fields `start`/`stop` use.
     #[tokio::test]
     async fn manager_start_stop_tracks_state() {
         let _env_guard = ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         // SAFETY: env vars are process-global; `_env_guard` (held for this whole test)
         // serializes this test against the other `HOME`/`XDG_CONFIG_HOME`-mutating tests in
-        // this module so they never interleave. Tests elsewhere in the crate that touch
-        // credentials use `Store::open` with an explicit path, not the free functions, so
-        // they're unaffected either way.
+        // this module so they never interleave.
         unsafe {
             std::env::set_var("HOME", tmp.path());
             std::env::set_var("XDG_CONFIG_HOME", tmp.path());
@@ -508,22 +428,15 @@ mod tests {
 
         let manager = test_manager();
 
-        // Bypass login/find_servers (no live account) by inserting a tunnel directly through
-        // the same code path `start()` uses after server selection, minus the client lookup:
-        // simplest is to fake a full server+creds pair and drive the rest of `start()`'s body
-        // via a second, minimal constructor-free helper. Since `start()` requires a logged-in
-        // client, and building one needs the network, we instead assert the *documented*
-        // contract at the level available without a live account: manual bookkeeping via the
-        // same private fields `start`/`stop` use, proving `tunnels()`/`stop()` behave
-        // correctly given a tracked tunnel.
         {
             let task = manager.driver.spawn_socks5(
                 "127.0.0.1:11000".to_string(),
-                wireguard::interface_name("US"),
+                Arc::new(Tunnel::loopback_for_testing()),
             );
             manager.tunnels.lock().unwrap().insert(
                 "US".to_string(),
                 TunnelHandle {
+                    tunnel: Arc::new(Tunnel::loopback_for_testing()),
                     interface: wireguard::interface_name("US"),
                     socks_port: 11000,
                     task,
@@ -549,29 +462,8 @@ mod tests {
         assert!(manager.stop("US").await.is_err());
     }
 
-    /// A self-signed test certificate (RSA-2048, `CN=proton-test`) with a single SAN IP entry
-    /// of `10.2.0.5` — the same fixture `tests/wireguard_config.rs` uses (duplicated here
-    /// since unit tests in `src/` can't reach files under `tests/`). Contains no real account
-    /// data.
-    const TEST_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
-MIIDHjCCAgagAwIBAgIUa/5mCrPYf855/Ob4AvhLmbKnZwAwDQYJKoZIhvcNAQEL
-BQAwFjEUMBIGA1UEAwwLcHJvdG9uLXRlc3QwHhcNMjYwODE4MTAxNDA4WhcNMzYw
-ODE1MTAxNDA4WjAWMRQwEgYDVQQDDAtwcm90b24tdGVzdDCCASIwDQYJKoZIhvcN
-AQEBBQADggEPADCCAQoCggEBAJ7s1rNtRRsqNoiIt9ov2P+J0sy8Cl68Y1YmM7lG
-aQZ7rqajQqBlF0HSEv2OTF5biPHb9aaTxeZoPeoull7qWPbQwmqXxLSWu0Swtxga
-KWXclWrXlh3zPsoVcTZDarhHk0oTs4v9fXkuctacNB/sHm0Auv8DshAJLXNYpoWH
-peaUzDsd5/jT375E7RRkCeInov7c7hso5JyMxY7U8EFawUexObbe6Q5WELpTcIFz
-rino9srIz6+bhx5cIltluPXoTH279Lmr9q1sXTedwMbtrErJxZrAiP/JmsPeaNvc
-JUxwSt6lvgMAJZSWT8vQKMbEuwLYYzrMrKtn5c0sJrPDW+MCAwEAAaNkMGIwHQYD
-VR0OBBYEFABogFWxB2xkPbxu9+mJPG9uTIqKMB8GA1UdIwQYMBaAFABogFWxB2xk
-Pbxu9+mJPG9uTIqKMA8GA1UdEwEB/wQFMAMBAf8wDwYDVR0RBAgwBocECgIABTAN
-BgkqhkiG9w0BAQsFAAOCAQEAVgl0pqpn0wfdxBC/m07PA8+ngXXN4eLHypQYePSF
-QsEiyu8ZfSPy2CRaIa/660Z9cMcwxaMABesO4Cu0R0GEvuSQSE5ZCSfiAQqmb/nw
-/OGp7+4zfDqbaaxuZSoozAgj1VoOCp1OCUWxfcdvoXwqUbwslS+BrdymNOdr1d7y
-TJcG6MxOvCjdoIEyDVsXmOFhqEtpvte7jRvPncz8DdG1n4ukl5cdVvuAzY4jHP8j
-rxA/XsUNPp08PNpGI34w1X7prwi/VLkAkGEeY1wNufP1/IVXW+ahOfNvcGLJQJVf
-eRd1dKRVcDggq2K+vBNH5fXpGufy8FPBsFFnA5ZDGFrqpg==
------END CERTIFICATE-----";
+    const TEST_CERT_PEM: &str =
+        "-----BEGIN CERTIFICATE-----\ntest-only-placeholder\n-----END CERTIFICATE-----";
 
     fn test_server(location: &str) -> crate::models::VPNServer {
         crate::models::VPNServer {
@@ -606,7 +498,7 @@ eRd1dKRVcDggq2K+vBNH5fXpGufy8FPBsFFnA5ZDGFrqpg==
 
     /// Builds a `ProtonVPNClient` pre-populated with a fake server list + credentials, without
     /// any network call (`ProtonVPNClient`'s fields are all `pub`, so this bypasses `login()`/
-    /// `fetch_servers()` entirely — the same trick Task 02/03's own tests use for the DTOs).
+    /// `fetch_servers()` entirely).
     fn fake_logged_in_client(location: &str) -> ProtonVPNClient {
         let mut client = ProtonVPNClient::new("test-user");
         client.vpn_credentials = Some(test_creds());
@@ -614,9 +506,6 @@ eRd1dKRVcDggq2K+vBNH5fXpGufy8FPBsFFnA5ZDGFrqpg==
         client
     }
 
-    /// Like `scratch_manager`, but lets the caller keep hold of the `Arc<FakeDriver>` (rather
-    /// than a type-erased `Arc<dyn TunnelDriver>`) so it can inspect recorded calls / flip
-    /// `fail_down` / mark interfaces `already_down` after building the manager.
     fn scratch_manager_with_driver(base_port: u16, driver: Arc<FakeDriver>) -> TunnelManager {
         let tmp = tempfile::tempdir().unwrap();
         // SAFETY: see the note in `manager_start_stop_tracks_state` above.
@@ -636,8 +525,8 @@ eRd1dKRVcDggq2K+vBNH5fXpGufy8FPBsFFnA5ZDGFrqpg==
 
     /// Drives `start()`'s real new-tunnel path (not just the idempotent short-circuit
     /// `manager_start_stop_tracks_state` exercises): a logged-in (faked) client selects a
-    /// server, `wg_up`/`spawn_socks5` are faked via `FakeDriver`, and the tunnel ends up
-    /// tracked with a deterministic port.
+    /// server, `connect_tunnel`/`spawn_socks5` are faked via `FakeDriver`, and the tunnel ends
+    /// up tracked with a deterministic port.
     #[tokio::test]
     async fn manager_start_drives_new_tunnel_path() {
         let _env_guard = ENV_LOCK.lock().await;
@@ -666,11 +555,11 @@ eRd1dKRVcDggq2K+vBNH5fXpGufy8FPBsFFnA5ZDGFrqpg==
         assert!(credentials::list_active().unwrap().is_empty());
     }
 
-    /// Reproduces the double-start race the review flagged: two concurrent `start()` calls for
-    /// a location that isn't tracked yet (e.g. a double-clicked "Start" button) must not both
-    /// bring the tunnel up / both write `credentials::set_active` rows — the per-location lock
-    /// in `location_lock` must serialize them so exactly one `TunnelHandle` and one persisted
-    /// `active_tunnels` row result, both agreeing on the same port.
+    /// Reproduces the double-start race a prior review flagged: two concurrent `start()` calls
+    /// for a location that isn't tracked yet (e.g. a double-clicked "Start" button) must not
+    /// both bring a tunnel up / both write `credentials::set_active` rows — the per-location
+    /// lock in `location_lock` must serialize them so exactly one `TunnelHandle` and one
+    /// persisted `active_tunnels` row result, both agreeing on the same port.
     #[tokio::test]
     async fn manager_start_concurrent_same_location_is_serialized() {
         let _env_guard = ENV_LOCK.lock().await;
@@ -688,10 +577,6 @@ eRd1dKRVcDggq2K+vBNH5fXpGufy8FPBsFFnA5ZDGFrqpg==
         // Both callers must observe the same winning port.
         assert_eq!(port_a, port_b);
 
-        // Exactly one tracked tunnel, and the persisted store agrees with the in-memory map on
-        // which port won — this is the specific desync the review flagged (`set_active` being
-        // called unconditionally by both racers, independent of which racer's in-memory
-        // `TunnelHandle` ended up tracked).
         let snapshot = manager.tunnels();
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].socks_port, port_a);
@@ -701,99 +586,18 @@ eRd1dKRVcDggq2K+vBNH5fXpGufy8FPBsFFnA5ZDGFrqpg==
         assert_eq!(active[0].socks_port, port_a);
     }
 
-    /// Finding #2: if `wg_down` fails, `stop()` must leave the tunnel tracked (not orphan it)
-    /// and propagate the error, rather than removing the in-memory/persisted state first and
-    /// then discovering teardown failed.
+    /// If the post-`connect_tunnel` step (`credentials::set_active`) fails, `start()` must
+    /// leave nothing tracked/persisted — the tunnel `connect_tunnel` returned is simply
+    /// dropped (no real interface exists that could leak).
     #[tokio::test]
-    async fn manager_stop_leaves_tunnel_tracked_when_wg_down_fails() {
-        let _env_guard = ENV_LOCK.lock().await;
-        let driver = Arc::new(FakeDriver::default());
-        driver.fail_down.store(true, Ordering::SeqCst);
-        let manager = scratch_manager_with_driver(14000, driver.clone());
-
-        // Bypass start()'s network/login path (same technique as
-        // `manager_start_stop_tracks_state`): insert a tunnel directly.
-        let task = manager.driver.spawn_socks5(
-            "127.0.0.1:14000".to_string(),
-            wireguard::interface_name("US"),
-        );
-        manager.tunnels.lock().unwrap().insert(
-            "US".to_string(),
-            TunnelHandle {
-                interface: wireguard::interface_name("US"),
-                socks_port: 14000,
-                task,
-            },
-        );
-        credentials::set_active("US", &wireguard::interface_name("US"), 14000).unwrap();
-
-        // wg_down fails -> stop() must error, and the tunnel must still be tracked/persisted.
-        assert!(manager.stop("US").await.is_err());
-        assert_eq!(
-            manager.tunnels().len(),
-            1,
-            "tunnel must stay tracked after a failed teardown"
-        );
-        assert_eq!(
-            credentials::list_active().unwrap().len(),
-            1,
-            "active_tunnels row must stay persisted after a failed teardown"
-        );
-
-        // Retrying after the underlying failure clears must succeed and actually tear down.
-        driver.fail_down.store(false, Ordering::SeqCst);
-        manager.stop("US").await.unwrap();
-        assert!(manager.tunnels().is_empty());
-        assert!(credentials::list_active().unwrap().is_empty());
-    }
-
-    /// Finding #2: `stop()` must be idempotent against an interface that's already down (e.g.
-    /// torn down externally) — it should treat that as a no-op success (never calling
-    /// `wg_down`) rather than erroring, and still clear tracked/persisted state.
-    #[tokio::test]
-    async fn manager_stop_is_idempotent_when_interface_already_down() {
-        let _env_guard = ENV_LOCK.lock().await;
-        let driver = Arc::new(FakeDriver::default());
-        let iface = wireguard::interface_name("US");
-        driver.already_down.lock().unwrap().insert(iface.clone());
-        let manager = scratch_manager_with_driver(14100, driver.clone());
-
-        let task = manager
-            .driver
-            .spawn_socks5("127.0.0.1:14100".to_string(), iface.clone());
-        manager.tunnels.lock().unwrap().insert(
-            "US".to_string(),
-            TunnelHandle {
-                interface: iface.clone(),
-                socks_port: 14100,
-                task,
-            },
-        );
-        credentials::set_active("US", &iface, 14100).unwrap();
-
-        manager.stop("US").await.unwrap();
-
-        assert!(
-            driver.down_calls.lock().unwrap().is_empty(),
-            "wg_down must not be called for an already-down interface"
-        );
-        assert!(manager.tunnels().is_empty());
-        assert!(credentials::list_active().unwrap().is_empty());
-    }
-
-    /// Finding #4: if the post-`wg_up` step (`credentials::set_active`) fails, `start()` must
-    /// best-effort bring the interface back down rather than leaking it with nothing
-    /// tracked/persisted for it.
-    #[tokio::test]
-    async fn manager_start_cleans_up_interface_on_set_active_failure() {
+    async fn manager_start_cleans_up_on_set_active_failure() {
         let _env_guard = ENV_LOCK.lock().await;
         let driver = Arc::new(FakeDriver::default());
         let manager = scratch_manager_with_driver(14200, driver.clone());
         *manager.client.lock().await = Some(fake_logged_in_client("US"));
 
         // Force the DB file into existence, then make it read-only so the `set_active` call
-        // inside `start()` fails with a permissions error, simulating "disk full/DB
-        // locked/permissions" from the finding.
+        // inside `start()` fails with a permissions error.
         credentials::set_active("ZZ", "proton-zz", 1).unwrap();
         let db_path = credentials::db_path().unwrap();
         let mut perms = std::fs::metadata(&db_path).unwrap().permissions();
@@ -811,20 +615,15 @@ eRd1dKRVcDggq2K+vBNH5fXpGufy8FPBsFFnA5ZDGFrqpg==
             "nothing should be left tracked"
         );
         assert_eq!(
-            driver.up_calls.lock().unwrap().as_slice(),
-            [wireguard::interface_name("US")],
-            "wg_up must have been called once before the failure"
-        );
-        assert_eq!(
-            driver.down_calls.lock().unwrap().as_slice(),
-            [wireguard::interface_name("US")],
-            "best-effort cleanup must have called wg_down for the interface wg_up brought up"
+            driver.connect_calls.lock().unwrap().as_slice(),
+            ["US"],
+            "connect_tunnel must have been called once before the failure"
         );
     }
 
-    /// Finding #5: `"us"` and `"US"` must resolve to the same tracked entry / the same
-    /// WireGuard interface, closing the idempotence bug where two distinct casings of the same
-    /// location were tracked as two distinct entries under two distinct per-location locks.
+    /// `"us"` and `"US"` must resolve to the same tracked entry, closing the idempotence bug
+    /// where two distinct casings of the same location were tracked as two distinct entries
+    /// under two distinct per-location locks.
     #[tokio::test]
     async fn manager_start_normalizes_location_case() {
         let _env_guard = ENV_LOCK.lock().await;
@@ -845,16 +644,15 @@ eRd1dKRVcDggq2K+vBNH5fXpGufy8FPBsFFnA5ZDGFrqpg==
             "only one tracked entry, not one per casing"
         );
         assert_eq!(snapshot[0].location, "US");
-        assert_eq!(snapshot[0].interface, wireguard::interface_name("US"));
 
         // stop() with the other casing must find and tear down the same entry.
         manager.stop("us").await.unwrap();
         assert!(manager.tunnels().is_empty());
     }
 
-    /// Finding #5: an invalid location must be rejected before it ever reaches
-    /// `wireguard::interface_name`/`wireguard::config_path` — proven here by asserting the
-    /// driver's `wg_up` was never called for a path-traversal-shaped value.
+    /// An invalid location must be rejected before it ever reaches `connect_tunnel` — proven
+    /// here by asserting the driver's `connect_tunnel` was never called for a
+    /// path-traversal-shaped value.
     #[tokio::test]
     async fn manager_start_rejects_invalid_location() {
         let _env_guard = ENV_LOCK.lock().await;
@@ -868,8 +666,8 @@ eRd1dKRVcDggq2K+vBNH5fXpGufy8FPBsFFnA5ZDGFrqpg==
         assert!(err.to_string().contains("invalid location"));
 
         assert!(
-            driver.up_calls.lock().unwrap().is_empty(),
-            "an invalid location must never reach wg_up"
+            driver.connect_calls.lock().unwrap().is_empty(),
+            "an invalid location must never reach connect_tunnel"
         );
         assert!(manager.tunnels().is_empty());
     }

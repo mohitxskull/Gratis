@@ -1,28 +1,26 @@
 //! Minimal SOCKS5 proxy engine (RFC 1928), CONNECT-only, no-auth.
 //!
-//! The proxy is interface-pinned: every *outbound* TCP connection it opens on behalf of a
-//! client is bound to a specific network interface (typically a WireGuard interface) via
-//! `SO_BINDTODEVICE`, so traffic egresses through that tunnel regardless of routing table
-//! state. Domain names are resolved on the host using normal (unbound) resolution — only the
-//! outbound connect socket itself is interface-bound.
+//! Every outbound connection is opened through a live [`crate::wireguard::Tunnel`] — a
+//! userspace WireGuard session, not a real network interface — so traffic egresses through
+//! that tunnel regardless of the host's routing table. Domain names are resolved on the host
+//! using normal (unbound) resolution; only the actual TCP connection goes through the tunnel.
 //!
 //! Scope, deliberately minimal:
 //! - Handshake: no-auth only. We always reply with method `0x00` (no authentication required)
-//!   regardless of what the client offered, per the brief's "no-auth simplification" — this
-//!   keeps the handshake trivial and matches the fact that this proxy is only ever reachable
-//!   on loopback/localhost by a trusted local client (the daemon's own consumers).
+//!   regardless of what the client offered — this proxy is only ever reachable on
+//!   loopback/localhost by a trusted local client.
 //! - Commands: `CONNECT` (`0x01`) only. `BIND` (`0x02`) and `UDP ASSOCIATE` (`0x03`) are
 //!   rejected with reply code `0x07` (command not supported) and the connection is closed.
 //! - Address types: IPv4, IPv6, and domain name are all supported.
 //! - Relay: a plain bidirectional byte pipe with **no idle timeout** — streaming / SSE /
 //!   WebSocket connections with long quiet gaps must survive for as long as both ends keep the
-//!   TCP connection open.
+//!   connection open.
 //!
 //! One instance of [`run_socks5`] is intended to be spawned per WireGuard location by the
-//! tunnel manager (see Task 05). Each accepted client connection is handled on its own spawned
-//! task, so there is no artificial concurrency cap.
+//! tunnel manager. Each accepted client connection is handled on its own spawned task, so
+//! there is no artificial concurrency cap.
 
-use socket2::{Domain, Protocol, Socket, Type};
+use crate::wireguard::SharedTunnel;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -46,11 +44,11 @@ const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 
 /// Run the SOCKS5 proxy: bind `listen_addr`, accept clients forever, and relay each `CONNECT`
-/// through an outbound socket bound to `interface`.
+/// through `tunnel`.
 ///
 /// This future only returns (with `Err`) if the listener fails to bind; otherwise it runs
 /// forever, spawning one task per accepted connection.
-pub async fn run_socks5(listen_addr: &str, interface: &str) -> io::Result<()> {
+pub async fn run_socks5(listen_addr: &str, tunnel: SharedTunnel) -> io::Result<()> {
     let listener = TcpListener::bind(listen_addr).await?;
 
     loop {
@@ -58,25 +56,21 @@ pub async fn run_socks5(listen_addr: &str, interface: &str) -> io::Result<()> {
             Ok(v) => v,
             Err(err) => {
                 // Transient accept errors (EMFILE/ENFILE/ECONNABORTED, etc.) must not take
-                // down the whole listener — a single failed accept should not kill every
-                // other client this proxy instance is serving. Log and keep looping; a
-                // `TcpListener` that already bound successfully essentially never becomes
-                // permanently unusable via accept() failures alone.
+                // down the whole listener.
                 eprintln!("socks5: accept() failed, continuing to listen: {err}");
                 continue;
             }
         };
-        let interface = interface.to_string();
+        let tunnel = tunnel.clone();
         tokio::spawn(async move {
-            if let Err(_err) = handle_client(client, &interface).await {
-                // Best-effort relay: any I/O error just ends this connection's task. Nothing
-                // else in the process depends on a single client connection's outcome.
+            if let Err(_err) = handle_client(client, tunnel).await {
+                // Best-effort relay: any I/O error just ends this connection's task.
             }
         });
     }
 }
 
-async fn handle_client(mut client: TcpStream, interface: &str) -> io::Result<()> {
+async fn handle_client(mut client: TcpStream, tunnel: SharedTunnel) -> io::Result<()> {
     negotiate_method(&mut client).await?;
 
     let (cmd, target) = match read_request(&mut client).await {
@@ -111,16 +105,15 @@ async fn handle_client(mut client: TcpStream, interface: &str) -> io::Result<()>
         }
     };
 
-    let outbound = match dial_via_interface(addr, interface).await {
-        Ok(s) => s,
+    let outbound = match tunnel.connect_tcp(addr).await {
+        Ok(c) => c,
         Err(_) => {
             send_reply(&mut client, REP_GENERAL_FAILURE, local_v4_zero()).await?;
             return Ok(());
         }
     };
 
-    let bound = outbound.local_addr().unwrap_or_else(|_| local_v4_zero());
-    send_reply(&mut client, REP_SUCCEEDED, bound).await?;
+    send_reply(&mut client, REP_SUCCEEDED, local_v4_zero()).await?;
 
     relay(client, outbound).await
 }
@@ -207,34 +200,16 @@ async fn resolve_target(target: &Target) -> io::Result<SocketAddr> {
     match target {
         Target::Addr(addr) => Ok(*addr),
         Target::Domain(domain, port) => {
-            // Normal (unbound) resolution on the host — only the outbound connect socket is
-            // pinned to the tunnel interface.
+            // Normal (unbound) resolution on the host — the tunnel's own DNS path returns a
+            // diagnostic "MTU Probe" message rather than real answers (verified live), so
+            // domain names are resolved outside the tunnel; only the TCP connection itself
+            // goes through it.
             let mut addrs = tokio::net::lookup_host((domain.as_str(), *port)).await?;
             addrs
                 .next()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no addresses resolved"))
         }
     }
-}
-
-/// Open an outbound TCP connection to `addr`, bound to `interface` via `SO_BINDTODEVICE`, so
-/// the connection egresses through that interface (typically a WireGuard tunnel).
-///
-/// The blocking `socket2` connect happens on a `spawn_blocking` thread so it never stalls a
-/// tokio worker thread.
-async fn dial_via_interface(addr: SocketAddr, interface: &str) -> io::Result<TcpStream> {
-    let interface = interface.to_string();
-    let std_stream = tokio::task::spawn_blocking(move || -> io::Result<std::net::TcpStream> {
-        let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
-        sock.bind_device(Some(interface.as_bytes()))?; // SO_BINDTODEVICE (needs CAP_NET_RAW)
-        sock.connect(&addr.into())?;
-        sock.set_nonblocking(true)?;
-        Ok(sock.into())
-    })
-    .await
-    .map_err(io::Error::other)??;
-
-    TcpStream::from_std(std_stream)
 }
 
 async fn send_reply(client: &mut TcpStream, rep: u8, bound: SocketAddr) -> io::Result<()> {
@@ -259,11 +234,44 @@ fn local_v4_zero() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
 }
 
-/// Bidirectional byte relay with **no idle timeout**. Streaming / SSE / WebSocket connections
-/// must survive arbitrarily long quiet gaps as long as both TCP endpoints stay open.
-async fn relay(mut client: TcpStream, mut outbound: TcpStream) -> io::Result<()> {
-    match tokio::io::copy_bidirectional(&mut client, &mut outbound).await {
-        Ok(_) => Ok(()),
-        Err(e) => Err(e),
-    }
+/// Bidirectional byte relay with **no idle timeout**, between the real client `TcpStream` and
+/// a [`crate::wireguard::TunnelConnection`] through the tunnel.
+///
+/// `TunnelConnection` isn't `AsyncRead`/`AsyncWrite`, so this is a manual pump rather than
+/// `tokio::io::copy_bidirectional`, but the streaming-safety property is the same: no timeout
+/// is ever applied to either direction, so quiet gaps (SSE/WebSocket) don't kill the relay.
+async fn relay(
+    client: TcpStream,
+    outbound: Box<dyn crate::wireguard::TunnelConnection>,
+) -> io::Result<()> {
+    let (mut client_rd, mut client_wr) = client.into_split();
+
+    let to_tunnel = async {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = client_rd.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            outbound.write_all(&buf[..n]).await?;
+        }
+        outbound.shutdown();
+        Ok::<(), io::Error>(())
+    };
+
+    let to_client = async {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = outbound.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            client_wr.write_all(&buf[..n]).await?;
+        }
+        let _ = client_wr.shutdown().await;
+        Ok::<(), io::Error>(())
+    };
+
+    let _ = tokio::join!(to_tunnel, to_client);
+    Ok(())
 }

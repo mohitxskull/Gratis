@@ -1,7 +1,16 @@
 //! `proton-proxy` daemon entry point. No CLI subcommands: a single `serve`-style entrypoint
 //! that starts the localhost control API + embedded web UI, optionally pre-starting a list of
-//! locations passed via `--locations`. Authentication happens through `POST /api/login` (or
-//! the web UI's login form), never via CLI arguments.
+//! locations passed via `--locations`. There is no login route or login form — authentication
+//! happens exactly once, automatically, from a `.env` file in the current directory
+//! (`EMAIL=...` / `PASSWORD=...`, read literally with no shell interpretation) at startup.
+//! Credentials are never accepted as CLI arguments (they'd leak into `ps`/shell history).
+//!
+//! Runs entirely unprivileged: tunnels are in-process userspace WireGuard sessions (see
+//! `wireguard.rs`), not real kernel interfaces, so there is nothing here to reconcile at boot
+//! or tear down at shutdown beyond normal process exit — a tunnel cannot outlive the process
+//! that holds it. `active_tunnels` rows from a previous run are therefore always stale (no
+//! process restart can "adopt" a tunnel that necessarily died with its process), so they're
+//! cleared unconditionally on startup, not reconciled against any live external state.
 use clap::Parser;
 use proton_proxy::api;
 use proton_proxy::manager::TunnelManager;
@@ -23,15 +32,11 @@ struct Cli {
     locations: Vec<String>,
 }
 
-/// Boot reconciliation (finding #3, part 1): a previous process's `active_tunnels` rows may be
-/// stale — the daemon doesn't persist a session token, so a restart can never "adopt" a live
-/// tunnel back into a running SOCKS5 proxy anyway (see the design-decision doc comment on
-/// `manager::TunnelManager`), and a hard kill (SIGKILL, power loss) leaves both the WireGuard
-/// interface up and the DB row behind with nothing tracking either. So reconciling at startup
-/// here means *cleaning up*, not resuming: for each persisted row, tear down the interface if
-/// it's still up, then clear the row. Synchronous/blocking (shells to `wg`/`wg-quick`), so the
-/// caller runs it inside `spawn_blocking`.
-fn reconcile_boot_state() {
+/// Clear any `active_tunnels` rows left over from a previous run. They're always stale: a
+/// tunnel is in-process state that cannot survive its process exiting, so there is nothing to
+/// reconcile against — unlike the old `sudo wg-quick`-based design, no kernel interface could
+/// have outlived the previous process for this to check against.
+fn clear_stale_active_tunnels() {
     let active = match proton_proxy::credentials::list_active() {
         Ok(rows) => rows,
         Err(err) => {
@@ -41,25 +46,10 @@ fn reconcile_boot_state() {
     };
 
     for row in active {
-        if proton_proxy::wireguard::is_up(&row.interface) {
-            eprintln!(
-                "proton-proxy: found interface {} (location {}) still up from a previous run; tearing it down",
-                row.interface, row.location
-            );
-            if let Err(err) = proton_proxy::wireguard::down(&row.interface) {
-                eprintln!(
-                    "proton-proxy: failed to tear down stale interface {} for location {}: {err} (leaving its active_tunnels row for a future retry)",
-                    row.interface, row.location
-                );
-                continue;
-            }
-        } else {
-            eprintln!(
-                "proton-proxy: clearing stale active_tunnels row for location {} (interface {} already down)",
-                row.location, row.interface
-            );
-        }
-
+        eprintln!(
+            "proton-proxy: clearing stale active_tunnels row for location {} (from a previous run)",
+            row.location
+        );
         if let Err(err) = proton_proxy::credentials::clear_active(&row.location) {
             eprintln!(
                 "proton-proxy: failed to clear stale active-tunnel row for location {}: {err}",
@@ -69,34 +59,75 @@ fn reconcile_boot_state() {
     }
 }
 
+/// Read `KEY=value` lines directly from a `.env` file, with NO shell interpretation — sourcing
+/// a `.env` through a shell (`source .env`) can mangle values containing `\`, `$`, `#`, etc.
+/// (verified: it silently dropped a backslash and expanded an unset `$var` in a real password
+/// during development). Returns `None` if the file doesn't exist; missing keys inside an
+/// existing file are also `None` for that key.
+fn read_dotenv_var(path: &std::path::Path, key: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    content
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{key}=")).map(|v| v.to_string()))
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
-    if let Err(err) = tokio::task::spawn_blocking(reconcile_boot_state).await {
-        eprintln!("proton-proxy: boot reconciliation task panicked: {err}");
-    }
+    clear_stale_active_tunnels();
 
     let manager = Arc::new(TunnelManager::new(cli.socks_base_port));
 
-    // Restore-on-startup: saved credentials (if any) cannot alone drive a fresh server list
-    // or an authenticated session (see the design-decision doc comment on
-    // `manager.rs`/`TunnelManager`), so we only report their presence here; a real login via
-    // `POST /api/login` (or the web UI) is still required before `--locations` pre-start can
-    // succeed.
-    if manager.has_saved_credentials() {
-        eprintln!(
-            "proton-proxy: found saved credentials, but a fresh login (POST /api/login or the web UI) is still required to fetch a server list before any tunnel can be started"
-        );
+    // Auto-login from `.env` in the current directory, if present — the common "just run it"
+    // path. Restore-on-startup from *saved* credentials (below) still can't work (no session
+    // token or server list is persisted — see the design-decision doc comment on
+    // `manager.rs`/`TunnelManager`), but re-deriving a fresh login from `.env` on every start
+    // sidesteps that limitation entirely for anyone willing to keep a `.env` next to the
+    // binary.
+    let dotenv_path = std::path::Path::new(".env");
+    let dotenv_creds = (
+        read_dotenv_var(dotenv_path, "EMAIL"),
+        read_dotenv_var(dotenv_path, "PASSWORD"),
+    );
+    let logged_in_from_dotenv = match dotenv_creds {
+        (Some(email), Some(password)) => match manager.login(&email, &password).await {
+            Ok(()) => {
+                println!("proton-proxy: logged in automatically from .env ({email})");
+                true
+            }
+            Err(err) => {
+                eprintln!("proton-proxy: auto-login from .env failed: {err}");
+                false
+            }
+        },
+        (Some(_), None) | (None, Some(_)) => {
+            eprintln!("proton-proxy: .env found but must set both EMAIL and PASSWORD; ignoring it");
+            false
+        }
+        (None, None) => false,
+    };
+
+    // Saved credentials (from a *previous* run's .env login) are informational only when
+    // .env didn't just log us in — see the module doc comment on why this can't drive an
+    // unattended restore on its own. With no login route, a missing/incomplete `.env` means
+    // no tunnel can ever be started this run.
+    if !logged_in_from_dotenv {
+        if manager.has_saved_credentials() {
+            eprintln!(
+                "proton-proxy: found saved credentials from a previous run, but no valid .env this time — no tunnel can be started until a valid .env (EMAIL + PASSWORD) is present at startup"
+            );
+        } else {
+            eprintln!(
+                "proton-proxy: no .env (EMAIL + PASSWORD) found — no tunnel can be started until one is present at startup"
+            );
+        }
     }
 
-    // Attempt to pre-start each requested location. With no persisted session token (see the
-    // restore-on-startup note above), this will fail with "not logged in" until a login
-    // happens through the API/UI unless a previous call already populated the in-process
-    // client (it can't have, this early) — so today this loop effectively always logs and
-    // moves on. It's kept as a real attempt (not skipped outright) so that if a future task
-    // adds session-token persistence, pre-start starts working with no changes here. Per the
-    // brief: a failure here must never crash the daemon.
+    // Attempt to pre-start each requested location. Succeeds immediately if .env just logged
+    // us in; otherwise fails with "not logged in" (no login route exists to fix this after
+    // the fact — restart with a valid .env). Per the brief: a failure here must never crash
+    // the daemon.
     for location in &cli.locations {
         if let Err(err) = manager.start(location).await {
             eprintln!("proton-proxy: failed to pre-start location {location}: {err}");
@@ -115,18 +146,12 @@ async fn main() {
     };
 
     println!("proton-proxy: control API + web UI listening on http://{addr}");
+    println!("proton-proxy: running unprivileged — no root/sudo required");
 
-    // Shutdown teardown (finding #3, part 2): without this, killing the daemon (Ctrl-C/
-    // SIGTERM) leaves every WireGuard interface up and every `active_tunnels` row stale — the
-    // machine keeps routing tunnel traffic with no proxy listening on it, and the next boot's
-    // `reconcile_boot_state` above is the only thing that would ever clean it up. Catching
-    // SIGINT via `tokio::signal::ctrl_c()` and tearing down every tracked tunnel before
-    // exiting closes that gap for the common "Ctrl-C" / graceful-stop case.
-    //
-    // This deliberately does not also install a SIGTERM handler (`tokio::signal::ctrl_c()`
-    // only catches SIGINT) — a first pass sufficient per the review's own scope; a process
-    // killed via SIGTERM (e.g. `systemctl stop`/`kill` without `-INT`) still relies on
-    // `reconcile_boot_state` at the next boot.
+    // Ctrl-C stops tracked tunnels before exiting, purely so `GET /api/tunnels` and the
+    // active_tunnels DB rows reflect reality if something outlives the process shutdown
+    // sequence briefly (e.g. a slow disk flush) — not required for correctness, since process
+    // exit alone already reclaims every tunnel's memory/sockets.
     tokio::select! {
         result = axum::serve(listener, router) => {
             if let Err(err) = result {
@@ -139,7 +164,7 @@ async fn main() {
                 eprintln!("proton-proxy: failed to install Ctrl-C handler: {err}");
                 return;
             }
-            eprintln!("proton-proxy: received shutdown signal, tearing down tracked tunnels...");
+            eprintln!("proton-proxy: received shutdown signal, stopping tracked tunnels...");
             for info in manager.tunnels() {
                 if let Err(err) = manager.stop(&info.location).await {
                     eprintln!(
@@ -148,7 +173,7 @@ async fn main() {
                     );
                 }
             }
-            eprintln!("proton-proxy: shutdown teardown complete");
+            eprintln!("proton-proxy: shutdown complete");
         }
     }
 }
