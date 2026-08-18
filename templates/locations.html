@@ -8,18 +8,16 @@
         <span class="text-sm text-ink/55 truncate">{{ loc.name }}</span>
       </span>
       <span class="flex items-center gap-4 shrink-0">
+        {% if loc.connected %}
+        <span class="flex items-center gap-1.5 text-xs text-ink/70">
+          <span class="inline-block w-1.5 h-1.5 rounded-full bg-ink"></span>Connected
+        </span>
+        {% endif %}
         <span class="text-xs text-ink/50 tabular-nums">{{ loc.load }}%</span>
-        <button
-          hx-post="/ui/tunnels/{{ loc.code }}/start"
-          hx-target="#tunnels"
-          hx-swap="innerHTML"
-          hx-disabled-elt="this"
-          onclick="event.stopPropagation()"
-          class="text-xs uppercase tracking-wide border border-ink/25 rounded px-3 py-1 hover:bg-ink hover:text-paper transition disabled:opacity-40"
-        >Start</button>
       </span>
     </summary>
     <div
+      id="servers-{{ loc.code }}"
       hx-get="/ui/locations/{{ loc.code }}/servers"
       hx-trigger="toggle once from:closest details"
       hx-swap="innerHTML"

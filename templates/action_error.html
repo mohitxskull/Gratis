@@ -1,0 +1,11 @@
+<div id="action-error" hx-swap-oob="true">
+  {% if let Some(err) = error %}
+  <div class="flex items-center justify-between gap-3 border border-ink/20 bg-paper-dim rounded p-3 text-sm mb-8">
+    <span class="text-ink/70">{{ err }}</span>
+    <button
+      onclick="document.getElementById('action-error').innerHTML=''"
+      class="text-ink/40 hover:text-ink transition text-xs uppercase tracking-wide shrink-0"
+    >Dismiss</button>
+  </div>
+  {% endif %}
+</div>

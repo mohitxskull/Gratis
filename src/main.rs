@@ -1,6 +1,6 @@
 //! `gratis` daemon entry point. No CLI subcommands: a single `serve`-style entrypoint
 //! that starts the localhost control API + embedded web UI, optionally pre-starting a list of
-//! locations passed via `--locations`. There is no login route or login form — authentication
+//! location passed via `--location`. There is no login route or login form — authentication
 //! happens exactly once, automatically, from a `.env` file in the current directory
 //! (`EMAIL=...` / `PASSWORD=...`, read literally with no shell interpretation) at startup.
 //! Credentials are never accepted as CLI arguments (they'd leak into `ps`/shell history).
@@ -23,13 +23,15 @@ struct Cli {
     #[arg(long, default_value = "9000")]
     control_port: u16,
 
-    /// Base SOCKS5 port; each started location gets `socks_base_port + index`.
+    /// SOCKS5 port the (single) tunnel listens on.
     #[arg(long, default_value = "1080")]
-    socks_base_port: u16,
+    socks_port: u16,
 
-    /// Comma-separated location (country) codes to start immediately at boot, e.g. `US,NL`.
-    #[arg(long, value_delimiter = ',')]
-    locations: Vec<String>,
+    /// Location (country) code to start immediately at boot, e.g. `US`. `TunnelManager` runs
+    /// at most one tunnel at a time — this isn't a list any more; switching locations later
+    /// (via the API/web UI) hot-swaps this same tunnel rather than adding another.
+    #[arg(long)]
+    location: Option<String>,
 }
 
 /// Clear any `active_tunnels` rows left over from a previous run. They're always stale: a
@@ -77,7 +79,7 @@ async fn main() {
 
     clear_stale_active_tunnels();
 
-    let manager = Arc::new(TunnelManager::new(cli.socks_base_port));
+    let manager = Arc::new(TunnelManager::new(cli.socks_port));
 
     // Auto-login from `.env` in the current directory, if present — the common "just run it"
     // path. Restore-on-startup from *saved* credentials (below) still can't work (no session
@@ -124,14 +126,14 @@ async fn main() {
         }
     }
 
-    // Attempt to pre-start each requested location. Succeeds immediately if .env just logged
-    // us in; otherwise fails with "not logged in" (no login route exists to fix this after
-    // the fact — restart with a valid .env). Per the brief: a failure here must never crash
-    // the daemon.
-    for location in &cli.locations {
-        if let Err(err) = manager.start(location).await {
-            eprintln!("gratis: failed to pre-start location {location}: {err}");
-        }
+    // Attempt to pre-start the requested location, if any. Succeeds immediately if .env just
+    // logged us in; otherwise fails with "not logged in" (no login route exists to fix this
+    // after the fact — restart with a valid .env). Per the brief: a failure here must never
+    // crash the daemon.
+    if let Some(location) = &cli.location
+        && let Err(err) = manager.start(location).await
+    {
+        eprintln!("gratis: failed to pre-start location {location}: {err}");
     }
 
     let router = api::router(manager.clone());
@@ -146,7 +148,6 @@ async fn main() {
     };
 
     println!("gratis: control API + web UI listening on http://{addr}");
-    println!("gratis: running unprivileged — no root/sudo required");
 
     // Ctrl-C stops tracked tunnels before exiting, purely so `GET /api/tunnels` and the
     // active_tunnels DB rows reflect reality if something outlives the process shutdown

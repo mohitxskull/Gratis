@@ -9,7 +9,10 @@
 //! UI, and `TunnelManager::login` is only ever called from `main.rs`'s startup sequence.
 use crate::errors::ProtonError;
 use crate::manager::{CountryInfo, TunnelInfo, TunnelManager};
-use crate::webui::{IndexTemplate, LocationsTemplate, ServersTemplate, TunnelsTemplate};
+use crate::webui::{
+    ActionErrorTemplate, IndexTemplate, LocationsTemplate, ServersTemplate, TunnelsTemplate,
+    location_rows, server_rows,
+};
 use askama::Template;
 use axum::{
     Json, Router,
@@ -61,17 +64,18 @@ async fn index(State(manager): State<Arc<TunnelManager>>) -> Response {
         Ok(locs) => (None, locs),
         Err(e) => (Some(e.to_string()), Vec::new()),
     };
-    render(IndexTemplate::new(
-        login_error,
-        locations,
-        manager.tunnels(),
-    ))
+    let tunnels = manager.tunnels();
+    let locations = location_rows(locations, tunnels.first());
+    render(IndexTemplate::new(login_error, locations, tunnels))
 }
 
 /// Locations table fragment, for the "Refresh" button.
 async fn ui_locations(State(manager): State<Arc<TunnelManager>>) -> Response {
     let locations = manager.list_locations().await.unwrap_or_default();
-    render(LocationsTemplate { locations })
+    let tunnels = manager.tunnels();
+    render(LocationsTemplate {
+        locations: location_rows(locations, tunnels.first()),
+    })
 }
 
 /// Individual-server list for one country, lazy-loaded the first time its row is expanded.
@@ -80,9 +84,10 @@ async fn ui_location_servers(
     Path(code): Path<String>,
 ) -> Response {
     let servers = manager.list_servers_in(&code).await.unwrap_or_default();
+    let tunnels = manager.tunnels();
     render(ServersTemplate {
+        servers: server_rows(&code, servers, tunnels.first()),
         location: code,
-        servers,
     })
 }
 
@@ -93,18 +98,15 @@ async fn ui_tunnels(State(manager): State<Arc<TunnelManager>>) -> Response {
     })
 }
 
-/// Start a tunnel from the web UI. Renders the refreshed tunnels fragment regardless of
-/// success — a failed start simply leaves the table unchanged; there's no per-action error
-/// surface in the fragment-swap model yet (a reasonable v1 scope limit, not a bug: the JSON
-/// `/api/tunnels` route below is available for callers that need the failure reason).
+/// Start a tunnel from the web UI. Renders the refreshed tunnels fragment either way; a failed
+/// start also surfaces the failure reason via the `#action-error` banner (see
+/// `render_tunnels_and_servers`) rather than silently leaving the table unchanged.
 async fn ui_start_tunnel(
     State(manager): State<Arc<TunnelManager>>,
     Path(location): Path<String>,
 ) -> Response {
-    let _ = manager.start(&location).await;
-    render(TunnelsTemplate {
-        tunnels: manager.tunnels(),
-    })
+    let error = manager.start(&location).await.err().map(|e| e.to_string());
+    render_tunnels_and_servers(&manager, &location, error).await
 }
 
 /// Start a tunnel to one specific server within a location, from the web UI. Same
@@ -113,10 +115,12 @@ async fn ui_start_tunnel_server(
     State(manager): State<Arc<TunnelManager>>,
     Path((location, server)): Path<(String, String)>,
 ) -> Response {
-    let _ = manager.start_server(&location, Some(&server)).await;
-    render(TunnelsTemplate {
-        tunnels: manager.tunnels(),
-    })
+    let error = manager
+        .start_server(&location, Some(&server))
+        .await
+        .err()
+        .map(|e| e.to_string());
+    render_tunnels_and_servers(&manager, &location, error).await
 }
 
 /// Stop a tunnel from the web UI. Same fragment-rendering contract as `ui_start_tunnel`.
@@ -124,10 +128,44 @@ async fn ui_stop_tunnel(
     State(manager): State<Arc<TunnelManager>>,
     Path(location): Path<String>,
 ) -> Response {
-    let _ = manager.stop(&location).await;
-    render(TunnelsTemplate {
-        tunnels: manager.tunnels(),
-    })
+    let error = manager.stop(&location).await.err().map(|e| e.to_string());
+    render_tunnels_and_servers(&manager, &location, error).await
+}
+
+/// Renders the refreshed tunnels fragment (the primary swap target for all three actions
+/// above) plus two out-of-band updates:
+/// - `location`'s server list (`servers.html`'s root carries `id="servers-{location}"` +
+///   `hx-swap-oob="true"` for exactly this) — if that location isn't currently expanded in the
+///   DOM, this is a no-op. Flips a server row's "Connect" button to a "Connected" badge (and
+///   back on stop) immediately, rather than leaving it stale until the next poll of the
+///   "Active tunnels" panel or a manual Locations refresh.
+/// - the `#action-error` banner (`action_error.html`), showing `error` if the action that
+///   triggered this failed, or clearing any previously-shown error if it succeeded.
+async fn render_tunnels_and_servers(
+    manager: &TunnelManager,
+    location: &str,
+    error: Option<String>,
+) -> Response {
+    let tunnels = manager.tunnels();
+    let servers = manager.list_servers_in(location).await.unwrap_or_default();
+    let servers = server_rows(location, servers, tunnels.first());
+
+    let tunnels_html = TunnelsTemplate { tunnels }.render();
+    let servers_html = ServersTemplate {
+        location: location.to_string(),
+        servers,
+    }
+    .render();
+    let error_html = ActionErrorTemplate { error }.render();
+
+    match (tunnels_html, servers_html, error_html) {
+        (Ok(t), Ok(s), Ok(e)) => Html(format!("{t}{s}{e}")).into_response(),
+        (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("template error: {err}"),
+        )
+            .into_response(),
+    }
 }
 
 async fn locations(

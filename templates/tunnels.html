@@ -6,7 +6,7 @@
       <span class="font-mono text-xs text-ink/50 truncate">{{ t.server }}</span>
       <span class="font-mono text-xs text-ink/55 truncate">socks5://127.0.0.1:{{ t.socks_port }}</span>
       <button
-        onclick="navigator.clipboard.writeText('socks5://127.0.0.1:{{ t.socks_port }}')"
+        onclick="navigator.clipboard.writeText('socks5://127.0.0.1:{{ t.socks_port }}'); this.textContent='copied'; setTimeout(() => this.textContent='copy', 1200)"
         class="text-xs text-ink/40 hover:text-ink transition"
         title="Copy"
       >copy</button>

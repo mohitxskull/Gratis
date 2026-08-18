@@ -34,7 +34,6 @@ use crate::wireguard::{self, CurrentTunnel, SharedTunnel, Tunnel};
 use async_trait::async_trait;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
@@ -84,17 +83,15 @@ impl TunnelDriver for RealDriver {
     }
 }
 
-/// A tracked, running tunnel: the shared handle to it, the SOCKS5 port it's bound to, the
-/// display label (`GET /api/tunnels`'s `interface` field — no longer a real OS interface, see
-/// the module doc comment), and the `JoinHandle` of the task serving that SOCKS5 proxy.
-struct TunnelHandle {
-    /// The live tunnel this location's SOCKS5 listener relays through. Swapping its contents
-    /// (see [`CurrentTunnel`]) changes which server *new* connections use, in place, without
-    /// respawning `task` or touching `socks_port`.
-    current: CurrentTunnel,
-    interface: String,
-    socks_port: u16,
+/// The one currently active tunnel + SOCKS5 proxy, if any. `TunnelManager` runs at most one at
+/// a time: starting a different location or server swaps this in place (same `socks_port`,
+/// same SOCKS5 `task`, so already-open client connections are undisturbed — see
+/// [`CurrentTunnel`]) rather than running multiple tunnels side by side.
+struct RunningTunnel {
+    location: String,
     server: String,
+    interface: String,
+    current: CurrentTunnel,
     task: JoinHandle<()>,
 }
 
@@ -144,51 +141,32 @@ const PERMISSIVE_TIER: i32 = 0;
 
 pub struct TunnelManager {
     client: AsyncMutex<Option<ProtonVPNClient>>,
-    socks_base_port: u16,
-    tunnels: Mutex<HashMap<String, TunnelHandle>>,
-    /// Monotonically increasing port index; a location's assigned port is
-    /// `socks_base_port + index`. Deliberately never reused after `stop()`, so a rapid
-    /// stop/start of the same location can't collide with another location's still-shutting-
-    /// down listener on the same port.
-    next_port_index: AtomicU16,
+    /// Fixed SOCKS5 port for the single tunnel this manager ever runs. Never changes across a
+    /// location/server switch — only ever (re)bound once, the first time a tunnel starts.
+    socks_port: u16,
+    active: Mutex<Option<RunningTunnel>>,
     driver: Arc<dyn TunnelDriver>,
-    /// Per-location async locks serializing `start()`/`stop()` for a given location, so the
-    /// whole `connect_tunnel -> credentials::set_active -> spawn_socks5 -> tunnels.insert`
-    /// sequence (and the mirrored `stop()` sequence) is atomic with respect to concurrent
-    /// calls for the *same* location. Distinct locations proceed independently. Entries are
-    /// never removed once created (the key space is bounded by the small, roughly-fixed set
-    /// of country codes Proton exposes).
-    start_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// Serializes `start_server()`/`stop()` end-to-end, so concurrent calls (e.g. a
+    /// double-clicked button, or a switch racing a stop) can't interleave.
+    switch_lock: AsyncMutex<()>,
 }
 
 impl TunnelManager {
     /// Build a manager using the real tunnel/SOCKS5 driver.
-    pub fn new(socks_base_port: u16) -> Self {
-        Self::with_driver(socks_base_port, Arc::new(RealDriver))
+    pub fn new(socks_port: u16) -> Self {
+        Self::with_driver(socks_port, Arc::new(RealDriver))
     }
 
     /// Build a manager with an injected driver (used by tests to avoid touching real
     /// WireGuard/network state).
-    pub fn with_driver(socks_base_port: u16, driver: Arc<dyn TunnelDriver>) -> Self {
+    pub fn with_driver(socks_port: u16, driver: Arc<dyn TunnelDriver>) -> Self {
         Self {
             client: AsyncMutex::new(None),
-            socks_base_port,
-            tunnels: Mutex::new(HashMap::new()),
-            next_port_index: AtomicU16::new(0),
+            socks_port,
+            active: Mutex::new(None),
             driver,
-            start_locks: Mutex::new(HashMap::new()),
+            switch_lock: AsyncMutex::new(()),
         }
-    }
-
-    /// Get (creating if absent) the per-location async lock used to serialize `start()`/
-    /// `stop()` for `location`.
-    fn location_lock(&self, location: &str) -> Arc<AsyncMutex<()>> {
-        self.start_locks
-            .lock()
-            .unwrap()
-            .entry(location.to_string())
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone()
     }
 
     /// Whether a previous session's credentials are present in the SQLite store. Informational
@@ -261,8 +239,9 @@ impl TunnelManager {
             .collect())
     }
 
-    /// Normalize a caller-supplied `location` (country code) to the canonical form used as the
-    /// `tunnels`/`start_locks`/`active_tunnels` key: uppercase, exactly two ASCII letters.
+    /// Normalize a caller-supplied `location` (country code) to the canonical form used
+    /// throughout (`active_tunnels` DB key, comparisons against the running tunnel's
+    /// location): uppercase, exactly two ASCII letters.
     fn normalize_location(location: &str) -> Result<String> {
         let upper = location.to_ascii_uppercase();
         if upper.len() == 2 && upper.bytes().all(|b| b.is_ascii_alphabetic()) {
@@ -274,69 +253,82 @@ impl TunnelManager {
         }
     }
 
-    /// Start a tunnel + SOCKS5 proxy for `location` (a country code, e.g. `"US"`) if not
-    /// already running, picking whichever free-tier server in that location currently has the
-    /// lowest load. Idempotent (returns the existing port if already up). Returns the bound
-    /// SOCKS5 port.
+    /// Start the tunnel + SOCKS5 proxy pointed at `location` (a country code, e.g. `"US"`),
+    /// picking whichever free-tier server there currently has the lowest load. Idempotent if
+    /// already pointed at `location` (returns the existing port unchanged); otherwise brings
+    /// up a tunnel (if none is running yet) or hot-swaps the running one over to `location`
+    /// (see `start_server`). Returns the bound SOCKS5 port.
     pub async fn start(&self, location: &str) -> Result<u16> {
         self.start_server(location, None).await
     }
 
-    /// Start a tunnel + SOCKS5 proxy for `location`, connecting to `server_name` specifically
-    /// (matched case-insensitively against `find_servers`' free-tier results) rather than
-    /// letting `start` pick the lowest-load server. `None` behaves exactly like `start`.
+    /// Start the tunnel + SOCKS5 proxy pointed at `location`, connecting to `server_name`
+    /// specifically (matched case-insensitively against `find_servers`' free-tier results)
+    /// rather than letting `start` pick the lowest-load server. `None` behaves exactly like
+    /// `start`.
     ///
-    /// If `location` has no tunnel yet, this brings one up (as `start` does). If a tunnel is
-    /// already up for `location` and `server_name` names a *different* server than the one
-    /// it's currently connected to, this hot-swaps the underlying WireGuard tunnel in place:
-    /// the SOCKS5 listener is never rebound (so `socks_port` never changes) and already-open
+    /// `TunnelManager` runs at most one tunnel at a time. If none is running, this brings one
+    /// up. If one is already running — whether pointed at this same location or a completely
+    /// different one — and the request names a different target (different location, or same
+    /// location but a different server), this hot-swaps the underlying WireGuard tunnel in
+    /// place: the SOCKS5 listener is never rebound (so the port never changes) and already-open
     /// client connections keep flowing through the tunnel they started on — see
-    /// [`wireguard::CurrentTunnel`]. New connections after the swap use the new server.
+    /// [`wireguard::CurrentTunnel`]. New connections after the swap use the new target.
     pub async fn start_server(&self, location: &str, server_name: Option<&str>) -> Result<u16> {
         let location = Self::normalize_location(location)?;
         let location = location.as_str();
 
-        // Serialize the whole resolve -> connect_tunnel -> swap/spawn -> insert sequence per
-        // location so two concurrent calls for the same location (e.g. a double-clicked
-        // button in the web UI) can't race each other.
-        let lock = self.location_lock(location);
-        let _guard = lock.lock().await;
+        // Serialize the whole resolve -> connect_tunnel -> swap/spawn sequence so concurrent
+        // calls (e.g. a double-clicked button in the web UI) can't race each other.
+        let _guard = self.switch_lock.lock().await;
 
-        let existing = self
-            .tunnels
-            .lock()
-            .unwrap()
-            .get(location)
-            .map(|h| (h.current.clone(), h.socks_port, h.server.clone()));
+        let existing = self.active.lock().unwrap().as_ref().map(|a| {
+            (
+                a.current.clone(),
+                a.location.clone(),
+                a.server.clone(),
+                a.task.is_finished(),
+            )
+        });
 
-        if let Some((current, socks_port, existing_server)) = existing {
-            let switch = match server_name {
-                None => false,
-                Some(name) => !name.eq_ignore_ascii_case(&existing_server),
-            };
-            if !switch {
-                return Ok(socks_port);
+        if let Some((current, active_location, active_server, task_died)) = existing
+            && !task_died
+        {
+            let already_there = active_location.eq_ignore_ascii_case(location)
+                && match server_name {
+                    None => true,
+                    Some(name) => name.eq_ignore_ascii_case(&active_server),
+                };
+            if already_there {
+                return Ok(self.socks_port);
             }
 
             let (server, creds) = self.resolve_server(location, server_name).await?;
             let tunnel = self.driver.connect_tunnel(&server, &creds).await?;
             // Swapping this slot's contents is the entire switch: `run_socks5` reads it fresh
             // per accepted connection, so this alone redirects future connections to the new
-            // server. The old `SharedTunnel` this overwrites stays alive for as long as
+            // target. The old `SharedTunnel` this overwrites stays alive for as long as
             // already-accepted connections still hold their own clone of it, then tears down
             // on its own once the last one finishes.
             *current.lock().unwrap() = tunnel;
-            if let Some(h) = self.tunnels.lock().unwrap().get_mut(location) {
-                h.server = server.name;
+
+            let interface = wireguard::interface_name(location);
+            if !active_location.eq_ignore_ascii_case(location) {
+                credentials::clear_active(&active_location)?;
             }
-            return Ok(socks_port);
+            credentials::set_active(location, &interface, self.socks_port)?;
+
+            if let Some(a) = self.active.lock().unwrap().as_mut() {
+                a.location = location.to_string();
+                a.server = server.name;
+                a.interface = interface;
+            }
+            return Ok(self.socks_port);
         }
 
         let (server, creds) = self.resolve_server(location, server_name).await?;
         let tunnel = self.driver.connect_tunnel(&server, &creds).await?;
 
-        let idx = self.next_port_index.fetch_add(1, Ordering::SeqCst);
-        let socks_port = self.socks_base_port + idx;
         let interface = wireguard::interface_name(location);
 
         // Record the active tunnel in the persisted store first, then spawn the proxy.
@@ -346,26 +338,22 @@ impl TunnelManager {
         // drops it — its background tasks abort via `Drop` (see `wireguard::SharedTunnel`'s
         // doc comment). Unlike the old `sudo wg-quick`-based design, there is no real
         // interface that could be left up with nothing tracking it.
-        credentials::set_active(location, &interface, socks_port)?;
+        credentials::set_active(location, &interface, self.socks_port)?;
 
-        let listen_addr = format!("127.0.0.1:{socks_port}");
+        let listen_addr = format!("127.0.0.1:{}", self.socks_port);
         let current: CurrentTunnel = Arc::new(std::sync::Mutex::new(tunnel));
         let task = self.driver.spawn_socks5(listen_addr, current.clone());
 
-        // No race to check for here any more: `_guard` has held this location's lock for the
-        // entire sequence above, so no concurrent `start()` for `location` could have run any
-        // of it in the meantime.
-        self.tunnels.lock().unwrap().insert(
-            location.to_string(),
-            TunnelHandle {
-                current,
-                interface,
-                socks_port,
-                server: server.name,
-                task,
-            },
-        );
-        Ok(socks_port)
+        // No race to check for here any more: `_guard` has held the switch lock for the
+        // entire sequence above, so no concurrent call could have run any of it meanwhile.
+        *self.active.lock().unwrap() = Some(RunningTunnel {
+            location: location.to_string(),
+            server: server.name,
+            interface,
+            current,
+            task,
+        });
+        Ok(self.socks_port)
     }
 
     /// Resolve `server_name` (or, if `None`, the lowest-load server) within `location` to a
@@ -401,7 +389,7 @@ impl TunnelManager {
         Ok((server, creds))
     }
 
-    /// Tear down the tunnel + SOCKS5 proxy for `location`.
+    /// Tear down the running tunnel + SOCKS5 proxy, if it's currently pointed at `location`.
     ///
     /// Unlike the old `sudo wg-quick`-based design, teardown cannot fail: there is no external
     /// process to shell out to. Aborting the SOCKS5 task and dropping the tunnel's last
@@ -410,38 +398,44 @@ impl TunnelManager {
         let location = Self::normalize_location(location)?;
         let location = location.as_str();
 
-        // Shares the same per-location lock `start()` uses, so a `stop()` racing a `start()`
-        // for the same location can't interleave with the latter's connect/set_active/spawn
-        // sequence.
-        let lock = self.location_lock(location);
-        let _guard = lock.lock().await;
+        // Shares the switch lock `start_server()` uses, so a `stop()` racing a start/switch
+        // can't interleave with the latter's connect/set_active/spawn sequence.
+        let _guard = self.switch_lock.lock().await;
 
-        let handle = self.tunnels.lock().unwrap().remove(location);
-        let Some(handle) = handle else {
+        let matches = self
+            .active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|a| a.location.eq_ignore_ascii_case(location));
+        if !matches {
             return Err(ProtonError::Config(format!(
                 "no active tunnel for location {location}"
             )));
-        };
-        handle.task.abort();
-        drop(handle); // drops the tunnel's Arc reference; background tasks abort via Drop
+        }
+        let running = self.active.lock().unwrap().take().unwrap();
+        running.task.abort();
+        drop(running); // drops the tunnel's Arc reference; background tasks abort via Drop
 
         credentials::clear_active(location)?;
         Ok(())
     }
 
-    /// Snapshot of all currently-tracked tunnels.
+    /// Snapshot of the currently-running tunnel, if any (0 or 1 entries — `TunnelManager` never
+    /// runs more than one at a time).
     pub fn tunnels(&self) -> Vec<TunnelInfo> {
-        self.tunnels
+        self.active
             .lock()
             .unwrap()
-            .iter()
-            .map(|(location, h)| TunnelInfo {
-                location: location.clone(),
-                interface: h.interface.clone(),
-                socks_port: h.socks_port,
-                server: h.server.clone(),
-                connected: !h.task.is_finished(),
+            .as_ref()
+            .map(|a| TunnelInfo {
+                location: a.location.clone(),
+                interface: a.interface.clone(),
+                socks_port: self.socks_port,
+                server: a.server.clone(),
+                connected: !a.task.is_finished(),
             })
+            .into_iter()
             .collect()
     }
 }
@@ -517,16 +511,13 @@ mod tests {
             let task = manager
                 .driver
                 .spawn_socks5("127.0.0.1:11000".to_string(), current.clone());
-            manager.tunnels.lock().unwrap().insert(
-                "US".to_string(),
-                TunnelHandle {
-                    current,
-                    interface: wireguard::interface_name("US"),
-                    socks_port: 11000,
-                    server: "US#1".to_string(),
-                    task,
-                },
-            );
+            *manager.active.lock().unwrap() = Some(RunningTunnel {
+                location: "US".to_string(),
+                server: "US#1".to_string(),
+                interface: wireguard::interface_name("US"),
+                current,
+                task,
+            });
         }
 
         let snapshot = manager.tunnels();
@@ -603,7 +594,16 @@ mod tests {
         client
     }
 
-    fn scratch_manager_with_driver(base_port: u16, driver: Arc<FakeDriver>) -> TunnelManager {
+    /// Like `fake_logged_in_client`, but with one server per given location, for exercising
+    /// `start_server`'s hot-swap-*across-locations* path.
+    fn fake_logged_in_client_multi(locations: &[&str]) -> ProtonVPNClient {
+        let mut client = ProtonVPNClient::new("test-user");
+        client.vpn_credentials = Some(test_creds());
+        client.server_list = locations.iter().map(|l| test_server(l)).collect();
+        client
+    }
+
+    fn scratch_manager_with_driver(socks_port: u16, driver: Arc<FakeDriver>) -> TunnelManager {
         let tmp = tempfile::tempdir().unwrap();
         // SAFETY: see the note in `manager_start_stop_tracks_state` above.
         unsafe {
@@ -613,11 +613,11 @@ mod tests {
         // Leak the tempdir so it outlives the test (it's process-local scratch space cleaned
         // up when the test process exits; nothing else depends on it being removed sooner).
         std::mem::forget(tmp);
-        TunnelManager::with_driver(base_port, driver)
+        TunnelManager::with_driver(socks_port, driver)
     }
 
-    fn scratch_manager(base_port: u16) -> TunnelManager {
-        scratch_manager_with_driver(base_port, Arc::new(FakeDriver::default()))
+    fn scratch_manager(socks_port: u16) -> TunnelManager {
+        scratch_manager_with_driver(socks_port, Arc::new(FakeDriver::default()))
     }
 
     /// Drives `start()`'s real new-tunnel path (not just the idempotent short-circuit
@@ -631,7 +631,7 @@ mod tests {
         *manager.client.lock().await = Some(fake_logged_in_client("US"));
 
         let port = manager.start("US").await.unwrap();
-        assert_eq!(port, 12000, "first location gets socks_base_port + 0");
+        assert_eq!(port, 12000, "always the manager's fixed socks_port");
 
         let snapshot = manager.tunnels();
         assert_eq!(snapshot.len(), 1);
@@ -805,5 +805,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(port3, port2);
+    }
+
+    /// `TunnelManager` runs at most one tunnel at a time: starting a *different* location while
+    /// one is already running must swap it in place (same port, no second tunnel tracked), and
+    /// the persisted `active_tunnels` row must move from the old location to the new one, not
+    /// accumulate both.
+    #[tokio::test]
+    async fn manager_start_switches_across_locations_keeping_one_tunnel() {
+        let _env_guard = ENV_LOCK.lock().await;
+        let manager = scratch_manager(15100);
+        *manager.client.lock().await = Some(fake_logged_in_client_multi(&["CH", "CA"]));
+
+        let port1 = manager.start("CH").await.unwrap();
+        assert_eq!(manager.tunnels()[0].location, "CH");
+
+        let port2 = manager.start("CA").await.unwrap();
+        assert_eq!(port1, port2, "switching locations must not change the port");
+
+        let snapshot = manager.tunnels();
+        assert_eq!(snapshot.len(), 1, "never more than one tunnel at a time");
+        assert_eq!(snapshot[0].location, "CA");
+        assert!(snapshot[0].connected);
+
+        let active = credentials::list_active().unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "the old location's active_tunnels row must be cleared, not left stranded"
+        );
+        assert_eq!(active[0].location, "CA");
     }
 }

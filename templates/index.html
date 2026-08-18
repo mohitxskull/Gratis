@@ -13,6 +13,8 @@
     <h1 class="text-3xl font-semibold tracking-tight">Gratis</h1>
   </header>
 
+  <div id="action-error"></div>
+
   {% if let Some(err) = login_error %}
   <div class="border border-ink/15 bg-paper-dim rounded p-4 text-sm mb-10">
     <span class="font-semibold">Login failed.</span> <span class="text-ink/65">{{ err }}</span>
@@ -74,18 +76,36 @@
     <div id="locations">
       {% include "locations.html" %}
     </div>
+    <div id="locations-empty" class="hidden py-6 text-center text-ink/40 text-sm">No locations match your filter.</div>
   </section>
 
 </div>
 <script>{{ htmx_js|safe }}</script>
 <script>
+let locationFilter = '';
+
 function filterLocations(query) {
-  const q = query.trim().toLowerCase();
-  document.querySelectorAll('#locations details[data-code]').forEach((row) => {
-    const match = row.dataset.code.includes(q) || row.dataset.name.includes(q);
-    row.classList.toggle('hidden', !match);
-  });
+  locationFilter = query.trim().toLowerCase();
+  applyLocationFilter();
 }
+
+// Re-applies the current filter after any htmx swap of #locations — the "Refresh" button and
+// any Connect/Stop action's out-of-band server-list update both replace rows there, which would
+// otherwise silently drop the filter (rows reappear even though the input still shows a query).
+function applyLocationFilter() {
+  const rows = document.querySelectorAll('#locations details[data-code]');
+  let anyVisible = false;
+  rows.forEach((row) => {
+    const match = row.dataset.code.includes(locationFilter) || row.dataset.name.includes(locationFilter);
+    row.classList.toggle('hidden', !match);
+    if (match) anyVisible = true;
+  });
+  document.getElementById('locations-empty').classList.toggle('hidden', rows.length === 0 || anyVisible || locationFilter === '');
+}
+
+document.body.addEventListener('htmx:afterSwap', (e) => {
+  if (e.target.id === 'locations') applyLocationFilter();
+});
 </script>
 </body>
 </html>

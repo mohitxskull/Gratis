@@ -14,20 +14,79 @@ use askama::Template;
 const TAILWIND_CSS: &str = include_str!("../assets/tailwind.css");
 const HTMX_JS: &str = include_str!("../assets/htmx.min.js");
 
+/// A country row for the locations list, with `connected` filled in by `src/api.rs` from the
+/// manager's (at most one) running tunnel — so the template can show "Connected" instead of an
+/// actionable control once a location has a tunnel, rather than leaving a stale-looking button.
+#[derive(Debug, Clone)]
+pub struct LocationRow {
+    pub code: String,
+    pub name: String,
+    pub load: f64,
+    pub connected: bool,
+}
+
+/// Builds `LocationRow`s by matching each `CountryInfo` against the currently running tunnel
+/// (if any). Shared by `index` and `ui_locations` in `src/api.rs`.
+pub fn location_rows(locations: Vec<CountryInfo>, active: Option<&TunnelInfo>) -> Vec<LocationRow> {
+    locations
+        .into_iter()
+        .map(|loc| {
+            let connected = active.is_some_and(|a| a.location.eq_ignore_ascii_case(&loc.code));
+            LocationRow {
+                code: loc.code,
+                name: loc.name,
+                load: loc.load,
+                connected,
+            }
+        })
+        .collect()
+}
+
+/// A server row for one country's expanded server list, with `connected` filled in by
+/// `src/api.rs`: `true` only for the exact server the running tunnel (if any) is on.
+#[derive(Debug, Clone)]
+pub struct ServerRow {
+    pub name: String,
+    pub load: f64,
+    pub connected: bool,
+}
+
+/// Builds `ServerRow`s for `location` by matching each `ServerSummary` against the currently
+/// running tunnel (if any). Shared by `ui_location_servers` in `src/api.rs`.
+pub fn server_rows(
+    location: &str,
+    servers: Vec<ServerSummary>,
+    active: Option<&TunnelInfo>,
+) -> Vec<ServerRow> {
+    servers
+        .into_iter()
+        .map(|s| {
+            let connected = active.is_some_and(|a| {
+                a.location.eq_ignore_ascii_case(location) && a.server.eq_ignore_ascii_case(&s.name)
+            });
+            ServerRow {
+                name: s.name,
+                load: s.load,
+                connected,
+            }
+        })
+        .collect()
+}
+
 #[derive(Template)]
 #[template(path = "index.html")]
 pub struct IndexTemplate {
     pub tailwind_css: &'static str,
     pub htmx_js: &'static str,
     pub login_error: Option<String>,
-    pub locations: Vec<CountryInfo>,
+    pub locations: Vec<LocationRow>,
     pub tunnels: Vec<TunnelInfo>,
 }
 
 impl IndexTemplate {
     pub fn new(
         login_error: Option<String>,
-        locations: Vec<CountryInfo>,
+        locations: Vec<LocationRow>,
         tunnels: Vec<TunnelInfo>,
     ) -> Self {
         Self {
@@ -43,7 +102,7 @@ impl IndexTemplate {
 #[derive(Template)]
 #[template(path = "locations.html")]
 pub struct LocationsTemplate {
-    pub locations: Vec<CountryInfo>,
+    pub locations: Vec<LocationRow>,
 }
 
 #[derive(Template)]
@@ -56,5 +115,15 @@ pub struct TunnelsTemplate {
 #[template(path = "servers.html")]
 pub struct ServersTemplate {
     pub location: String,
-    pub servers: Vec<ServerSummary>,
+    pub servers: Vec<ServerRow>,
+}
+
+/// An out-of-band error banner (`templates/action_error.html`'s `#action-error` div), sent
+/// alongside every start/stop action's response — see `render_tunnels_and_servers` in
+/// `src/api.rs`. `None` renders an empty div, which clears (via `hx-swap-oob`'s default
+/// outerHTML swap) whatever error was showing from a previous failed action.
+#[derive(Template)]
+#[template(path = "action_error.html")]
+pub struct ActionErrorTemplate {
+    pub error: Option<String>,
 }
