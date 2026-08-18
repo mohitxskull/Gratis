@@ -11,7 +11,7 @@
 //! `.env` file (see `main.rs`) — there is no supported way to log in via this API or the web
 //! UI, and `TunnelManager::login` is only ever called from `main.rs`'s startup sequence.
 use crate::manager::{ServerStatus, TunnelManager};
-use crate::webui::{IndexTemplate, ServersTemplate, server_rows};
+use crate::webui::{IndexTemplate, ServersTemplate};
 use askama::Template;
 use axum::{
     Json, Router,
@@ -54,9 +54,7 @@ async fn index(axum::extract::State(manager): axum::extract::State<Arc<TunnelMan
 /// The server table fragment, polled by the page every few seconds so status (connected,
 /// open connections, telemetry) stays live without a manual refresh.
 async fn ui_servers(axum::extract::State(manager): axum::extract::State<Arc<TunnelManager>>) -> Response {
-    render(ServersTemplate {
-        servers: server_rows(manager.servers()),
-    })
+    render(ServersTemplate::new(manager.servers()))
 }
 
 async fn list_servers(

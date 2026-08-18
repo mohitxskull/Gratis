@@ -132,6 +132,10 @@ struct ServerSlot {
 
     tunnel: Mutex<Option<SharedTunnel>>,
     connected_at: Mutex<Option<Instant>>,
+    /// When the tunnel will be torn down if `open_connections` stays at zero — set the moment
+    /// it hits zero, cleared the moment a new connection arrives. `None` whenever there's no
+    /// tunnel, or at least one connection is open.
+    idle_deadline: Mutex<Option<Instant>>,
     open_connections: AtomicU32,
     /// Bumped on every `acquire` (including reuses of an already-connected tunnel). An
     /// idle-teardown timer only acts if this hasn't moved since it was spawned — see
@@ -160,6 +164,7 @@ impl ServerSlot {
             stats: Arc::new(Mutex::new(TunnelStats::default())),
             tunnel: Mutex::new(None),
             connected_at: Mutex::new(None),
+            idle_deadline: Mutex::new(None),
             open_connections: AtomicU32::new(0),
             idle_generation: AtomicU64::new(0),
             connect_lock: AsyncMutex::new(()),
@@ -170,6 +175,7 @@ impl ServerSlot {
     fn status(&self) -> ServerStatus {
         let tunnel = self.tunnel.lock().unwrap().clone();
         let connected_at = *self.connected_at.lock().unwrap();
+        let idle_deadline = *self.idle_deadline.lock().unwrap();
         let stats = self.stats.lock().unwrap();
         ServerStatus {
             name: self.server.name.clone(),
@@ -185,6 +191,8 @@ impl ServerSlot {
                 .as_ref()
                 .and_then(|t| t.time_since_last_handshake())
                 .map(|d| d.as_secs()),
+            idle_countdown_secs: idle_deadline
+                .map(|d| d.saturating_duration_since(Instant::now()).as_secs()),
             bytes_sent: stats.bytes_sent,
             bytes_received: stats.bytes_received,
         }
@@ -196,8 +204,10 @@ impl TunnelSource for ServerSlot {
     async fn acquire(&self) -> std::result::Result<SharedTunnel, SourceError> {
         self.open_connections.fetch_add(1, Ordering::SeqCst);
         // Invalidates any idle-teardown timer spawned by a previous `release` — see that
-        // method's doc comment.
+        // method's doc comment. There's now at least one open connection, so no teardown is
+        // pending any more either way.
         self.idle_generation.fetch_add(1, Ordering::SeqCst);
+        *self.idle_deadline.lock().unwrap() = None;
 
         if let Some(tunnel) = self.tunnel.lock().unwrap().clone() {
             return Ok(tunnel);
@@ -239,6 +249,11 @@ impl TunnelSource for ServerSlot {
         // distinguish "still the same idle period" from "a fresh one that also happens to be
         // momentarily at zero").
         let generation = self.idle_generation.load(Ordering::SeqCst);
+        // Set synchronously, right as the count hits zero, so it's always the correct deadline
+        // for the current idle window — a subsequent `acquire` clears it immediately, before
+        // this window's countdown could ever be read as stale.
+        *self.idle_deadline.lock().unwrap() = Some(Instant::now() + IDLE_TIMEOUT);
+
         let Some(slot) = self.self_ref.upgrade() else {
             return;
         };
@@ -249,6 +264,7 @@ impl TunnelSource for ServerSlot {
             {
                 *slot.tunnel.lock().unwrap() = None;
                 *slot.connected_at.lock().unwrap() = None;
+                *slot.idle_deadline.lock().unwrap() = None;
             }
         });
     }
@@ -273,6 +289,9 @@ pub struct ServerStatus {
     pub uptime_secs: Option<u64>,
     /// Seconds since the last WireGuard handshake, or `None` if not currently connected.
     pub handshake_age_secs: Option<u64>,
+    /// Seconds until this server's tunnel tears itself down, or `None` unless it's currently
+    /// connected with zero open connections (i.e. actively counting down to idle teardown).
+    pub idle_countdown_secs: Option<u64>,
     pub bytes_sent: u64,
     pub bytes_received: u64,
 }

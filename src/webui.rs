@@ -61,6 +61,9 @@ pub struct ServerRow {
     pub handshake: String,
     pub sent: String,
     pub received: String,
+    /// Set only while connected with zero open connections — how long until this server's
+    /// tunnel tears itself down and it drops back to the idle list.
+    pub idle_countdown: Option<String>,
 }
 
 /// Convert raw [`ServerStatus`]es into display [`ServerRow`]s, sorted by country then server
@@ -90,8 +93,15 @@ pub fn server_rows(mut servers: Vec<ServerStatus>) -> Vec<ServerRow> {
                 .unwrap_or_else(|| "—".to_string()),
             sent: format_bytes(s.bytes_sent),
             received: format_bytes(s.bytes_received),
+            idle_countdown: s.idle_countdown_secs.map(|secs| format!("{secs}s")),
         })
         .collect()
+}
+
+/// How many rows in `rows` are currently connected (shown in the always-visible section,
+/// rather than the collapsed idle list).
+pub fn connected_count(rows: &[ServerRow]) -> usize {
+    rows.iter().filter(|r| r.connected).count()
 }
 
 #[derive(Template)]
@@ -100,14 +110,18 @@ pub struct IndexTemplate {
     pub tailwind_css: &'static str,
     pub htmx_js: &'static str,
     pub servers: Vec<ServerRow>,
+    pub connected_count: usize,
 }
 
 impl IndexTemplate {
     pub fn new(servers: Vec<ServerStatus>) -> Self {
+        let servers = server_rows(servers);
+        let connected_count = connected_count(&servers);
         Self {
             tailwind_css: TAILWIND_CSS,
             htmx_js: HTMX_JS,
-            servers: server_rows(servers),
+            servers,
+            connected_count,
         }
     }
 }
@@ -116,4 +130,16 @@ impl IndexTemplate {
 #[template(path = "servers.html")]
 pub struct ServersTemplate {
     pub servers: Vec<ServerRow>,
+    pub connected_count: usize,
+}
+
+impl ServersTemplate {
+    pub fn new(servers: Vec<ServerStatus>) -> Self {
+        let servers = server_rows(servers);
+        let connected_count = connected_count(&servers);
+        Self {
+            servers,
+            connected_count,
+        }
+    }
 }

@@ -32,12 +32,6 @@
         Refresh
       </button>
     </div>
-    <input
-      type="text"
-      placeholder="Filter by code, name, or country…"
-      oninput="filterServers(this.value)"
-      class="w-full bg-paper border border-ink/20 rounded px-3 py-2 text-sm placeholder-ink/40 mb-3 focus:outline-none focus:border-ink/60 focus:ring-1 focus:ring-ink/20"
-    >
     <div
       id="servers"
       hx-get="/ui/servers"
@@ -46,35 +40,26 @@
     >
       {% include "servers.html" %}
     </div>
-    <div id="servers-empty" class="hidden py-6 text-center text-ink/40 text-sm">No servers match your filter.</div>
   </section>
 
 </div>
 <script>{{ htmx_js|safe }}</script>
 <script>
-let serverFilter = '';
+// The idle-servers <details> collapse's open/closed state has to be preserved by hand across
+// every htmx swap of #servers (the 3s poll included) — otherwise a fresh render would reset it
+// closed every few seconds, undoing whatever the user just expanded it to check.
+let idleServersOpen = false;
 
-function filterServers(query) {
-  serverFilter = query.trim().toLowerCase();
-  applyServerFilter();
-}
-
-// Re-applies the current filter after any htmx swap of #servers — the "Refresh" button and the
-// 3s poll both replace rows there, which would otherwise silently drop the filter.
-function applyServerFilter() {
-  const rows = document.querySelectorAll('#servers > div');
-  let anyVisible = false;
-  rows.forEach((row) => {
-    const text = row.textContent.toLowerCase();
-    const match = text.includes(serverFilter);
-    row.classList.toggle('hidden', !match);
-    if (match) anyVisible = true;
-  });
-  document.getElementById('servers-empty').classList.toggle('hidden', rows.length === 0 || anyVisible || serverFilter === '');
-}
+document.body.addEventListener('htmx:beforeSwap', (e) => {
+  if (e.detail.target.id !== 'servers') return;
+  const details = document.getElementById('servers-idle-wrap');
+  if (details) idleServersOpen = details.open;
+});
 
 document.body.addEventListener('htmx:afterSwap', (e) => {
-  if (e.target.id === 'servers') applyServerFilter();
+  if (e.target.id !== 'servers') return;
+  const details = document.getElementById('servers-idle-wrap');
+  if (details) details.open = idleServersOpen;
 });
 </script>
 </body>
