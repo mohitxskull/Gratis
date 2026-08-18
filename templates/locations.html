@@ -1,7 +1,7 @@
 <div class="border border-ink/10 rounded divide-y divide-ink/10 bg-paper">
   {% for loc in locations %}
   <details class="group" data-code="{{ loc.code|lower }}" data-name="{{ loc.name|lower }}">
-    <summary class="flex items-center justify-between px-4 py-3 cursor-pointer select-none hover:bg-ink/[0.04] list-none [&::-webkit-details-marker]:hidden">
+    <summary class="flex items-center justify-between px-4 py-3 cursor-pointer select-none hover:bg-ink/[0.04] list-none [&::-webkit-details-marker]:hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ink/30">
       <span class="flex items-center gap-3 min-w-0">
         <svg class="w-3 h-3 text-ink/40 shrink-0 transition-transform group-open:rotate-90" viewBox="0 0 8 8" fill="currentColor"><path d="M1 0l6 4-6 4z"/></svg>
         <span class="font-mono text-sm text-ink">{{ loc.code }}</span>
@@ -10,7 +10,7 @@
       <span class="flex items-center gap-4 shrink-0">
         {% if loc.connected %}
         <span class="flex items-center gap-1.5 text-xs text-ink/70">
-          <span class="inline-block w-1.5 h-1.5 rounded-full bg-ink"></span>Connected
+           <span class="inline-block w-1.5 h-1.5 rounded-full bg-connected"></span>Connected
         </span>
         {% endif %}
         <span class="text-xs text-ink/50 tabular-nums">{{ loc.load }}%</span>
@@ -26,6 +26,6 @@
   </details>
   {% endfor %}
   {% if locations.is_empty() %}
-  <div class="py-6 text-center text-ink/40 text-sm">No locations available — is the daemon logged in?</div>
+  <div class="py-6 text-center text-ink/40 text-sm">No locations available. The daemon couldn't log in — check the credentials in your `.env` and restart it.</div>
   {% endif %}
 </div>

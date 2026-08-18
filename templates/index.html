@@ -11,9 +11,10 @@
 
   <header class="mb-12 border-b border-ink/10 pb-6">
     <h1 class="text-3xl font-semibold tracking-tight">Gratis</h1>
+    <p class="text-sm text-ink/50 mt-1">Local Proton VPN control panel — start and manage SOCKS5 tunnels.</p>
   </header>
 
-  <div id="action-error"></div>
+  <div id="action-error" class="fixed top-4 right-4 z-50 max-w-sm w-[calc(100%-2rem)]"></div>
 
   {% if let Some(err) = login_error %}
   <div class="border border-ink/15 bg-paper-dim rounded p-4 text-sm mb-10">
@@ -30,7 +31,7 @@
         hx-swap="innerHTML"
         hx-indicator="#tunnels-spinner"
         hx-disabled-elt="this"
-        class="flex items-center gap-1.5 text-xs uppercase tracking-wide text-ink/50 hover:text-ink transition disabled:opacity-40"
+        class="flex items-center gap-1.5 text-xs uppercase tracking-wide text-ink/50 hover:text-ink transition disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ink/30"
       >
         <svg id="tunnels-spinner" class="htmx-indicator spinner w-3 h-3" viewBox="0 0 24 24" fill="none">
           <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3" stroke-opacity="0.25"/>
@@ -42,7 +43,7 @@
     <div
       id="tunnels"
       hx-get="/ui/tunnels"
-      hx-trigger="every 3s"
+      hx-trigger="every 3s[!(document.activeElement && document.activeElement.closest('#tunnels'))]"
       hx-swap="innerHTML"
     >
       {% include "tunnels.html" %}
@@ -58,7 +59,7 @@
         hx-swap="innerHTML"
         hx-indicator="#locations-spinner"
         hx-disabled-elt="this"
-        class="flex items-center gap-1.5 text-xs uppercase tracking-wide text-ink/50 hover:text-ink transition disabled:opacity-40"
+        class="flex items-center gap-1.5 text-xs uppercase tracking-wide text-ink/50 hover:text-ink transition disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ink/30"
       >
         <svg id="locations-spinner" class="htmx-indicator spinner w-3 h-3" viewBox="0 0 24 24" fill="none">
           <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3" stroke-opacity="0.25"/>

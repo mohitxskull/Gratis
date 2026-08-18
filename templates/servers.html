@@ -6,15 +6,16 @@
       <span class="text-ink/50 tabular-nums text-xs">{{ s.load }}% load</span>
       {% if s.connected %}
       <span class="flex items-center gap-1.5 text-xs uppercase tracking-wide text-ink/50 border border-ink/15 rounded px-2.5 py-0.5">
-        <span class="inline-block w-1.5 h-1.5 rounded-full bg-ink"></span>Connected
+         <span class="inline-block w-1.5 h-1.5 rounded-full bg-connected"></span>Connected
       </span>
       {% else %}
       <button
+        {% if s.location_connected %}disabled{% endif %}
         hx-post="/ui/tunnels/{{ location }}/start/{{ s.name|urlencode_strict }}"
         hx-target="#tunnels"
         hx-swap="innerHTML"
         hx-disabled-elt="this"
-        class="text-xs uppercase tracking-wide border border-ink/25 rounded px-2.5 py-0.5 hover:bg-ink hover:text-paper transition disabled:opacity-40"
+        class="text-xs uppercase tracking-wide border border-ink/25 rounded px-2.5 py-0.5 hover:bg-ink hover:text-paper transition disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ink/30" title="Another server in this location is already connected"
       >Connect</button>
       {% endif %}
     </span>

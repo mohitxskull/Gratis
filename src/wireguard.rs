@@ -18,6 +18,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use wireguard_netstack::{ManagedTunnel, WireGuardConfig};
 
@@ -181,6 +182,24 @@ impl Tunnel {
             }
         }
     }
+
+    /// Seconds since the last successful WireGuard handshake, or `None` if the
+    /// tunnel isn't a real WireGuard session (e.g. the test Loopback).
+    pub fn time_since_last_handshake(&self) -> Option<Duration> {
+        match self {
+            Self::Real(managed) => managed.time_since_last_handshake(),
+            Self::Loopback => None,
+        }
+    }
+}
+
+/// Cumulative bytes relayed through a tunnel's SOCKS5 proxy.
+#[derive(Default)]
+pub struct TunnelStats {
+    /// Bytes from the local client out to the tunnel/Internet (upload).
+    pub bytes_sent: u64,
+    /// Bytes from the tunnel/Internet back to the local client (download).
+    pub bytes_received: u64,
 }
 
 /// Shared handle to a running tunnel, so both the manager and the SOCKS5 relay tasks it spawns

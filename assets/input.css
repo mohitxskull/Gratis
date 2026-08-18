@@ -11,6 +11,7 @@
   --color-paper: #f7f5f1;
   --color-paper-dim: #efece5;
   --color-ink: #1a1815;
+  --color-connected: #2f7d5b;
 }
 
 @layer utilities {

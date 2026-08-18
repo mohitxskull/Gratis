@@ -11,6 +11,66 @@
 use crate::manager::{CountryInfo, ServerSummary, TunnelInfo};
 use askama::Template;
 
+/// Display-oriented view of a [`TunnelInfo`] with pre-formatted telemetry strings.
+pub struct TunnelView {
+    pub location: String,
+    pub server: String,
+    pub socks_port: u16,
+    pub connected: bool,
+    pub uptime: String,
+    pub handshake: String,
+    pub sent: String,
+    pub received: String,
+}
+
+fn format_duration(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.2} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Convert raw [`TunnelInfo`]s into display [`TunnelView`]s with human-readable telemetry.
+pub fn tunnel_views(tunnels: Vec<TunnelInfo>) -> Vec<TunnelView> {
+    tunnels
+        .into_iter()
+        .map(|t| TunnelView {
+            location: t.location,
+            server: t.server,
+            socks_port: t.socks_port,
+            connected: t.connected,
+            uptime: format_duration(t.uptime_secs),
+            handshake: t
+                .handshake_age_secs
+                .map(|s| format!("{s}s ago"))
+                .unwrap_or_else(|| "—".to_string()),
+            sent: format_bytes(t.bytes_sent),
+            received: format_bytes(t.bytes_received),
+        })
+        .collect()
+}
+
 const TAILWIND_CSS: &str = include_str!("../assets/tailwind.css");
 const HTMX_JS: &str = include_str!("../assets/htmx.min.js");
 
@@ -35,7 +95,7 @@ pub fn location_rows(locations: Vec<CountryInfo>, active: Option<&TunnelInfo>) -
             LocationRow {
                 code: loc.code,
                 name: loc.name,
-                load: loc.load,
+                load: loc.load.round(),
                 connected,
             }
         })
@@ -49,6 +109,7 @@ pub struct ServerRow {
     pub name: String,
     pub load: f64,
     pub connected: bool,
+    pub location_connected: bool,
 }
 
 /// Builds `ServerRow`s for `location` by matching each `ServerSummary` against the currently
@@ -64,10 +125,12 @@ pub fn server_rows(
             let connected = active.is_some_and(|a| {
                 a.location.eq_ignore_ascii_case(location) && a.server.eq_ignore_ascii_case(&s.name)
             });
+            let location_connected = active.is_some_and(|a| a.location.eq_ignore_ascii_case(location));
             ServerRow {
                 name: s.name,
-                load: s.load,
+                load: s.load.round(),
                 connected,
+                location_connected,
             }
         })
         .collect()
@@ -81,6 +144,7 @@ pub struct IndexTemplate {
     pub login_error: Option<String>,
     pub locations: Vec<LocationRow>,
     pub tunnels: Vec<TunnelInfo>,
+    pub tunnel_views: Vec<TunnelView>,
 }
 
 impl IndexTemplate {
@@ -94,7 +158,8 @@ impl IndexTemplate {
             htmx_js: HTMX_JS,
             login_error,
             locations,
-            tunnels,
+            tunnels: tunnels.clone(),
+            tunnel_views: tunnel_views(tunnels),
         }
     }
 }
@@ -108,7 +173,7 @@ pub struct LocationsTemplate {
 #[derive(Template)]
 #[template(path = "tunnels.html")]
 pub struct TunnelsTemplate {
-    pub tunnels: Vec<TunnelInfo>,
+    pub tunnel_views: Vec<TunnelView>,
 }
 
 #[derive(Template)]

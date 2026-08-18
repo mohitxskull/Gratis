@@ -11,7 +11,7 @@ use crate::errors::ProtonError;
 use crate::manager::{CountryInfo, TunnelInfo, TunnelManager};
 use crate::webui::{
     ActionErrorTemplate, IndexTemplate, LocationsTemplate, ServersTemplate, TunnelsTemplate,
-    location_rows, server_rows,
+    location_rows, server_rows, tunnel_views,
 };
 use askama::Template;
 use axum::{
@@ -94,7 +94,7 @@ async fn ui_location_servers(
 /// Tunnels table fragment, for the "Refresh" button and after start/stop actions.
 async fn ui_tunnels(State(manager): State<Arc<TunnelManager>>) -> Response {
     render(TunnelsTemplate {
-        tunnels: manager.tunnels(),
+        tunnel_views: tunnel_views(manager.tunnels()),
     })
 }
 
@@ -150,7 +150,10 @@ async fn render_tunnels_and_servers(
     let servers = manager.list_servers_in(location).await.unwrap_or_default();
     let servers = server_rows(location, servers, tunnels.first());
 
-    let tunnels_html = TunnelsTemplate { tunnels }.render();
+    let tunnels_html = TunnelsTemplate {
+        tunnel_views: tunnel_views(tunnels),
+    }
+    .render();
     let servers_html = ServersTemplate {
         location: location.to_string(),
         servers,

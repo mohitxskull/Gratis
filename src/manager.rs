@@ -30,11 +30,12 @@ use crate::credentials;
 use crate::errors::*;
 use crate::models::{VPNCredentials, VPNServer};
 use crate::socks5;
-use crate::wireguard::{self, CurrentTunnel, SharedTunnel, Tunnel};
+use crate::wireguard::{self, CurrentTunnel, SharedTunnel, Tunnel, TunnelStats};
 use async_trait::async_trait;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
@@ -56,7 +57,12 @@ pub trait TunnelDriver: Send + Sync {
     /// manager can `abort()` it on `stop()`. `tunnel` is a swappable slot (see
     /// [`CurrentTunnel`]) rather than a fixed tunnel, so the manager can hot-swap which
     /// server it points at later without respawning this task.
-    fn spawn_socks5(&self, listen_addr: String, tunnel: CurrentTunnel) -> JoinHandle<()>;
+    fn spawn_socks5(
+        &self,
+        listen_addr: String,
+        tunnel: CurrentTunnel,
+        stats: Arc<Mutex<TunnelStats>>,
+    ) -> JoinHandle<()>;
 }
 
 /// Production driver: brings up a real userspace WireGuard tunnel and binds a real SOCKS5
@@ -74,9 +80,14 @@ impl TunnelDriver for RealDriver {
         Ok(Arc::new(tunnel))
     }
 
-    fn spawn_socks5(&self, listen_addr: String, tunnel: CurrentTunnel) -> JoinHandle<()> {
+    fn spawn_socks5(
+        &self,
+        listen_addr: String,
+        tunnel: CurrentTunnel,
+        stats: Arc<Mutex<TunnelStats>>,
+    ) -> JoinHandle<()> {
         tokio::spawn(async move {
-            if let Err(err) = socks5::run_socks5(&listen_addr, tunnel).await {
+            if let Err(err) = socks5::run_socks5(&listen_addr, tunnel, stats).await {
                 eprintln!("socks5 listener on {listen_addr} exited: {err}");
             }
         })
@@ -93,6 +104,8 @@ struct RunningTunnel {
     interface: String,
     current: CurrentTunnel,
     task: JoinHandle<()>,
+    started_at: Instant,
+    stats: Arc<Mutex<TunnelStats>>,
 }
 
 /// A country available to connect to, derived from the logged-in client's server list.
@@ -122,6 +135,14 @@ pub struct TunnelInfo {
     /// Whether the SOCKS5 task backing this tunnel is still running, derived from
     /// `JoinHandle::is_finished()`.
     pub connected: bool,
+    /// Seconds the current tunnel session has been running.
+    pub uptime_secs: u64,
+    /// Seconds since the last WireGuard handshake, or `None` if not a real session.
+    pub handshake_age_secs: Option<u64>,
+    /// Bytes relayed client→Internet (upload) by the SOCKS5 proxy.
+    pub bytes_sent: u64,
+    /// Bytes relayed Internet→client (download) by the SOCKS5 proxy.
+    pub bytes_received: u64,
 }
 
 /// Account tier used for `find_servers`'s `user_tier` filter.
@@ -342,7 +363,11 @@ impl TunnelManager {
 
         let listen_addr = format!("127.0.0.1:{}", self.socks_port);
         let current: CurrentTunnel = Arc::new(std::sync::Mutex::new(tunnel));
-        let task = self.driver.spawn_socks5(listen_addr, current.clone());
+        let stats = Arc::new(Mutex::new(TunnelStats::default()));
+        let started_at = Instant::now();
+        let task = self
+            .driver
+            .spawn_socks5(listen_addr, current.clone(), stats.clone());
 
         // No race to check for here any more: `_guard` has held the switch lock for the
         // entire sequence above, so no concurrent call could have run any of it meanwhile.
@@ -352,6 +377,8 @@ impl TunnelManager {
             interface,
             current,
             task,
+            started_at,
+            stats,
         });
         Ok(self.socks_port)
     }
@@ -428,12 +455,28 @@ impl TunnelManager {
             .lock()
             .unwrap()
             .as_ref()
-            .map(|a| TunnelInfo {
-                location: a.location.clone(),
-                interface: a.interface.clone(),
-                socks_port: self.socks_port,
-                server: a.server.clone(),
-                connected: !a.task.is_finished(),
+            .map(|a| {
+                let started_at = a.started_at;
+                let stats = a.stats.lock().unwrap();
+                let (bytes_sent, bytes_received) = (stats.bytes_sent, stats.bytes_received);
+                drop(stats);
+                let handshake_age_secs = a
+                    .current
+                    .lock()
+                    .unwrap()
+                    .time_since_last_handshake()
+                    .map(|d| d.as_secs());
+                TunnelInfo {
+                    location: a.location.clone(),
+                    interface: a.interface.clone(),
+                    socks_port: self.socks_port,
+                    server: a.server.clone(),
+                    connected: !a.task.is_finished(),
+                    uptime_secs: started_at.elapsed().as_secs(),
+                    handshake_age_secs,
+                    bytes_sent,
+                    bytes_received,
+                }
             })
             .into_iter()
             .collect()
@@ -475,7 +518,12 @@ mod tests {
             Ok(Arc::new(Tunnel::loopback_for_testing()))
         }
 
-        fn spawn_socks5(&self, _listen_addr: String, _tunnel: CurrentTunnel) -> JoinHandle<()> {
+        fn spawn_socks5(
+            &self,
+            _listen_addr: String,
+            _tunnel: CurrentTunnel,
+            _stats: Arc<Mutex<TunnelStats>>,
+        ) -> JoinHandle<()> {
             tokio::spawn(async {
                 // Stand in for `run_socks5`'s infinite accept loop: never returns on its own,
                 // only via `abort()`, matching the real driver's task shape.
@@ -508,15 +556,20 @@ mod tests {
         {
             let current: CurrentTunnel =
                 Arc::new(std::sync::Mutex::new(Arc::new(Tunnel::loopback_for_testing())));
-            let task = manager
-                .driver
-                .spawn_socks5("127.0.0.1:11000".to_string(), current.clone());
+            let stats = Arc::new(Mutex::new(TunnelStats::default()));
+            let task = manager.driver.spawn_socks5(
+                "127.0.0.1:11000".to_string(),
+                current.clone(),
+                stats.clone(),
+            );
             *manager.active.lock().unwrap() = Some(RunningTunnel {
                 location: "US".to_string(),
                 server: "US#1".to_string(),
                 interface: wireguard::interface_name("US"),
                 current,
                 task,
+                started_at: Instant::now(),
+                stats,
             });
         }
 

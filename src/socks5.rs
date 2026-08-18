@@ -20,9 +20,10 @@
 //! tunnel manager. Each accepted client connection is handled on its own spawned task, so
 //! there is no artificial concurrency cap.
 
-use crate::wireguard::{CurrentTunnel, SharedTunnel};
+use crate::wireguard::{CurrentTunnel, SharedTunnel, TunnelStats};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -53,7 +54,11 @@ const REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 ///
 /// This future only returns (with `Err`) if the listener fails to bind; otherwise it runs
 /// forever, spawning one task per accepted connection.
-pub async fn run_socks5(listen_addr: &str, current: CurrentTunnel) -> io::Result<()> {
+pub async fn run_socks5(
+    listen_addr: &str,
+    current: CurrentTunnel,
+    stats: Arc<Mutex<TunnelStats>>,
+) -> io::Result<()> {
     let listener = TcpListener::bind(listen_addr).await?;
 
     loop {
@@ -67,15 +72,20 @@ pub async fn run_socks5(listen_addr: &str, current: CurrentTunnel) -> io::Result
             }
         };
         let tunnel = current.lock().unwrap().clone();
+        let stats = stats.clone();
         tokio::spawn(async move {
-            if let Err(_err) = handle_client(client, tunnel).await {
+            if let Err(_err) = handle_client(client, tunnel, stats.clone()).await {
                 // Best-effort relay: any I/O error just ends this connection's task.
             }
         });
     }
 }
 
-async fn handle_client(mut client: TcpStream, tunnel: SharedTunnel) -> io::Result<()> {
+async fn handle_client(
+    mut client: TcpStream,
+    tunnel: SharedTunnel,
+    stats: Arc<Mutex<TunnelStats>>,
+) -> io::Result<()> {
     negotiate_method(&mut client).await?;
 
     let (cmd, target) = match read_request(&mut client).await {
@@ -120,7 +130,7 @@ async fn handle_client(mut client: TcpStream, tunnel: SharedTunnel) -> io::Resul
 
     send_reply(&mut client, REP_SUCCEEDED, local_v4_zero()).await?;
 
-    relay(client, outbound).await
+    relay(client, outbound, stats).await
 }
 
 /// The target of a `CONNECT` request: either an already-resolved socket address, or a
@@ -248,6 +258,7 @@ fn local_v4_zero() -> SocketAddr {
 async fn relay(
     client: TcpStream,
     outbound: Box<dyn crate::wireguard::TunnelConnection>,
+    stats: Arc<Mutex<TunnelStats>>,
 ) -> io::Result<()> {
     let (mut client_rd, mut client_wr) = client.into_split();
 
@@ -259,6 +270,7 @@ async fn relay(
                 break;
             }
             outbound.write_all(&buf[..n]).await?;
+            stats.lock().unwrap().bytes_sent += n as u64;
         }
         outbound.shutdown();
         Ok::<(), io::Error>(())
@@ -272,6 +284,7 @@ async fn relay(
                 break;
             }
             client_wr.write_all(&buf[..n]).await?;
+            stats.lock().unwrap().bytes_received += n as u64;
         }
         let _ = client_wr.shutdown().await;
         Ok::<(), io::Error>(())
