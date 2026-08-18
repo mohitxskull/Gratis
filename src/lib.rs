@@ -2,6 +2,7 @@ pub mod api;
 pub mod client;
 pub mod credentials;
 pub mod errors;
+pub mod keys;
 pub mod manager;
 pub mod models;
 pub mod socks5;

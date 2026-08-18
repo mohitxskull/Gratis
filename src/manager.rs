@@ -19,7 +19,6 @@
 use crate::client::ProtonVPNClient;
 use crate::credentials;
 use crate::errors::*;
-use crate::models;
 use crate::socks5;
 use crate::wireguard;
 use serde::Serialize;
@@ -288,8 +287,7 @@ impl TunnelManager {
         };
 
         let interface = wireguard::interface_name(location);
-        let client_address = models::client_address_from_certificate(&creds.certificate)?;
-        let config = wireguard::generate_config(&server, &creds, &client_address, &interface);
+        let config = wireguard::generate_config(&server, &creds, &interface)?;
 
         let driver = self.driver.clone();
         let up_interface = interface.clone();
@@ -585,19 +583,24 @@ eRd1dKRVcDggq2K+vBNH5fXpGufy8FPBsFFnA5ZDGFrqpg==
             tier: 0,
             load: 12.0,
             features: vec![],
-            ips: vec!["203.0.113.9".into()],
             status: 1,
-            wg_public_key: "SERVERPUBKEYBASE64==".into(),
+            physical: vec![crate::models::PhysicalServer {
+                entry_ip: "203.0.113.9".into(),
+                domain: "test.protonvpn.net".into(),
+                x25519_public_key: "SERVERPUBKEYBASE64==".into(),
+                enabled: true,
+            }],
         }
     }
 
     fn test_creds() -> crate::models::VPNCredentials {
         crate::models::VPNCredentials {
             username: "testuser".into(),
-            password: "unused-in-wg-config".into(),
-            certificate: TEST_CERT_PEM.into(),
+            ed25519_seed_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             wg_public_key: "CLIENTPUBKEYBASE64==".into(),
             wg_private_key: "CLIENTPRIVKEYBASE64==".into(),
+            certificate: TEST_CERT_PEM.into(),
+            certificate_expires_at: 9_999_999_999,
         }
     }
 

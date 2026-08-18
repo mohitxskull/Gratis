@@ -22,11 +22,20 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 x509-parser = "0.16"
 socket2 = { version = "0.5", features = ["all"] }
 axum = "0.7"
+# WHY: the WireGuard client identity is generated locally, never issued by the server (Proton
+# hands back a signed certificate for a client-supplied public key, not a private key) —
+# verified against the official proton-vpn-api-core client's key_mgr.py/credentials.py.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 base64 = "0.22"
 tempfile = "3"
 tower = { version = "0.4", features = ["util"] }
+boringtun = "0.7"
+etherparse = "0.21"
 
 [profile.release]
 # dev tool; keep default.

@@ -1,5 +1,5 @@
 {
-    "Servers": [
+    "LogicalServers": [
         {
             "ID": "srv-us-free-1",
             "Name": "US-FREE#1",
@@ -7,11 +7,16 @@
             "City": "New York",
             "Tier": 0,
             "Load": 42.0,
-            "Features": 1,
-            "IsSecureCore": false,
+            "Features": 4,
             "Status": 1,
-            "Addresses": [{ "IP": "203.0.113.10" }],
-            "WGPublicKey": "USfree1WgPubKeyBase64AAAAAAAAAAAAAAAAAAAAAA="
+            "Servers": [
+                {
+                    "EntryIP": "203.0.113.10",
+                    "Domain": "node1.us-free.protonvpn.net",
+                    "Status": 1,
+                    "X25519PublicKey": "USfree1WgPubKeyBase64AAAAAAAAAAAAAAAAAAAAAA="
+                }
+            ]
         },
         {
             "ID": "srv-us-free-2",
@@ -21,10 +26,15 @@
             "Tier": 0,
             "Load": 11.0,
             "Features": 0,
-            "IsSecureCore": false,
             "Status": 1,
-            "Addresses": [{ "IP": "203.0.113.11" }],
-            "WGPublicKey": "USfree2WgPubKeyBase64BBBBBBBBBBBBBBBBBBBBBB="
+            "Servers": [
+                {
+                    "EntryIP": "203.0.113.11",
+                    "Domain": "node2.us-free.protonvpn.net",
+                    "Status": 1,
+                    "X25519PublicKey": "USfree2WgPubKeyBase64BBBBBBBBBBBBBBBBBBBBBB="
+                }
+            ]
         },
         {
             "ID": "srv-us-plus-1",
@@ -33,11 +43,22 @@
             "City": "Chicago",
             "Tier": 2,
             "Load": 5.0,
-            "Features": 9,
-            "IsSecureCore": false,
+            "Features": 6,
             "Status": 1,
-            "Addresses": [{ "IP": "203.0.113.12" }],
-            "WGPublicKey": "USplus1WgPubKeyBase64CCCCCCCCCCCCCCCCCCCCCC="
+            "Servers": [
+                {
+                    "EntryIP": "203.0.113.12",
+                    "Domain": "node1.us-plus.protonvpn.net",
+                    "Status": 1,
+                    "X25519PublicKey": "USplus1WgPubKeyBase64CCCCCCCCCCCCCCCCCCCCCC="
+                },
+                {
+                    "EntryIP": "203.0.113.13",
+                    "Domain": "node2.us-plus.protonvpn.net",
+                    "Status": 0,
+                    "X25519PublicKey": "USplus1bWgPubKeyBase64GGGGGGGGGGGGGGGGGGGGG="
+                }
+            ]
         },
         {
             "ID": "srv-nl-free-1",
@@ -46,11 +67,16 @@
             "City": "Amsterdam",
             "Tier": 0,
             "Load": 20.0,
-            "Features": 8,
-            "IsSecureCore": false,
+            "Features": 2,
             "Status": 1,
-            "Addresses": [{ "IP": "203.0.113.20" }],
-            "WGPublicKey": "NLfree1WgPubKeyBase64DDDDDDDDDDDDDDDDDDDDDD="
+            "Servers": [
+                {
+                    "EntryIP": "203.0.113.20",
+                    "Domain": "node1.nl-free.protonvpn.net",
+                    "Status": 1,
+                    "X25519PublicKey": "NLfree1WgPubKeyBase64DDDDDDDDDDDDDDDDDDDDDD="
+                }
+            ]
         },
         {
             "ID": "srv-se-sc-1",
@@ -59,11 +85,16 @@
             "City": "Stockholm",
             "Tier": 2,
             "Load": 8.0,
-            "Features": 0,
-            "IsSecureCore": true,
+            "Features": 1,
             "Status": 1,
-            "Addresses": [{ "IP": "203.0.113.30" }],
-            "WGPublicKey": "SEsc1WgPubKeyBase64EEEEEEEEEEEEEEEEEEEEEEEE="
+            "Servers": [
+                {
+                    "EntryIP": "203.0.113.30",
+                    "Domain": "node1.se-sc.protonvpn.net",
+                    "Status": 1,
+                    "X25519PublicKey": "SEsc1WgPubKeyBase64EEEEEEEEEEEEEEEEEEEEEEEE="
+                }
+            ]
         },
         {
             "ID": "srv-de-maint-1",
@@ -73,10 +104,15 @@
             "Tier": 0,
             "Load": 1.0,
             "Features": 0,
-            "IsSecureCore": false,
             "Status": 0,
-            "Addresses": [{ "IP": "203.0.113.40" }],
-            "WGPublicKey": "DEmaint1WgPubKeyBase64FFFFFFFFFFFFFFFFFFFFFF="
+            "Servers": [
+                {
+                    "EntryIP": "203.0.113.40",
+                    "Domain": "node1.de.protonvpn.net",
+                    "Status": 1,
+                    "X25519PublicKey": "DEmaint1WgPubKeyBase64FFFFFFFFFFFFFFFFFFFFFF="
+                }
+            ]
         }
     ]
 }

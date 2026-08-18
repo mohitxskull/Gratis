@@ -1,7 +1,9 @@
 {
-    "version": 4,
-    "salt": "tkCXC7BqxwRPMKxGf+oRyw==",
-    "server_ephemeral": "AgB5C46khpJfBn67AjuNhJQwktH9CXd/aby+/inMHDGXPD8626YNEn1twJv+xfJoqnsTYdYv6UQ3sIDSx+8dEI2nuHcZsiHO6mPslRnQ6EFemnieG5bwwk8oQ6bJsmXay4dx03X/oxiLbJ18CD4yGO3ke/2/Z6Ve1sy35Liok6JSRIgQC5gdVXCxNmgSWCtnrequLvn95TcJ1KCBg4Onifhfk4UwFt6MZoKBLGf3QVN9Zki0w9TZhpNM3IW0u/1I+ACouZwUSGv9sg4Gutcr0IPK7dJBsKBQXwONPEt+M27MBWp2EE6hItkFCWC5xY+GGWL18R34rKS9UwvoD04aqg==",
-    "srp_session": "synthetic-srp-session-id-0001",
-    "modulus": "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\ny6TtufhYg2mIeauZYOti+GPbd/0vP66kP34TgE6elK/kXkTW/Yfrp1jMmtLiWWSq5cszTMRIEighuwPbZ/z3RrWPxsOg0+jYgbFu8yZ8vOAwrPtLxZl94x0PFTAZBrVapmCn+VYcM+UXdO9v70xFDLwj34tpPbvpODHVWHSlGlhOwndWg3XBE2D9PJopFZajNZiqOScBXree5rDgzU5BBaPbIb6nySpyaeThMCcNzpcEqE8r3ro+E/VdXBvSSJpusr1dvAwHc3IDGUzAhodqV5mjYy9nXwq/9gHWpYNtm76Ols7ReWAhZwy1+cQllQZwGfzzOVGpc+3WutOntQjM6Q==\n-----BEGIN PGP SIGNATURE-----\nVersion: ProtonMail\nComment: https://protonmail.com\n\nwl4EARYIABAFAlwB1j8JEDUFhcTpUY8mAADfEAD8DFdNXn4TsgbfbAZRDa9a\nyywqa/2W9Qyg5MJaNZd2a+0BAPg04gEZI+G8RaoPVh/SYvWx7jpP3L1O8bEi\nM/j1cjIO\n=5RYw\n-----END PGP SIGNATURE-----"
+    "Code": 1000,
+    "Version": 4,
+    "Salt": "tkCXC7BqxwRPMKxGf+oRyw==",
+    "ServerEphemeral": "AgB5C46khpJfBn67AjuNhJQwktH9CXd/aby+/inMHDGXPD8626YNEn1twJv+xfJoqnsTYdYv6UQ3sIDSx+8dEI2nuHcZsiHO6mPslRnQ6EFemnieG5bwwk8oQ6bJsmXay4dx03X/oxiLbJ18CD4yGO3ke/2/Z6Ve1sy35Liok6JSRIgQC5gdVXCxNmgSWCtnrequLvn95TcJ1KCBg4Onifhfk4UwFt6MZoKBLGf3QVN9Zki0w9TZhpNM3IW0u/1I+ACouZwUSGv9sg4Gutcr0IPK7dJBsKBQXwONPEt+M27MBWp2EE6hItkFCWC5xY+GGWL18R34rKS9UwvoD04aqg==",
+    "SRPSession": "synthetic-srp-session-id-0001",
+    "Modulus": "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\ny6TtufhYg2mIeauZYOti+GPbd/0vP66kP34TgE6elK/kXkTW/Yfrp1jMmtLiWWSq5cszTMRIEighuwPbZ/z3RrWPxsOg0+jYgbFu8yZ8vOAwrPtLxZl94x0PFTAZBrVapmCn+VYcM+UXdO9v70xFDLwj34tpPbvpODHVWHSlGlhOwndWg3XBE2D9PJopFZajNZiqOScBXree5rDgzU5BBaPbIb6nySpyaeThMCcNzpcEqE8r3ro+E/VdXBvSSJpusr1dvAwHc3IDGUzAhodqV5mjYy9nXwq/9gHWpYNtm76Ols7ReWAhZwy1+cQllQZwGfzzOVGpc+3WutOntQjM6Q==\n-----BEGIN PGP SIGNATURE-----\nVersion: ProtonMail\nComment: https://protonmail.com\n\nwl4EARYIABAFAlwB1j8JEDUFhcTpUY8mAADfEAD8DFdNXn4TsgbfbAZRDa9a\nyywqa/2W9Qyg5MJaNZd2a+0BAPg04gEZI+G8RaoPVh/SYvWx7jpP3L1O8bEi\nM/j1cjIO\n=5RYw\n-----END PGP SIGNATURE-----",
+    "Username": "test-user"
 }

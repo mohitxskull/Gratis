@@ -1,16 +1,31 @@
 //! Data models and API DTOs.
 //!
-//! Field names follow the JSON from Proton's API. The correctness reference for the
-//! auth/session/WireGuard flow is the official client:
-//! <https://github.com/ProtonVPN/proton-vpn-cli>
-use crate::errors::{ProtonError, Result};
+//! Field names and endpoint shapes were originally sourced from `tmp/proton-vpn-cli`, which
+//! turned out to be the wrong layer (the CLI, not the API client) and got several things
+//! wrong. They are now verified against the real API and the official client's source
+//! (`proton-core`/`proton-vpn-api-core`, installed system-wide on the dev machine at
+//! `/usr/lib/python3/dist-packages/proton/`), and against a real live login.
 use serde::Deserialize;
 
 pub const PROTON_API_URL: &str = "https://api.protonvpn.ch";
 pub const USER_AGENT: &str = "ProtonVPN-CustomClient/1.0";
 
-/// A VPN server as returned by `GET /vpn/v1/servers`.
-#[derive(Debug, Clone, Deserialize)]
+/// One physical server backing a logical server. A logical server ("CH#10") can be served by
+/// several physical machines; the entry IP and WireGuard peer public key are properties of the
+/// *physical* server, never mixed across two different physical entries (this was the root
+/// cause of Flagged gap #2 in the old Python: pairing `ips[0]` with a key that belonged to a
+/// different physical server, or simply reading the wrong field).
+#[derive(Debug, Clone)]
+pub struct PhysicalServer {
+    pub entry_ip: String,
+    pub domain: String,
+    /// Base64-encoded X25519 public key — verified live field name `X25519PublicKey`.
+    pub x25519_public_key: String,
+    pub enabled: bool,
+}
+
+/// A logical VPN server ("CH#10"), aggregating one or more physical servers.
+#[derive(Debug, Clone)]
 pub struct VPNServer {
     pub id: String,
     pub name: String,
@@ -20,76 +35,76 @@ pub struct VPNServer {
     pub tier: i32,
     pub load: f64,
     pub features: Vec<String>,
-    pub ips: Vec<String>,
     pub status: i32,
-    // Captured from the live /vpn/v1/servers response (Flagged gap #2): the real
-    // WireGuard peer public key field is confirmed against proton-vpn-cli at impl time.
-    // It must NOT be `ips[0]` (that is the server IP, not the WG key).
-    pub wg_public_key: String,
+    pub physical: Vec<PhysicalServer>,
 }
 
-/// Per-account VPN credentials from `GET /vpn/v2/account`.
-#[derive(Debug, Clone, Deserialize)]
+impl VPNServer {
+    /// Pick a physical server to connect through: the first enabled one, or (if none are
+    /// marked enabled) the first one at all. Returns `None` only if the logical has no
+    /// physical servers listed.
+    pub fn pick_physical(&self) -> Option<&PhysicalServer> {
+        self.physical
+            .iter()
+            .find(|p| p.enabled)
+            .or_else(|| self.physical.first())
+    }
+}
+
+/// Client-side WireGuard/certificate identity plus the certificate Proton issued for it.
+///
+/// Verified against `proton-vpn-api-core`: Proton's API never hands back a WireGuard private
+/// key. The client generates an ed25519 seed locally (see `crate::keys::ClientIdentity`),
+/// derives the WireGuard (X25519) keypair from it, and asks `/vpn/v1/certificate` to sign the
+/// corresponding ed25519 public key. `wg_private_key`/`wg_public_key` here are that locally
+/// derived keypair, base64-encoded — never anything read off the wire.
+#[derive(Debug, Clone)]
 pub struct VPNCredentials {
     pub username: String,
-    pub password: String,
-    pub certificate: String,
-    pub wg_public_key: String,
+    /// Raw 32-byte ed25519 seed, base64-encoded, so the same client identity (and therefore
+    /// the same WireGuard keypair) can be restored across restarts instead of minting a new
+    /// device identity on every login.
+    pub ed25519_seed_b64: String,
     pub wg_private_key: String,
+    pub wg_public_key: String,
+    /// PEM certificate from `/vpn/v1/certificate`, authorizing `wg_public_key`'s corresponding
+    /// ed25519 identity to connect. Not currently required to bring up a bare WireGuard
+    /// tunnel (verified: the NetworkManager WireGuard backend's `_set_wireguard_properties`
+    /// never touches the certificate), but Proton's "local agent" protocol — which the real
+    /// client uses post-connect for keepalive/feature negotiation/kill-switch — does use it,
+    /// and that protocol is not implemented here (no accessible source for its wire format
+    /// beyond a compiled Rust extension). Whether a tunnel stays usable without it is unverified.
+    pub certificate: String,
+    pub certificate_expires_at: i64,
 }
 
-/// Derive the client's WireGuard tunnel address from the X.509 Subject Alternative Name
-/// (IP entry) embedded in `VPNCredentials.certificate` (the `CertificatePEM` field).
-///
-/// **UNVERIFIED (Flagged gap #3):** no live Proton account was available to confirm that
-/// the client WireGuard tunnel address is in fact carried as a SAN IP entry on the client
-/// certificate. This is a best-effort inference based on how Proton's certificate-based
-/// WireGuard auth is documented to work (the cert binds the client to an IP that the server
-/// also assigns as the tunnel peer address). **This must be checked against a real login
-/// response before relying on it in production** — if wrong, swap this out for whatever
-/// field the live `/vpn/v2/account` (or connect) response actually carries.
-pub fn client_address_from_certificate(pem: &str) -> Result<String> {
-    let (_, pem_block) = x509_parser::pem::parse_x509_pem(pem.as_bytes())
-        .map_err(|e| ProtonError::Config(format!("invalid certificate PEM: {e}")))?;
-    let cert = pem_block
-        .parse_x509()
-        .map_err(|e| ProtonError::Config(format!("invalid X.509 certificate: {e}")))?;
-
-    let san = cert
-        .subject_alternative_name()
-        .map_err(|e| ProtonError::Config(format!("failed to read SAN extension: {e}")))?
-        .ok_or_else(|| ProtonError::Config("certificate has no SAN extension".into()))?;
-
-    for name in san.value.general_names.iter() {
-        if let x509_parser::extensions::GeneralName::IPAddress(ip) = name {
-            return match ip.len() {
-                4 => Ok(std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]).to_string()),
-                16 => {
-                    let mut octets = [0u8; 16];
-                    octets.copy_from_slice(ip);
-                    Ok(std::net::Ipv6Addr::from(octets).to_string())
-                }
-                _ => continue,
-            };
-        }
-    }
-
-    Err(ProtonError::Config(
-        "certificate SAN has no IP address entry".into(),
-    ))
+/// `POST /vpn/v1/certificate` response. Field names verified against
+/// `proton.vpn.session.dataclasses.VPNCertificate`.
+#[derive(Debug, Deserialize)]
+pub struct CertificateResponse {
+    #[serde(rename = "Certificate")]
+    pub certificate: String,
+    #[serde(rename = "ExpirationTime")]
+    pub expiration_time: i64,
 }
 
-/// `POST /auth/v4/info` response (SRP parameters).
+/// `POST /auth/info` response (SRP parameters). Endpoint and field names verified live and
+/// against `proton.session.api.Session.async_authenticate`.
 #[derive(Debug, Deserialize)]
 pub struct AuthInfo {
-    pub version: u32,             // Protocol version (e.g. 4)
-    pub salt: String,             // base64
-    pub server_ephemeral: String, // base64 (B)
+    #[serde(rename = "Version")]
+    pub version: u32,
+    #[serde(rename = "Salt")]
+    pub salt: String,
+    #[serde(rename = "ServerEphemeral")]
+    pub server_ephemeral: String,
+    #[serde(rename = "SRPSession")]
     pub srp_session: String,
-    pub modulus: String, // PGP-signed modulus message
+    #[serde(rename = "Modulus")]
+    pub modulus: String,
 }
 
-/// `POST /auth/v4/authenticate` response.
+/// `POST /auth` response.
 #[derive(Debug, Deserialize)]
 pub struct AuthResponse {
     #[serde(rename = "AccessToken")]
@@ -98,72 +113,52 @@ pub struct AuthResponse {
     pub refresh_token: Option<String>,
     #[serde(rename = "UID")]
     pub uid: Option<String>,
-    #[serde(rename = "ResponseCode")]
+    // Verified live against api.protonvpn.ch: every response (success and error alike) uses
+    // "Code", not "ResponseCode" (the field name this flow's docs/reference used to cite).
+    #[serde(rename = "Code")]
     pub response_code: Option<i32>,
     #[serde(rename = "Error")]
     pub error: Option<String>,
-    // Present only when the server chooses to send its proof; we verify it against the
-    // expected server proof computed during `prove`.
     #[serde(rename = "ServerProof", default)]
     pub server_proof: Option<String>,
 }
 
-/// Map the raw `ServerDto.features` bitmask into `VPNServer.features` strings.
-///
-/// `ServerDto.features` is an `i32` bitmask (1 = P2P, 8 = TOR). When the server is a
-/// Secure Core node (`IsSecureCore`), append `"secure-core"`. `find_servers` matches these
-/// strings case-insensitively.
-pub fn features_to_strings(features: i32, is_secure_core: bool) -> Vec<String> {
+/// Map a `LogicalServerDto.features` bitmask into strings. Verified against
+/// `proton.vpn.session.servers.types.ServerFeatureEnum`: `SECURE_CORE=1, TOR=2, P2P=4,
+/// STREAMING=8, IPV6=16` — the old `1=P2P, 8=TOR` assumption (never verified against a live
+/// account) was wrong.
+pub fn features_to_strings(features: i32) -> Vec<String> {
     let mut out = Vec::new();
     if features & 1 != 0 {
+        out.push("secure-core".to_string());
+    }
+    if features & 2 != 0 {
+        out.push("tor".to_string());
+    }
+    if features & 4 != 0 {
         out.push("p2p".to_string());
     }
     if features & 8 != 0 {
-        out.push("tor".to_string());
+        out.push("streaming".to_string());
     }
-    if is_secure_core {
-        out.push("secure-core".to_string());
+    if features & 16 != 0 {
+        out.push("ipv6".to_string());
     }
     out
 }
 
-/// `GET /vpn/v2/account` -> `VPN` sub-object.
+/// `GET /vpn/v1/logicals?SecureCoreFilter=all&WithState=true` response. Endpoint and shape
+/// verified against `proton.vpn.session.servers.server_list_fetcher.MixinEndpointV1` and
+/// `proton.vpn.session.servers.types`. This is a NESTED shape (logical -> physical servers),
+/// not the flat per-server list the old model assumed.
 #[derive(Debug, Deserialize)]
-pub struct AccountResponse {
-    #[serde(rename = "VPN")]
-    pub vpn: VpnAccount,
+pub struct LogicalServersResponse {
+    #[serde(rename = "LogicalServers")]
+    pub logical_servers: Vec<LogicalServerDto>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct VpnAccount {
-    #[serde(rename = "UserName")]
-    pub user_name: String,
-    #[serde(rename = "Password")]
-    pub password: String,
-    #[serde(rename = "PubKeyCredential")]
-    pub pub_key_credential: PubKeyCredential,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PubKeyCredential {
-    #[serde(rename = "CertificatePEM")]
-    pub certificate_pem: String,
-    #[serde(rename = "PublicKey")]
-    pub public_key: String,
-    #[serde(rename = "PrivateKey")]
-    pub private_key: String,
-}
-
-/// `GET /vpn/v1/servers` response.
-#[derive(Debug, Deserialize)]
-pub struct ServersResponse {
-    #[serde(rename = "Servers")]
-    pub servers: Vec<ServerDto>,
-}
-
-/// Raw server DTO before mapping into `VPNServer`.
-#[derive(Debug, Deserialize)]
-pub struct ServerDto {
+pub struct LogicalServerDto {
     #[serde(rename = "ID")]
     pub id: String,
     #[serde(rename = "Name")]
@@ -177,20 +172,21 @@ pub struct ServerDto {
     #[serde(rename = "Load")]
     pub load: f64,
     #[serde(rename = "Features")]
-    pub features: i32, // bitmask: 1=P2P, 8=TOR
-    #[serde(rename = "IsSecureCore")]
-    pub is_secure_core: bool,
+    pub features: i32,
     #[serde(rename = "Status")]
     pub status: i32,
-    #[serde(rename = "Addresses")]
-    pub addresses: Vec<ServerAddress>,
-    // Field name confirmed against proton-vpn-cli at impl time (Flagged gap #2).
-    #[serde(rename = "WGPublicKey", default)]
-    pub wg_public_key: String,
+    #[serde(rename = "Servers", default)]
+    pub servers: Vec<PhysicalServerDto>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ServerAddress {
-    #[serde(rename = "IP")]
-    pub ip: String,
+pub struct PhysicalServerDto {
+    #[serde(rename = "EntryIP")]
+    pub entry_ip: String,
+    #[serde(rename = "Domain")]
+    pub domain: String,
+    #[serde(rename = "Status")]
+    pub status: i32,
+    #[serde(rename = "X25519PublicKey", default)]
+    pub x25519_public_key: String,
 }

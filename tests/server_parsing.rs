@@ -1,82 +1,121 @@
-//! Server-list parsing + `find_servers` filtering/sorting tests (Task 02).
+//! Server-list parsing + `find_servers` filtering/sorting tests (Task 02, updated after
+//! live-account verification found the original `/vpn/v1/servers` flat-shape model was wrong
+//! — see `models.rs` doc comments).
 //!
 //! No network access is required: these tests deserialize the checked-in fixtures in
 //! `tests/fixtures/` and exercise `ProtonVPNClient::find_servers` (a pure function over
 //! `server_list`) directly.
 use proton_proxy::client::ProtonVPNClient;
 use proton_proxy::models::{
-    AccountResponse, ServersResponse, VPNServer, client_address_from_certificate,
-    features_to_strings,
+    CertificateResponse, LogicalServersResponse, PhysicalServer, VPNServer, features_to_strings,
 };
 
 const SERVERS_FIXTURE: &str = include_str!("fixtures/servers.json");
-const ACCOUNT_FIXTURE: &str = include_str!("fixtures/account.json");
+const CERTIFICATE_FIXTURE: &str = include_str!("fixtures/certificate.json");
 
-/// Feature bitmask mapping (per `proton-vpn-cli`): `Features & 1 => "p2p"`,
-/// `Features & 8 => "tor"`, `IsSecureCore => "secure-core"`. Bits can combine, and a server
-/// with no matching bits/flag gets an empty feature list.
+/// Feature bitmask mapping, verified against `proton.vpn.session.servers.types.
+/// ServerFeatureEnum`: `SECURE_CORE=1, TOR=2, P2P=4, STREAMING=8, IPV6=16`. Bits can combine,
+/// and a server with no matching bits gets an empty feature list.
 #[test]
-fn servers_response_parses_feature_bitmask() {
-    assert_eq!(features_to_strings(1, false), vec!["p2p".to_string()]);
-    assert_eq!(features_to_strings(8, false), vec!["tor".to_string()]);
+fn logicals_response_parses_feature_bitmask() {
+    assert_eq!(features_to_strings(1), vec!["secure-core".to_string()]);
+    assert_eq!(features_to_strings(2), vec!["tor".to_string()]);
+    assert_eq!(features_to_strings(4), vec!["p2p".to_string()]);
+    assert_eq!(features_to_strings(8), vec!["streaming".to_string()]);
+    assert_eq!(features_to_strings(16), vec!["ipv6".to_string()]);
     assert_eq!(
-        features_to_strings(0, true),
-        vec!["secure-core".to_string()]
+        features_to_strings(6),
+        vec!["tor".to_string(), "p2p".to_string()]
     );
-    assert_eq!(
-        features_to_strings(9, false),
-        vec!["p2p".to_string(), "tor".to_string()]
-    );
-    assert_eq!(features_to_strings(0, false), Vec::<String>::new());
+    assert_eq!(features_to_strings(0), Vec::<String>::new());
 }
 
-/// Deserialize the checked-in `servers.json` fixture end-to-end and confirm the
-/// Status-filter + field mapping (Flagged gap #2: `WGPublicKey`, never `ips[0]`).
+/// Deserialize the checked-in `servers.json` fixture end-to-end and confirm the Status
+/// filter + per-physical-server field pairing (Flagged gap #2's root cause: an IP and a
+/// WireGuard key must always come from the SAME physical server entry).
 #[test]
 fn servers_fixture_deserializes_and_maps_fields() {
-    let resp: ServersResponse =
+    let resp: LogicalServersResponse =
         serde_json::from_str(SERVERS_FIXTURE).expect("servers.json must parse");
 
-    // 6 servers in the fixture, one with Status == 0 (maintenance).
-    assert_eq!(resp.servers.len(), 6);
-    let active: Vec<_> = resp.servers.iter().filter(|s| s.status == 1).collect();
+    // 6 logical servers in the fixture, one with Status == 0 (maintenance).
+    assert_eq!(resp.logical_servers.len(), 6);
+    let active: Vec<_> = resp
+        .logical_servers
+        .iter()
+        .filter(|s| s.status == 1)
+        .collect();
     assert_eq!(active.len(), 5);
-    assert!(resp.servers.iter().any(|s| s.status == 0));
+    assert!(resp.logical_servers.iter().any(|s| s.status == 0));
 
     let us_plus = resp
-        .servers
+        .logical_servers
         .iter()
         .find(|s| s.id == "srv-us-plus-1")
         .expect("srv-us-plus-1 present");
     assert_eq!(us_plus.entry_country, "US");
     assert_eq!(us_plus.tier, 2);
+    assert_eq!(features_to_strings(us_plus.features), vec!["tor", "p2p"]);
+
+    // Two physical servers, each keeping its own IP paired with its own key — never mixed.
+    assert_eq!(us_plus.servers.len(), 2);
+    let enabled = &us_plus.servers[0];
+    assert_eq!(enabled.entry_ip, "203.0.113.12");
     assert_eq!(
-        us_plus.wg_public_key,
+        enabled.x25519_public_key,
         "USplus1WgPubKeyBase64CCCCCCCCCCCCCCCCCCCCCC="
     );
     // The WG peer public key must never be confused with the server's IP address.
-    assert_ne!(us_plus.wg_public_key, us_plus.addresses[0].ip);
-    assert_eq!(
-        features_to_strings(us_plus.features, us_plus.is_secure_core),
-        vec!["p2p".to_string(), "tor".to_string()]
-    );
+    assert_ne!(enabled.x25519_public_key, enabled.entry_ip);
+    let disabled = &us_plus.servers[1];
+    assert_eq!(disabled.status, 0);
+    assert_ne!(disabled.x25519_public_key, enabled.x25519_public_key);
 }
 
-/// Deserialize `account.json` and confirm `VPNCredentials`-shaped fields are non-empty and
-/// that the client tunnel address can be derived from the fixture's certificate SAN.
+/// `VPNServer::pick_physical` picks the first *enabled* physical server, not just the first
+/// one listed — and keeps its IP/key paired.
 #[test]
-fn account_fixture_deserializes_and_derives_client_address() {
-    let account: AccountResponse =
-        serde_json::from_str(ACCOUNT_FIXTURE).expect("account.json must parse");
+fn pick_physical_prefers_enabled_server() {
+    let server = VPNServer {
+        id: "s".into(),
+        name: "s".into(),
+        country: "US".into(),
+        country_code: "US".into(),
+        city: None,
+        tier: 0,
+        load: 0.0,
+        features: vec![],
+        status: 1,
+        physical: vec![
+            PhysicalServer {
+                entry_ip: "10.0.0.1".into(),
+                domain: "down.example.net".into(),
+                x25519_public_key: "down-key".into(),
+                enabled: false,
+            },
+            PhysicalServer {
+                entry_ip: "10.0.0.2".into(),
+                domain: "up.example.net".into(),
+                x25519_public_key: "up-key".into(),
+                enabled: true,
+            },
+        ],
+    };
 
-    assert_eq!(account.vpn.user_name, "fixture-vpn-user");
-    assert!(!account.vpn.pub_key_credential.public_key.is_empty());
-    assert!(!account.vpn.pub_key_credential.private_key.is_empty());
-    assert!(!account.vpn.pub_key_credential.certificate_pem.is_empty());
+    let picked = server.pick_physical().expect("a physical server");
+    assert_eq!(picked.entry_ip, "10.0.0.2");
+    assert_eq!(picked.x25519_public_key, "up-key");
+}
 
-    let address = client_address_from_certificate(&account.vpn.pub_key_credential.certificate_pem)
-        .expect("fixture certificate carries a SAN IP");
-    assert_eq!(address, "10.2.0.5");
+/// Deserialize `certificate.json` (the `POST /vpn/v1/certificate` response shape) and confirm
+/// the fields `VPNCredentials` needs are present.
+#[test]
+fn certificate_fixture_deserializes() {
+    let cert: CertificateResponse =
+        serde_json::from_str(CERTIFICATE_FIXTURE).expect("certificate.json must parse");
+
+    assert!(cert.certificate.contains("BEGIN CERTIFICATE"));
+    assert_eq!(cert.expiration_time, 1999999999);
 }
 
 fn server(id: &str, country_code: &str, tier: i32, load: f64) -> VPNServer {
@@ -89,9 +128,13 @@ fn server(id: &str, country_code: &str, tier: i32, load: f64) -> VPNServer {
         tier,
         load,
         features: vec![],
-        ips: vec!["203.0.113.1".into()],
         status: 1,
-        wg_public_key: format!("{id}-pubkey"),
+        physical: vec![PhysicalServer {
+            entry_ip: "203.0.113.1".into(),
+            domain: format!("{id}.protonvpn.net"),
+            x25519_public_key: format!("{id}-pubkey"),
+            enabled: true,
+        }],
     }
 }
 

@@ -6,10 +6,10 @@
 //! The signed modulus below is a PGP-signed SRP modulus fixture borrowed from the
 //! `proton-srp` crate's own test-suite (MIT/Apache). It is verified by `RPGPVerifier`, the
 //! same verifier the real flow uses, so `prove` exercises the genuine PGP path.
-use proton_proxy::models::{features_to_strings, AccountResponse, AuthResponse, ServersResponse, VPNServer};
+use base64::Engine as _;
+use proton_proxy::models::AuthResponse;
 use proton_proxy::srp::prove;
 use proton_srp::SrpHashVersion;
-use base64::Engine as _;
 
 /// PGP-signed SRP modulus fixture (proton-srp test-suite). Verified by `RPGPVerifier`.
 const TEST_SIGNED_MODULUS: &str = "-----BEGIN PGP SIGNED MESSAGE-----
@@ -68,7 +68,7 @@ fn auth_response_parses_with_response_code_1000() {
         "AccessToken": "at-123",
         "RefreshToken": "rt-123",
         "UID": "uid-123",
-        "ResponseCode": 1000,
+        "Code": 1000,
         "ServerProof": "c2VyaWZpZWRwcm9vZg=="
     }"#;
     let auth: AuthResponse = serde_json::from_str(json).expect("AuthResponse must parse");
@@ -77,101 +77,5 @@ fn auth_response_parses_with_response_code_1000() {
     assert_eq!(auth.server_proof.as_deref(), Some("c2VyaWZpZWRwcm9vZg=="));
 }
 
-#[test]
-fn servers_response_parses_and_filters_status() {
-    let json = r#"{
-        "Servers": [
-            {
-                "ID": "gW1lbsdQwWvQ...AAEASg==",
-                "Name": "CH#1",
-                "EntryCountry": "CH",
-                "City": "Zurich",
-                "Tier": 2,
-                "Load": 17.0,
-                "Features": 1,
-                "IsSecureCore": false,
-                "Status": 1,
-                "Addresses": [{ "IP": "185.1.2.3" }],
-                "WGPublicKey": "WgPubKeyCH"
-            },
-            {
-                "ID": "de-2",
-                "Name": "DE#2",
-                "EntryCountry": "DE",
-                "City": "Frankfurt",
-                "Tier": 0,
-                "Load": 42.0,
-                "Features": 8,
-                "IsSecureCore": false,
-                "Status": 0,
-                "Addresses": [{ "IP": "185.9.9.9" }],
-                "WGPublicKey": "WgPubKeyDE"
-            },
-            {
-                "ID": "sc-3",
-                "Name": "SE-SC#3",
-                "EntryCountry": "SE",
-                "City": "Stockholm",
-                "Tier": 2,
-                "Load": 5.0,
-                "Features": 0,
-                "IsSecureCore": true,
-                "Status": 1,
-                "Addresses": [{ "IP": "185.7.7.7" }],
-                "WGPublicKey": "WgPubKeySC"
-            }
-        ]
-    }"#;
-    let resp: ServersResponse = serde_json::from_str(json).expect("ServersResponse must parse");
-    let active: Vec<VPNServer> = resp
-        .servers
-        .into_iter()
-        .filter(|dto| dto.status == 1)
-        .map(|dto| VPNServer {
-            id: dto.id,
-            name: dto.name,
-            country: dto.entry_country.clone(),
-            country_code: dto.entry_country,
-            city: dto.city,
-            tier: dto.tier,
-            load: dto.load,
-            features: features_to_strings(dto.features, dto.is_secure_core),
-            ips: dto.addresses.into_iter().map(|a| a.ip).collect(),
-            status: dto.status,
-            wg_public_key: dto.wg_public_key,
-        })
-        .collect();
-
-    // Only the two Status == 1 servers survive; the Status == 0 one is dropped.
-    assert_eq!(active.len(), 2);
-    assert!(active.iter().all(|s| s.status == 1));
-    assert!(active.iter().any(|s| s.country_code == "CH"));
-    assert!(active.iter().any(|s| s.country_code == "SE"));
-
-    // Feature mapping: P2P (bit 1), TOR (bit 8), secure-core (IsSecureCore).
-    let ch = active.iter().find(|s| s.country_code == "CH").unwrap();
-    assert_eq!(ch.features, vec!["p2p".to_string()]);
-    assert_eq!(ch.ips, vec!["185.1.2.3".to_string()]);
-    assert_eq!(ch.wg_public_key, "WgPubKeyCH");
-
-    let sc = active.iter().find(|s| s.country_code == "SE").unwrap();
-    assert_eq!(sc.features, vec!["secure-core".to_string()]);
-}
-
-#[test]
-fn account_response_parses_vpn_credentials() {
-    let json = r#"{
-        "VPN": {
-            "UserName": "vpn-user",
-            "Password": "vpn-pass",
-            "PubKeyCredential": {
-                "CertificatePEM": "CERT",
-                "PublicKey": "WGPUB",
-                "PrivateKey": "WGPUD"
-            }
-        }
-    }"#;
-    let account: AccountResponse = serde_json::from_str(json).expect("AccountResponse must parse");
-    assert_eq!(account.vpn.user_name, "vpn-user");
-    assert_eq!(account.vpn.pub_key_credential.private_key, "WGPUD");
-}
+// Server-list parsing (now the nested LogicalServers shape) and certificate-response parsing
+// moved to tests/server_parsing.rs, alongside the fixtures that exercise them end-to-end.

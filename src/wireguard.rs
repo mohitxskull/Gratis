@@ -19,36 +19,52 @@ pub fn interface_name(location: &str) -> String {
     format!("proton-{}", location.to_ascii_lowercase())
 }
 
+/// Fixed client tunnel address Proton's own client uses for every WireGuard connection.
+///
+/// Verified against `proton.vpn.backend.networkmanager.protocol.wireguard.wireguard`
+/// (`wg_config.ipv4.address = "10.2.0.2"`, prefix `/32`): this is NOT derived per-account or
+/// per-connection at all. Flagged gap #3's earlier resolution (deriving it from the account
+/// certificate's X.509 SAN, `models::client_address_from_certificate`) was a best-effort
+/// guess made without a live account and is now confirmed wrong — replaced with this fixed
+/// address, which every Proton client uses.
+pub const CLIENT_ADDRESS: &str = "10.2.0.2";
+
 /// Generate a WireGuard `[Interface]`/`[Peer]` config.
 ///
-/// Correctness notes (Flagged gaps vs the old Python stub):
-/// - `Peer.PublicKey` must be the server's WireGuard public key (`server.wg_public_key`),
-///   NEVER `ips[0]` (that is the server IP).
-/// - `Interface.Address` is `client_address`, derived by the caller from the account
-///   certificate (see `models::client_address_from_certificate`), not hardcoded.
+/// Correctness notes (Flagged gaps vs the old Python stub, now verified against a live
+/// account and the official client's source):
+/// - `Peer.PublicKey` is the specific physical server's `X25519PublicKey`
+///   (`server.pick_physical()`), never mixed with a different physical server's entry IP —
+///   the root cause of Flagged gap #2 in the old Python.
+/// - `Interface.Address` is the fixed `CLIENT_ADDRESS` (see its doc comment) — not derived
+///   from anything, and not `10.8.0.1` (the old Python's unrelated wrong guess) either.
 /// - `Table = off`: this is a split tunnel. `wg-quick`'s `add_route` early-returns when
 ///   `Table = off`, so no default route is installed; only proxy-bound sockets use the
 ///   tunnel (Task 04/05).
-/// - `Endpoint` host is `ips[0]`, port `51820`.
+/// - `Endpoint` host is the picked physical server's `entry_ip`, port `51820`.
+///
+/// Returns an error if `server` has no physical server to connect through.
 pub fn generate_config(
     server: &VPNServer,
     creds: &VPNCredentials,
-    client_address: &str,
     interface: &str,
-) -> String {
+) -> Result<String> {
+    let physical = server.pick_physical().ok_or_else(|| {
+        ProtonError::Config(format!("server {} has no physical servers", server.name))
+    })?;
     // `interface` is not embedded in the config body (wg-quick derives the interface name
     // from the config file's name/path), but is accepted here so callers have a single
     // place to thread the interface name through to `up`/`down`/`set_active`.
     let _ = interface;
-    format!(
+    Ok(format!(
         "[Interface]\nPrivateKey = {pk}\nAddress = {addr}/32\nTable = off\n\n\
          [Peer]\nPublicKey = {peer}\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = {ip}:{port}\n",
         pk = creds.wg_private_key,
-        addr = client_address,
-        peer = server.wg_public_key,
-        ip = server.ips.first().map(String::as_str).unwrap_or(""),
+        addr = CLIENT_ADDRESS,
+        peer = physical.x25519_public_key,
+        ip = physical.entry_ip,
         port = WG_PORT,
-    )
+    ))
 }
 
 /// Directory the daemon owns for WireGuard config files, one per live interface.

@@ -2,8 +2,11 @@
 //!
 //! Correctness reference for endpoints/flow: <https://github.com/ProtonVPN/proton-vpn-cli>
 use crate::errors::*;
+use crate::keys::ClientIdentity;
 use crate::models::*;
 use crate::srp::prove;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use proton_srp::{SRPProofB64, SrpHashVersion};
 use reqwest::header;
 
@@ -11,6 +14,12 @@ pub struct ProtonVPNClient {
     pub username: String,
     pub client: reqwest::Client,
     pub auth_token: Option<String>,
+    /// Session UID from the auth response. Verified against `proton.session.transports.
+    /// requests.RequestsTransport`: authenticated requests must carry BOTH
+    /// `Authorization: Bearer <AccessToken>` AND `x-pm-uid: <UID>` — a request with only the
+    /// bearer token gets a bare 401 (this was silently broken until fetch_certificate's live
+    /// 401 surfaced it; `/vpn/v1/certificate` was the first call to require session auth).
+    pub uid: Option<String>,
     pub vpn_credentials: Option<VPNCredentials>,
     pub server_list: Vec<VPNServer>,
 }
@@ -21,9 +30,12 @@ impl ProtonVPNClient {
             .user_agent(USER_AGENT)
             .default_headers({
                 let mut h = header::HeaderMap::new();
+                // "Linux_5.2.5_web" (the value docs/references for this flow used to cite) is
+                // rejected by Proton's live API with a bare 500 (no error body) as of this
+                // writing; verified live against api.protonvpn.ch that this value is accepted.
                 h.insert(
                     "x-pm-appversion",
-                    header::HeaderValue::from_static("Linux_5.2.5_web"),
+                    header::HeaderValue::from_static("linux-vpn-cli@5.0.0"),
                 );
                 h.insert("x-pm-apiversion", header::HeaderValue::from_static("3"));
                 h
@@ -34,9 +46,23 @@ impl ProtonVPNClient {
             username: username.to_string(),
             client,
             auth_token: None,
+            uid: None,
             vpn_credentials: None,
             server_list: Vec::new(),
         }
+    }
+
+    /// Attach session auth headers (`Authorization: Bearer`, `x-pm-uid`) when logged in. Both
+    /// are required together — a request with only the bearer token gets a bare 401.
+    fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let mut req = req;
+        if let Some(token) = &self.auth_token {
+            req = req.bearer_auth(token);
+        }
+        if let Some(uid) = &self.uid {
+            req = req.header("x-pm-uid", uid);
+        }
+        req
     }
 
     /// POST `body` as JSON to `path` (relative to `PROTON_API_URL`), returning typed JSON.
@@ -48,10 +74,7 @@ impl ProtonVPNClient {
         body: &serde_json::Value,
     ) -> Result<T> {
         let url = format!("{PROTON_API_URL}{path}");
-        let mut req = self.client.post(&url).json(body);
-        if let Some(token) = &self.auth_token {
-            req = req.bearer_auth(token);
-        }
+        let req = self.authed(self.client.post(&url).json(body));
         let resp = req.send().await?;
         Self::into_json(resp).await
     }
@@ -59,10 +82,7 @@ impl ProtonVPNClient {
     /// GET `path` (relative to `PROTON_API_URL`), returning typed JSON.
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let url = format!("{PROTON_API_URL}{path}");
-        let mut req = self.client.get(&url);
-        if let Some(token) = &self.auth_token {
-            req = req.bearer_auth(token);
-        }
+        let req = self.authed(self.client.get(&url));
         let resp = req.send().await?;
         Self::into_json(resp).await
     }
@@ -77,17 +97,30 @@ impl ProtonVPNClient {
             let msg = resp.text().await.unwrap_or_default();
             return Err(ProtonError::Api(msg));
         }
-        Ok(resp.json::<T>().await?)
+        let text = resp.text().await?;
+        serde_json::from_str(&text).map_err(|e| {
+            // Never include the raw body here: some responses on this client (e.g. the
+            // account endpoint) carry private key material, and this error can end up in
+            // logs. Report only the top-level field names present, which is enough to
+            // diagnose a shape mismatch without risking a secret leak.
+            let keys: Vec<String> = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v.as_object().map(|o| o.keys().cloned().collect()))
+                .unwrap_or_default();
+            ProtonError::Api(format!("decode error: {e}; top-level fields: {keys:?}"))
+        })
     }
 
     /// Authenticate via SRP-6a and load VPN credentials.
     pub async fn login(&mut self, email: &str, password: &str) -> Result<VPNCredentials> {
         // 1. Fetch SRP parameters for this user.
+        // "/auth/v4/info" (the path this flow's docs/reference used to cite) also works
+        // live, but "/auth/info" is what the official proton-core client actually calls
+        // (verified by reading /usr/lib/python3/dist-packages/proton/session/api.py) — use
+        // the same path the reference uses rather than a v4-prefixed alias that happens to
+        // also route correctly today.
         let info: AuthInfo = self
-            .post(
-                "/auth/v4/info",
-                &serde_json::json!({ "Username": email }),
-            )
+            .post("/auth/info", &serde_json::json!({ "Username": email }))
             .await?;
 
         // 2. Build the SRP proofs. `info.version` is a u32 protocol version; cast to u8 for
@@ -110,9 +143,14 @@ impl ProtonVPNClient {
             "SRPSession": info.srp_session,
             "TwoFactorCode": null,
         });
-        let auth: AuthResponse = self.post("/auth/v4/authenticate", &body).await?;
+        // "/auth/v4/authenticate" (the path this flow's docs/reference used to cite) is a
+        // bare 404 live. "/auth/v4" also works (verified: a garbage-SRP-proof probe got a
+        // genuine SRP-field validation error, not a routing 404), but the official
+        // proton-core client actually posts to "/auth" (no version prefix) — use that,
+        // matching the reference exactly.
+        let auth: AuthResponse = self.post("/auth", &body).await?;
 
-        // 4. The API signals success with `ResponseCode == 1000`.
+        // 4. The API signals success with `Code == 1000`.
         if auth.response_code != Some(1000) {
             return Err(ProtonError::Auth);
         }
@@ -131,16 +169,34 @@ impl ProtonVPNClient {
         }
 
         self.auth_token = auth.access_token.clone();
+        self.uid = auth.uid.clone();
 
-        // 6. Fetch the VPN account and build credentials.
-        let account: AccountResponse = self.get("/vpn/v2/account").await?;
-        let vpn = account.vpn;
+        // 6. Generate a client WireGuard/certificate identity and ask Proton to sign it.
+        //    Verified against proton-vpn-api-core: the server never hands back a private
+        //    key (`GET /vpn/v2/account`, this flow's old source of `VPNCredentials`, doesn't
+        //    exist for this purpose at all) — the client generates its own ed25519/X25519
+        //    keypair and requests a certificate for the public half. A fresh identity is
+        //    minted on every login rather than restored from a prior one; restoring a saved
+        //    identity across logins is not implemented (matches the daemon's existing,
+        //    already-documented "no unattended restore" limitation).
+        let identity = ClientIdentity::generate();
+        let cert: CertificateResponse = self
+            .post(
+                "/vpn/v1/certificate",
+                &serde_json::json!({
+                    "ClientPublicKey": identity.ed25519_public_key_pem(),
+                    "Duration": "168 min",
+                }),
+            )
+            .await?;
+
         let creds = VPNCredentials {
-            username: vpn.user_name,
-            password: vpn.password,
-            certificate: vpn.pub_key_credential.certificate_pem,
-            wg_public_key: vpn.pub_key_credential.public_key,
-            wg_private_key: vpn.pub_key_credential.private_key,
+            username: email.to_string(),
+            ed25519_seed_b64: BASE64.encode(identity.ed25519_seed),
+            wg_private_key: identity.wg_private_key_b64(),
+            wg_public_key: identity.wg_public_key_b64(),
+            certificate: cert.certificate,
+            certificate_expires_at: cert.expiration_time,
         };
         self.vpn_credentials = Some(creds.clone());
         Ok(creds)
@@ -148,12 +204,17 @@ impl ProtonVPNClient {
 
     /// Fetch and parse the server list into `self.server_list`.
     pub async fn fetch_servers(&mut self) -> Result<()> {
-        let resp: ServersResponse = self.get("/vpn/v1/servers").await?;
+        // Verified live + against proton-vpn-api-core's `MixinEndpointV1.LOGICALS`: the real
+        // endpoint is "/vpn/v1/logicals" (nested logical -> physical servers), not the flat
+        // "/vpn/v1/servers" this flow's docs/reference used to cite (which 404s live).
+        let resp: LogicalServersResponse = self
+            .get("/vpn/v1/logicals?SecureCoreFilter=all&WithState=true")
+            .await?;
         self.server_list = resp
-            .servers
+            .logical_servers
             .into_iter()
             .filter(|dto| dto.status == 1)
-            .map(map_server)
+            .map(map_logical)
             .collect();
         Ok(())
     }
@@ -179,7 +240,10 @@ impl ProtonVPNClient {
                     return false;
                 }
                 if let Some(ci) = city
-                    && !s.city.as_deref().is_some_and(|x| x.eq_ignore_ascii_case(ci))
+                    && !s
+                        .city
+                        .as_deref()
+                        .is_some_and(|x| x.eq_ignore_ascii_case(ci))
                 {
                     return false;
                 }
@@ -205,11 +269,10 @@ impl ProtonVPNClient {
     }
 }
 
-/// Map a raw `ServerDto` (only `Status == 1` servers reach here) into a `VPNServer`.
-///
-/// `country_code` comes from `EntryCountry`; `ips` from `Addresses[].IP`; the WireGuard peer
-/// public key comes from `WGPublicKey` (NOT `ips[0]` — flagged gap #2).
-fn map_server(dto: ServerDto) -> VPNServer {
+/// Map a raw `LogicalServerDto` (only `Status == 1` logicals reach here) into a `VPNServer`,
+/// keeping each physical server's entry IP paired with ITS OWN WireGuard public key — never
+/// mixing IP and key across two different physical servers (flagged gap #2's root cause).
+fn map_logical(dto: LogicalServerDto) -> VPNServer {
     VPNServer {
         id: dto.id,
         name: dto.name,
@@ -218,9 +281,17 @@ fn map_server(dto: ServerDto) -> VPNServer {
         city: dto.city,
         tier: dto.tier,
         load: dto.load,
-        features: features_to_strings(dto.features, dto.is_secure_core),
-        ips: dto.addresses.into_iter().map(|a| a.ip).collect(),
+        features: features_to_strings(dto.features),
         status: dto.status,
-        wg_public_key: dto.wg_public_key,
+        physical: dto
+            .servers
+            .into_iter()
+            .map(|p| PhysicalServer {
+                entry_ip: p.entry_ip,
+                domain: p.domain,
+                x25519_public_key: p.x25519_public_key,
+                enabled: p.status == 1,
+            })
+            .collect(),
     }
 }

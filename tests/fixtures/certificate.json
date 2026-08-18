@@ -1,0 +1,13 @@
+{
+    "Code": 1000,
+    "SerialNumber": "fixture-serial-0001",
+    "ClientKeyFingerprint": "fixture-fingerprint-0001",
+    "ClientKey": "-----BEGIN PUBLIC KEY-----\nfixture-client-key\n-----END PUBLIC KEY-----",
+    "Certificate": "-----BEGIN CERTIFICATE-----\nfixture-certificate-body\n-----END CERTIFICATE-----",
+    "ExpirationTime": 1999999999,
+    "RefreshTime": 1999900000,
+    "Mode": "session",
+    "DeviceName": "proton-proxy-fixture",
+    "ServerPublicKeyMode": "EC",
+    "ServerPublicKey": "fixture-server-public-key"
+}

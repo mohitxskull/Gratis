@@ -1,36 +1,16 @@
-//! WireGuard config generation + active-tunnel state persistence tests (Task 03).
+//! WireGuard config generation + active-tunnel state persistence tests (Task 03, updated
+//! after live-account verification revealed the original server-list/credential model was
+//! wrong — see `models.rs`/`wireguard.rs` doc comments for what changed and why).
 //!
 //! No root privileges and no live WireGuard interface are required: these tests exercise
 //! `generate_config`'s output string and the SQLite-backed `credentials::Store` directly,
 //! against a tempdir DB path (never the real `~/.config/proton-proxy/` directory).
 use proton_proxy::credentials::Store;
-use proton_proxy::models::{VPNCredentials, VPNServer, client_address_from_certificate};
-use proton_proxy::wireguard::{WG_PORT, generate_config, interface_name};
+use proton_proxy::models::{PhysicalServer, VPNCredentials, VPNServer};
+use proton_proxy::wireguard::{CLIENT_ADDRESS, WG_PORT, generate_config, interface_name};
 
-/// A self-signed test certificate (RSA-2048, `CN=proton-test`) with a single SAN IP entry
-/// of `10.2.0.5`, generated with:
-/// `openssl req -x509 -newkey rsa:2048 -nodes -subj "/CN=proton-test" \
-///    -addext "subjectAltName=IP:10.2.0.5"`.
-/// Contains no real account data; it is a throwaway fixture.
-const TEST_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
-MIIDHjCCAgagAwIBAgIUa/5mCrPYf855/Ob4AvhLmbKnZwAwDQYJKoZIhvcNAQEL
-BQAwFjEUMBIGA1UEAwwLcHJvdG9uLXRlc3QwHhcNMjYwODE4MTAxNDA4WhcNMzYw
-ODE1MTAxNDA4WjAWMRQwEgYDVQQDDAtwcm90b24tdGVzdDCCASIwDQYJKoZIhvcN
-AQEBBQADggEPADCCAQoCggEBAJ7s1rNtRRsqNoiIt9ov2P+J0sy8Cl68Y1YmM7lG
-aQZ7rqajQqBlF0HSEv2OTF5biPHb9aaTxeZoPeoull7qWPbQwmqXxLSWu0Swtxga
-KWXclWrXlh3zPsoVcTZDarhHk0oTs4v9fXkuctacNB/sHm0Auv8DshAJLXNYpoWH
-peaUzDsd5/jT375E7RRkCeInov7c7hso5JyMxY7U8EFawUexObbe6Q5WELpTcIFz
-rino9srIz6+bhx5cIltluPXoTH279Lmr9q1sXTedwMbtrErJxZrAiP/JmsPeaNvc
-JUxwSt6lvgMAJZSWT8vQKMbEuwLYYzrMrKtn5c0sJrPDW+MCAwEAAaNkMGIwHQYD
-VR0OBBYEFABogFWxB2xkPbxu9+mJPG9uTIqKMB8GA1UdIwQYMBaAFABogFWxB2xk
-Pbxu9+mJPG9uTIqKMA8GA1UdEwEB/wQFMAMBAf8wDwYDVR0RBAgwBocECgIABTAN
-BgkqhkiG9w0BAQsFAAOCAQEAVgl0pqpn0wfdxBC/m07PA8+ngXXN4eLHypQYePSF
-QsEiyu8ZfSPy2CRaIa/660Z9cMcwxaMABesO4Cu0R0GEvuSQSE5ZCSfiAQqmb/nw
-/OGp7+4zfDqbaaxuZSoozAgj1VoOCp1OCUWxfcdvoXwqUbwslS+BrdymNOdr1d7y
-TJcG6MxOvCjdoIEyDVsXmOFhqEtpvte7jRvPncz8DdG1n4ukl5cdVvuAzY4jHP8j
-rxA/XsUNPp08PNpGI34w1X7prwi/VLkAkGEeY1wNufP1/IVXW+ahOfNvcGLJQJVf
-eRd1dKRVcDggq2K+vBNH5fXpGufy8FPBsFFnA5ZDGFrqpg==
------END CERTIFICATE-----";
+const TEST_CERT_PEM: &str =
+    "-----BEGIN CERTIFICATE-----\ntest-only-placeholder\n-----END CERTIFICATE-----";
 
 fn test_server() -> VPNServer {
     VPNServer {
@@ -42,21 +22,26 @@ fn test_server() -> VPNServer {
         tier: 0,
         load: 12.0,
         features: vec![],
-        ips: vec!["203.0.113.9".into()],
         status: 1,
-        // Deliberately distinct from `ips[0]` so a test that accidentally reads the wrong
-        // field is caught immediately.
-        wg_public_key: "SERVERPUBKEYBASE64==".into(),
+        physical: vec![PhysicalServer {
+            entry_ip: "203.0.113.9".into(),
+            domain: "node1.us.protonvpn.net".into(),
+            // Deliberately distinct from `entry_ip` so a test that accidentally reads the
+            // wrong field is caught immediately.
+            x25519_public_key: "SERVERPUBKEYBASE64==".into(),
+            enabled: true,
+        }],
     }
 }
 
 fn test_creds() -> VPNCredentials {
     VPNCredentials {
         username: "testuser".into(),
-        password: "unused-in-wg-config".into(),
-        certificate: TEST_CERT_PEM.into(),
+        ed25519_seed_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
         wg_public_key: "CLIENTPUBKEYBASE64==".into(),
         wg_private_key: "CLIENTPRIVKEYBASE64==".into(),
+        certificate: TEST_CERT_PEM.into(),
+        certificate_expires_at: 9_999_999_999,
     }
 }
 
@@ -66,19 +51,19 @@ fn config_has_correct_peer_public_key_not_ip() {
     let creds = test_creds();
     let iface = interface_name("us");
 
-    let config = generate_config(&server, &creds, "10.2.0.5", &iface);
+    let config = generate_config(&server, &creds, &iface).expect("generate_config");
 
     assert!(
         config.contains("PublicKey = SERVERPUBKEYBASE64=="),
-        "config must use the server's real WG pubkey field:\n{config}"
+        "config must use the physical server's real X25519 pubkey field:\n{config}"
     );
     assert!(
         !config.contains("PublicKey = 203.0.113.9"),
-        "config must NEVER use ips[0] as the peer public key:\n{config}"
+        "config must NEVER use entry_ip as the peer public key:\n{config}"
     );
     assert!(
         config.contains(&format!("Endpoint = 203.0.113.9:{WG_PORT}")),
-        "Endpoint must be ips[0]:{WG_PORT}:\n{config}"
+        "Endpoint must be the picked physical server's entry_ip:{WG_PORT}:\n{config}"
     );
     assert!(
         config.contains("AllowedIPs = 0.0.0.0/0, ::/0"),
@@ -91,28 +76,37 @@ fn config_has_correct_peer_public_key_not_ip() {
 }
 
 #[test]
-fn config_uses_derived_client_address() {
+fn config_uses_fixed_client_address() {
+    // Flagged gap #3's earlier resolution (deriving the client address from the account
+    // certificate's X.509 SAN) was a best-effort guess made without a live account. Verified
+    // against a live login + the official client's source: every Proton WireGuard connection
+    // uses the same fixed address, not anything derived per-account.
     let server = test_server();
     let creds = test_creds();
     let iface = interface_name("us");
 
-    let client_address =
-        client_address_from_certificate(&creds.certificate).expect("SAN IP must be present");
-    assert_eq!(
-        client_address, "10.2.0.5",
-        "derived address must match the fixture certificate's SAN IP"
-    );
+    let config = generate_config(&server, &creds, &iface).expect("generate_config");
 
-    let config = generate_config(&server, &creds, &client_address, &iface);
-
+    assert_eq!(CLIENT_ADDRESS, "10.2.0.2");
     assert!(
-        config.contains("Address = 10.2.0.5/32"),
-        "[Interface] Address must be the derived client address, not a hardcoded value:\n{config}"
+        config.contains("Address = 10.2.0.2/32"),
+        "[Interface] Address must be the fixed CLIENT_ADDRESS:\n{config}"
     );
     assert!(
         !config.contains("Address = 10.8.0.1"),
         "config must not fall back to the old hardcoded 10.8.0.1/24:\n{config}"
     );
+}
+
+#[test]
+fn generate_config_errors_without_a_physical_server() {
+    let mut server = test_server();
+    server.physical.clear();
+    let creds = test_creds();
+    let iface = interface_name("us");
+
+    let err = generate_config(&server, &creds, &iface).unwrap_err();
+    assert!(format!("{err}").contains("no physical servers"));
 }
 
 #[test]
@@ -150,8 +144,10 @@ fn credentials_roundtrip_via_store() {
 
     let loaded = store.load_credentials().expect("load_credentials");
     assert_eq!(loaded.username, creds.username);
+    assert_eq!(loaded.ed25519_seed_b64, creds.ed25519_seed_b64);
     assert_eq!(loaded.wg_public_key, creds.wg_public_key);
     assert_eq!(loaded.wg_private_key, creds.wg_private_key);
+    assert_eq!(loaded.certificate_expires_at, creds.certificate_expires_at);
 
     // File must be 0600 (owner read/write only).
     let mode = std::fs::metadata(&db_path).unwrap();

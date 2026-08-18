@@ -68,15 +68,12 @@ impl Store {
             "PRAGMA secure_delete = ON;
              CREATE TABLE IF NOT EXISTS credentials (
                  id INTEGER PRIMARY KEY CHECK (id = 1),
-                 email TEXT,
                  username TEXT NOT NULL,
-                 password TEXT NOT NULL,
-                 certificate TEXT NOT NULL,
+                 ed25519_seed_b64 TEXT NOT NULL,
                  wg_public_key TEXT NOT NULL,
                  wg_private_key TEXT NOT NULL,
-                 access_token TEXT,
-                 refresh_token TEXT,
-                 uid TEXT
+                 certificate TEXT NOT NULL,
+                 certificate_expires_at INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS active_tunnels (
                  location TEXT PRIMARY KEY,
@@ -90,30 +87,26 @@ impl Store {
     }
 
     /// Upsert the single credentials row.
-    ///
-    /// `VPNCredentials` (Task 02) does not currently carry `email`/`access_token`/
-    /// `refresh_token`/`uid` — those live in `ProtonVPNClient` during a session, not in the
-    /// credentials DTO the API hands back. The schema reserves columns for them (matching
-    /// the brief) so a later task can plumb them through without a migration; until then
-    /// they are stored as `NULL`. This is a deliberate divergence from a naive reading of
-    /// the brief, noted here rather than reshaping `client.rs`/`models.rs`'s DTOs for a
-    /// task that isn't this one.
     pub fn save_credentials(&self, creds: &VPNCredentials) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO credentials (id, username, password, certificate, wg_public_key, wg_private_key)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO credentials
+                 (id, username, ed25519_seed_b64, wg_public_key, wg_private_key,
+                  certificate, certificate_expires_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT (id) DO UPDATE SET
                  username = excluded.username,
-                 password = excluded.password,
-                 certificate = excluded.certificate,
+                 ed25519_seed_b64 = excluded.ed25519_seed_b64,
                  wg_public_key = excluded.wg_public_key,
-                 wg_private_key = excluded.wg_private_key",
+                 wg_private_key = excluded.wg_private_key,
+                 certificate = excluded.certificate,
+                 certificate_expires_at = excluded.certificate_expires_at",
             params![
                 creds.username,
-                creds.password,
-                creds.certificate,
+                creds.ed25519_seed_b64,
                 creds.wg_public_key,
                 creds.wg_private_key,
+                creds.certificate,
+                creds.certificate_expires_at,
             ],
         )?;
         Ok(())
@@ -123,16 +116,18 @@ impl Store {
     pub fn load_credentials(&self) -> Result<VPNCredentials> {
         self.conn
             .query_row(
-                "SELECT username, password, certificate, wg_public_key, wg_private_key
+                "SELECT username, ed25519_seed_b64, wg_public_key, wg_private_key,
+                        certificate, certificate_expires_at
                  FROM credentials WHERE id = 1",
                 [],
                 |row| {
                     Ok(VPNCredentials {
                         username: row.get(0)?,
-                        password: row.get(1)?,
-                        certificate: row.get(2)?,
-                        wg_public_key: row.get(3)?,
-                        wg_private_key: row.get(4)?,
+                        ed25519_seed_b64: row.get(1)?,
+                        wg_public_key: row.get(2)?,
+                        wg_private_key: row.get(3)?,
+                        certificate: row.get(4)?,
+                        certificate_expires_at: row.get(5)?,
                     })
                 },
             )

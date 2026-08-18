@@ -2,6 +2,6 @@
     "AccessToken": "synthetic-access-token-0001",
     "RefreshToken": "synthetic-refresh-token-0001",
     "UID": "synthetic-uid-0001",
-    "ResponseCode": 1000,
+    "Code": 1000,
     "ServerProof": "c2VyaWZpZWRwcm9vZg=="
 }
