@@ -9,7 +9,7 @@
 //! UI, and `TunnelManager::login` is only ever called from `main.rs`'s startup sequence.
 use crate::errors::ProtonError;
 use crate::manager::{CountryInfo, TunnelInfo, TunnelManager};
-use crate::webui::{IndexTemplate, LocationsTemplate, TunnelsTemplate};
+use crate::webui::{IndexTemplate, LocationsTemplate, ServersTemplate, TunnelsTemplate};
 use askama::Template;
 use axum::{
     Json, Router,
@@ -39,6 +39,7 @@ pub fn router(manager: Arc<TunnelManager>) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/ui/locations", get(ui_locations))
+        .route("/ui/locations/:code/servers", get(ui_location_servers))
         .route("/ui/tunnels", get(ui_tunnels))
         .route("/ui/tunnels/:location/start", post(ui_start_tunnel))
         .route("/ui/tunnels/:location/stop", post(ui_stop_tunnel))
@@ -67,6 +68,15 @@ async fn index(State(manager): State<Arc<TunnelManager>>) -> Response {
 async fn ui_locations(State(manager): State<Arc<TunnelManager>>) -> Response {
     let locations = manager.list_locations().await.unwrap_or_default();
     render(LocationsTemplate { locations })
+}
+
+/// Individual-server list for one country, lazy-loaded the first time its row is expanded.
+async fn ui_location_servers(
+    State(manager): State<Arc<TunnelManager>>,
+    Path(code): Path<String>,
+) -> Response {
+    let servers = manager.list_servers_in(&code).await.unwrap_or_default();
+    render(ServersTemplate { servers })
 }
 
 /// Tunnels table fragment, for the "Refresh" button and after start/stop actions.

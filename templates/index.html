@@ -3,56 +3,68 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>gratis</title>
+<title>Gratis</title>
 <style>{{ tailwind_css|safe }}</style>
 </head>
-<body class="bg-gray-950 text-gray-100 min-h-screen">
-<div class="max-w-3xl mx-auto p-6 space-y-8">
+<body class="bg-white text-black min-h-screen antialiased font-sans">
+<div class="max-w-3xl mx-auto px-6 py-12">
 
-  <header>
-    <h1 class="text-2xl font-bold text-blue-400">gratis</h1>
-    <p class="text-sm text-gray-500 mt-1">
-      Logged in automatically from <code class="bg-gray-800 px-1 rounded">.env</code> at startup — no root, no CLI login.
-    </p>
+  <header class="mb-12 border-b border-black/10 pb-6">
+    <h1 class="text-3xl font-semibold tracking-tight">Gratis</h1>
   </header>
 
   {% if let Some(err) = login_error %}
-  <div class="bg-red-950 border border-red-800 text-red-300 rounded-lg p-4 text-sm">
-    <strong>Login failed:</strong> {{ err }}
+  <div class="border border-black/20 rounded p-4 text-sm mb-10">
+    <span class="font-semibold">Login failed.</span> <span class="text-black/60">{{ err }}</span>
   </div>
   {% endif %}
 
-  <section>
-    <div class="flex items-center justify-between mb-3">
-      <h2 class="text-lg font-semibold">Locations</h2>
-      <button
-        hx-get="/ui/locations"
-        hx-target="#locations"
-        hx-swap="innerHTML"
-        class="text-sm px-3 py-1.5 rounded bg-gray-800 hover:bg-gray-700 transition"
-      >Refresh</button>
-    </div>
-    <div id="locations" class="bg-gray-900 rounded-lg p-4">
-      {% include "locations.html" %}
-    </div>
-  </section>
-
-  <section>
-    <div class="flex items-center justify-between mb-3">
-      <h2 class="text-lg font-semibold">Active tunnels</h2>
+  <section class="mb-12">
+    <div class="flex items-baseline justify-between mb-4">
+      <h2 class="text-xs font-semibold tracking-widest uppercase text-black/40">Active tunnels</h2>
       <button
         hx-get="/ui/tunnels"
         hx-target="#tunnels"
         hx-swap="innerHTML"
-        class="text-sm px-3 py-1.5 rounded bg-gray-800 hover:bg-gray-700 transition"
+        class="text-xs uppercase tracking-wide text-black/40 hover:text-black transition"
       >Refresh</button>
     </div>
-    <div id="tunnels" class="bg-gray-900 rounded-lg p-4">
+    <div id="tunnels">
       {% include "tunnels.html" %}
+    </div>
+  </section>
+
+  <section>
+    <div class="flex items-baseline justify-between mb-4">
+      <h2 class="text-xs font-semibold tracking-widest uppercase text-black/40">Locations</h2>
+      <button
+        hx-get="/ui/locations"
+        hx-target="#locations"
+        hx-swap="innerHTML"
+        class="text-xs uppercase tracking-wide text-black/40 hover:text-black transition"
+      >Refresh</button>
+    </div>
+    <input
+      type="text"
+      placeholder="Filter by code or country…"
+      oninput="filterLocations(this.value)"
+      class="w-full bg-transparent border border-black/20 rounded px-3 py-2 text-sm placeholder-black/30 mb-3 focus:outline-none focus:border-black/50"
+    >
+    <div id="locations">
+      {% include "locations.html" %}
     </div>
   </section>
 
 </div>
 <script>{{ htmx_js|safe }}</script>
+<script>
+function filterLocations(query) {
+  const q = query.trim().toLowerCase();
+  document.querySelectorAll('#locations details[data-code]').forEach((row) => {
+    const match = row.dataset.code.includes(q) || row.dataset.name.includes(q);
+    row.classList.toggle('hidden', !match);
+  });
+}
+</script>
 </body>
 </html>

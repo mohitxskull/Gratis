@@ -1,42 +1,33 @@
-<table class="w-full text-sm border-collapse">
-  <thead>
-    <tr class="text-left text-gray-400 border-b border-gray-800">
-      <th class="py-2 pr-4 font-medium">Location</th>
-      <th class="py-2 pr-4 font-medium">SOCKS5 URL</th>
-      <th class="py-2 pr-4 font-medium">Connected</th>
-      <th class="py-2"></th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for t in tunnels %}
-    <tr class="border-b border-gray-900 hover:bg-gray-900/50">
-      <td class="py-2 pr-4 font-mono">{{ t.location }}</td>
-      <td class="py-2 pr-4">
-        <code class="bg-gray-800 px-1.5 py-0.5 rounded text-xs">socks5://127.0.0.1:{{ t.socks_port }}</code>
-        <button
-          onclick="navigator.clipboard.writeText('socks5://127.0.0.1:{{ t.socks_port }}')"
-          class="text-xs px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 transition ml-1"
-        >Copy</button>
-      </td>
-      <td class="py-2 pr-4">
+<div class="border border-black/10 rounded divide-y divide-black/10">
+  {% for t in tunnels %}
+  <div class="flex items-center justify-between px-4 py-3">
+    <div class="flex items-center gap-4 min-w-0">
+      <span class="font-mono text-sm text-black/90">{{ t.location }}</span>
+      <span class="font-mono text-xs text-black/50 truncate">socks5://127.0.0.1:{{ t.socks_port }}</span>
+      <button
+        onclick="navigator.clipboard.writeText('socks5://127.0.0.1:{{ t.socks_port }}')"
+        class="text-xs text-black/30 hover:text-black transition"
+        title="Copy"
+      >copy</button>
+    </div>
+    <div class="flex items-center gap-4 shrink-0">
+      <span class="flex items-center text-xs text-black/50">
         {% if t.connected %}
-        <span class="text-green-400">●</span> yes
+        <span class="inline-block w-1.5 h-1.5 rounded-full bg-black mr-1.5"></span>connected
         {% else %}
-        <span class="text-red-400">●</span> no
+        <span class="inline-block w-1.5 h-1.5 rounded-full border border-black/30 mr-1.5"></span>stopped
         {% endif %}
-      </td>
-      <td class="py-2 text-right">
-        <button
-          hx-post="/ui/tunnels/{{ t.location }}/stop"
-          hx-target="#tunnels"
-          hx-swap="innerHTML"
-          class="text-xs px-2 py-1 rounded bg-red-700 hover:bg-red-600 transition text-white"
-        >Stop</button>
-      </td>
-    </tr>
-    {% endfor %}
-    {% if tunnels.is_empty() %}
-    <tr><td colspan="4" class="py-4 text-center text-gray-500">No active tunnels — start one from the Locations table.</td></tr>
-    {% endif %}
-  </tbody>
-</table>
+      </span>
+      <button
+        hx-post="/ui/tunnels/{{ t.location }}/stop"
+        hx-target="#tunnels"
+        hx-swap="innerHTML"
+        class="text-xs uppercase tracking-wide border border-black/20 rounded px-3 py-1 hover:bg-black hover:text-white transition"
+      >Stop</button>
+    </div>
+  </div>
+  {% endfor %}
+  {% if tunnels.is_empty() %}
+  <div class="py-6 text-center text-black/30 text-sm">No active tunnels — start one from Locations below.</div>
+  {% endif %}
+</div>

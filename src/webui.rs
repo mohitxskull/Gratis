@@ -8,7 +8,7 @@
 //! To regenerate the CSS after changing template classes: run the standalone `tailwindcss`
 //! binary (<https://github.com/tailwindlabs/tailwindcss/releases>) —
 //! `tailwindcss -i assets/input.css -o assets/tailwind.css --minify` — then rebuild.
-use crate::manager::{CountryInfo, TunnelInfo};
+use crate::manager::{CountryInfo, ServerSummary, TunnelInfo};
 use askama::Template;
 
 const TAILWIND_CSS: &str = include_str!("../assets/tailwind.css");
@@ -50,4 +50,10 @@ pub struct LocationsTemplate {
 #[template(path = "tunnels.html")]
 pub struct TunnelsTemplate {
     pub tunnels: Vec<TunnelInfo>,
+}
+
+#[derive(Template)]
+#[template(path = "servers.html")]
+pub struct ServersTemplate {
+    pub servers: Vec<ServerSummary>,
 }

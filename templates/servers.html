@@ -1,0 +1,11 @@
+<ul class="text-sm divide-y divide-black/5">
+  {% for s in servers %}
+  <li class="flex items-center justify-between py-1.5">
+    <span class="font-mono text-black/70">{{ s.name }}</span>
+    <span class="text-black/40 tabular-nums text-xs">{{ s.load }}% load</span>
+  </li>
+  {% endfor %}
+  {% if servers.is_empty() %}
+  <li class="py-1.5 text-black/30">No servers found.</li>
+  {% endif %}
+</ul>

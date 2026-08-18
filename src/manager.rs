@@ -102,6 +102,13 @@ pub struct CountryInfo {
     pub load: f64,
 }
 
+/// One individual server within a country, shown when its country row is expanded.
+#[derive(Debug, Clone, Serialize)]
+pub struct ServerSummary {
+    pub name: String,
+    pub load: f64,
+}
+
 /// A snapshot of one active tunnel, as surfaced by `GET /api/tunnels`.
 #[derive(Debug, Clone, Serialize)]
 pub struct TunnelInfo {
@@ -221,6 +228,26 @@ impl TunnelManager {
         let mut list: Vec<CountryInfo> = by_code.into_values().collect();
         list.sort_by(|a, b| a.code.cmp(&b.code));
         Ok(list)
+    }
+
+    /// Individual servers within `country_code`, lowest-load first — the detail list shown
+    /// when a country row is expanded in the web UI. Informational only: starting a tunnel
+    /// still operates at country granularity (`start` picks the lowest-load match itself),
+    /// this doesn't let the caller pick a specific server yet.
+    pub async fn list_servers_in(&self, country_code: &str) -> Result<Vec<ServerSummary>> {
+        let guard = self.client.lock().await;
+        let client = guard
+            .as_ref()
+            .ok_or_else(|| ProtonError::Config("not logged in".into()))?;
+
+        Ok(client
+            .find_servers(Some(country_code), None, None, PERMISSIVE_TIER)
+            .into_iter()
+            .map(|s| ServerSummary {
+                name: s.name,
+                load: s.load,
+            })
+            .collect())
     }
 
     /// Normalize a caller-supplied `location` (country code) to the canonical form used as the
