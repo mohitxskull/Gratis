@@ -1,5 +1,8 @@
 # Gratis
 
+[![CI](https://github.com/mohitxskull/Gratis/actions/workflows/ci.yml/badge.svg)](https://github.com/mohitxskull/Gratis/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/mohitxskull/Gratis)](https://github.com/mohitxskull/Gratis/releases/latest)
+
 A no-root Proton VPN (free tier) client. It logs in once, then exposes every free-tier
 server as its own local SOCKS5 proxy port — connect to a server's port and its WireGuard
 tunnel comes up on its own; leave it idle for 5 minutes and it tears itself back down.
@@ -13,29 +16,50 @@ servers at once as you want, simply by connecting to different ports.
 
 ## Installation
 
-Download a pre-built binary from the [Releases](https://github.com/mohitxskull/Gratis/releases)
-page (Linux/macOS, x86_64/aarch64) and extract the `gratis` binary somewhere on your `PATH`.
+Grab the tarball for your platform from the
+[latest release](https://github.com/mohitxskull/Gratis/releases/latest) and extract it —
+no build tools, no Rust toolchain needed. Pick one of `x86_64-unknown-linux-gnu`,
+`aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, or `aarch64-apple-darwin`:
 
-Or build from source:
+```sh
+# with the GitHub CLI (always fetches the current latest release):
+gh release download --repo mohitxskull/Gratis --pattern "*x86_64-unknown-linux-gnu*"
+
+# or with curl, filling in the exact filename from the releases page:
+curl -LO https://github.com/mohitxskull/Gratis/releases/latest/download/<filename>.tar.gz
+
+tar xzf gratis-*.tar.gz && cd gratis-*/
+./gratis --help
+```
+
+Move the extracted `gratis` binary onto your `PATH` (e.g. `~/.local/bin` or `/usr/local/bin`)
+if you want to run it as just `gratis` from anywhere.
+
+<details>
+<summary>Building from source instead</summary>
 
 ```sh
 cargo install --git https://github.com/mohitxskull/Gratis
 ```
 
+</details>
+
 ## Usage
 
-Create a `.env` file next to the binary with your Proton account credentials:
+Create a `.env` file next to the `gratis` binary with your Proton account credentials:
 
 ```
 EMAIL=you@example.com
 PASSWORD=your-password
 ```
 
-Then run the daemon:
+Then run it:
 
+```sh
+./gratis
 ```
-cargo run --release
-```
+
+(If you built from source instead of downloading a release: `cargo run --release`.)
 
 On startup it logs in, fetches the free-tier server list, and assigns each server a fixed
 port starting from `20000` (configurable — see below). Point any SOCKS5 client at
