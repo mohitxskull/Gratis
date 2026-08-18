@@ -3,7 +3,9 @@
 //! Correctness reference for the config shape: <https://github.com/ProtonVPN/proton-vpn-cli>
 use crate::errors::*;
 use crate::models::{VPNCredentials, VPNServer};
-use std::os::unix::fs::PermissionsExt;
+use std::fs::OpenOptions;
+use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt;
 use std::process::Command;
 
 /// Standard Proton WireGuard UDP port.
@@ -55,28 +57,53 @@ pub fn generate_config(
 /// active tunnel (location/interface/socks_port) is the caller's responsibility via
 /// `credentials::set_active`, since this layer has no `location`/`socks_port` to record —
 /// those are only known one layer up (the connect flow in Task 05).
+///
+/// Security: the config embeds the client's WireGuard private key, and the temp path
+/// (`<tmp>/<interface>.conf`) is predictable in a world-writable directory. The file is
+/// created with `O_CREAT | O_EXCL` and mode `0600` in a single syscall (`OpenOptions` with
+/// `create_new(true)` + `mode(0o600)`), so there is never a window where the file exists
+/// world-readable, and a pre-placed file/symlink at that path makes `open` fail instead of
+/// being silently written through or followed (no TOCTOU between "create" and "chmod", and
+/// no race between "write" and `wg-quick`'s read — the content is fully written, with
+/// owner-only permissions already in force, before `wg-quick` is ever invoked). The file is
+/// removed again once `wg-quick` has run, whether it succeeded or failed, so the private key
+/// doesn't linger on disk.
 pub fn up(interface: &str, config: &str) -> Result<()> {
     let path = std::env::temp_dir().join(format!("{interface}.conf"));
-    std::fs::write(&path, config)?;
-    // The config embeds the client's WireGuard private key: lock the temp file down to
-    // owner-only before `wg-quick` (running as root via sudo) reads it.
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
 
-    let status = Command::new("sudo")
-        .arg("wg-quick")
-        .arg("up")
-        .arg(&path)
-        .status()
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
         .map_err(ProtonError::Io)?;
+    file.write_all(config.as_bytes()).map_err(ProtonError::Io)?;
+    file.sync_all().map_err(ProtonError::Io)?;
+    drop(file);
 
-    if !status.success() {
-        return Err(ProtonError::Config(format!(
-            "wg-quick up {} failed with status {status}",
-            path.display()
-        )));
-    }
+    let run = || -> Result<()> {
+        let status = Command::new("sudo")
+            .arg("wg-quick")
+            .arg("up")
+            .arg(&path)
+            .status()
+            .map_err(ProtonError::Io)?;
 
-    Ok(())
+        if !status.success() {
+            return Err(ProtonError::Config(format!(
+                "wg-quick up {} failed with status {status}",
+                path.display()
+            )));
+        }
+        Ok(())
+    };
+    let result = run();
+
+    // Always clean up: the file contains the client's private key, whether `wg-quick`
+    // succeeded or failed.
+    let _ = std::fs::remove_file(&path);
+
+    result
 }
 
 /// Tear the tunnel down: `sudo wg-quick down <interface>`.
