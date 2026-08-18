@@ -453,7 +453,10 @@ mod tests {
     /// bookkeeping in isolation.
     fn manager_with_one_slot(port: u16) -> (Arc<TunnelManager>, Arc<ServerSlot>) {
         let driver = Arc::new(FakeDriver::default());
-        let manager = Arc::new(TunnelManager::with_driver(port, driver.clone() as Arc<dyn TunnelDriver>));
+        let manager = Arc::new(TunnelManager::with_driver(
+            port,
+            driver.clone() as Arc<dyn TunnelDriver>,
+        ));
         let slot = ServerSlot::new(test_server("srv-1", "US"), test_creds(), driver, port);
         manager.slots.lock().unwrap().push(slot.clone());
         (manager, slot)

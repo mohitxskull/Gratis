@@ -13,12 +13,12 @@
 use crate::manager::{ServerStatus, TunnelManager};
 use crate::webui::{IndexTemplate, ServersTemplate};
 use askama::Template;
+use axum::http::StatusCode;
 use axum::{
     Json, Router,
     response::{Html, IntoResponse, Response},
     routing::get,
 };
-use axum::http::StatusCode;
 use std::sync::Arc;
 
 /// Render an Askama template to an HTML response, mapping a render failure (should never
@@ -47,13 +47,17 @@ pub fn router(manager: Arc<TunnelManager>) -> Router {
 /// auto-login failed at startup) renders as an inline empty-state message in the template
 /// rather than a distinct error banner — there's nothing actionable to say beyond "nothing to
 /// show," and the daemon's stderr already carries the actual login failure reason.
-async fn index(axum::extract::State(manager): axum::extract::State<Arc<TunnelManager>>) -> Response {
+async fn index(
+    axum::extract::State(manager): axum::extract::State<Arc<TunnelManager>>,
+) -> Response {
     render(IndexTemplate::new(manager.servers()))
 }
 
 /// The server table fragment, polled by the page every few seconds so status (connected,
 /// open connections, telemetry) stays live without a manual refresh.
-async fn ui_servers(axum::extract::State(manager): axum::extract::State<Arc<TunnelManager>>) -> Response {
+async fn ui_servers(
+    axum::extract::State(manager): axum::extract::State<Arc<TunnelManager>>,
+) -> Response {
     render(ServersTemplate::new(manager.servers()))
 }
 
