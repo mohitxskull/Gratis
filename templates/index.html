@@ -37,7 +37,12 @@
         Refresh
       </button>
     </div>
-    <div id="tunnels">
+    <div
+      id="tunnels"
+      hx-get="/ui/tunnels"
+      hx-trigger="every 3s"
+      hx-swap="innerHTML"
+    >
       {% include "tunnels.html" %}
     </div>
   </section>

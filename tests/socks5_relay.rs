@@ -52,8 +52,9 @@ async fn spawn_proxy() -> u16 {
     let port = free_port();
     let listen_addr = format!("127.0.0.1:{port}");
     let tunnel = std::sync::Arc::new(gratis::wireguard::Tunnel::loopback_for_testing());
+    let current = std::sync::Arc::new(std::sync::Mutex::new(tunnel));
     tokio::spawn(async move {
-        let _ = gratis::socks5::run_socks5(&listen_addr, tunnel).await;
+        let _ = gratis::socks5::run_socks5(&listen_addr, current).await;
     });
 
     // Give the listener a moment to bind before clients try to connect.

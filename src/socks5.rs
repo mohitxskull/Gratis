@@ -20,7 +20,7 @@
 //! tunnel manager. Each accepted client connection is handled on its own spawned task, so
 //! there is no artificial concurrency cap.
 
-use crate::wireguard::SharedTunnel;
+use crate::wireguard::{CurrentTunnel, SharedTunnel};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -44,11 +44,16 @@ const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 
 /// Run the SOCKS5 proxy: bind `listen_addr`, accept clients forever, and relay each `CONNECT`
-/// through `tunnel`.
+/// through whichever tunnel `current` holds *at accept time*.
+///
+/// `current` is read fresh for every accepted connection, so `TunnelManager` can hot-swap it
+/// (e.g. switching which server a location's tunnel points at) without rebinding this
+/// listener: already-accepted connections keep using the tunnel clone they captured, only
+/// connections accepted after the swap pick up the new one.
 ///
 /// This future only returns (with `Err`) if the listener fails to bind; otherwise it runs
 /// forever, spawning one task per accepted connection.
-pub async fn run_socks5(listen_addr: &str, tunnel: SharedTunnel) -> io::Result<()> {
+pub async fn run_socks5(listen_addr: &str, current: CurrentTunnel) -> io::Result<()> {
     let listener = TcpListener::bind(listen_addr).await?;
 
     loop {
@@ -61,7 +66,7 @@ pub async fn run_socks5(listen_addr: &str, tunnel: SharedTunnel) -> io::Result<(
                 continue;
             }
         };
-        let tunnel = tunnel.clone();
+        let tunnel = current.lock().unwrap().clone();
         tokio::spawn(async move {
             if let Err(_err) = handle_client(client, tunnel).await {
                 // Best-effort relay: any I/O error just ends this connection's task.

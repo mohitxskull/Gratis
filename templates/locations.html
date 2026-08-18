@@ -21,9 +21,9 @@
     </summary>
     <div
       hx-get="/ui/locations/{{ loc.code }}/servers"
-      hx-trigger="toggle once"
+      hx-trigger="toggle once from:closest details"
       hx-swap="innerHTML"
-      class="px-4 pb-3 pl-10 text-ink/40 text-xs loading-pulse"
+      class="px-4 pb-3 pl-10 text-ink/40 text-xs loading-placeholder"
     >Loading…</div>
   </details>
   {% endfor %}

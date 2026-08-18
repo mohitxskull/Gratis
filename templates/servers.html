@@ -1,8 +1,17 @@
 <ul class="text-sm divide-y divide-ink/8">
   {% for s in servers %}
-  <li class="flex items-center justify-between py-1.5">
-    <span class="font-mono text-ink/75">{{ s.name }}</span>
-    <span class="text-ink/50 tabular-nums text-xs">{{ s.load }}% load</span>
+  <li class="flex items-center justify-between py-1.5 gap-3">
+    <span class="font-mono text-ink/75 truncate">{{ s.name }}</span>
+    <span class="flex items-center gap-3 shrink-0">
+      <span class="text-ink/50 tabular-nums text-xs">{{ s.load }}% load</span>
+      <button
+        hx-post="/ui/tunnels/{{ location }}/start/{{ s.name|urlencode_strict }}"
+        hx-target="#tunnels"
+        hx-swap="innerHTML"
+        hx-disabled-elt="this"
+        class="text-xs uppercase tracking-wide border border-ink/25 rounded px-2.5 py-0.5 hover:bg-ink hover:text-paper transition disabled:opacity-40"
+      >Connect</button>
+    </span>
   </li>
   {% endfor %}
   {% if servers.is_empty() %}

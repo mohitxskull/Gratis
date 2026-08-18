@@ -38,7 +38,10 @@
       opacity: 0.8;
     }
   }
-  .loading-pulse {
+  /* Only pulses while htmx has an in-flight request on this element (its `htmx-request`
+     class), so the animation stops the moment the real content swaps in — `hx-swap="innerHTML"`
+     replaces the div's children but keeps the div (and its classes) around afterward. */
+  .loading-placeholder.htmx-request {
     animation: pulse-fade 1.3s ease-in-out infinite;
   }
 }

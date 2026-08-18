@@ -191,3 +191,12 @@ impl Tunnel {
 /// `SharedTunnel` reference (once the manager has stopped spawning new SOCKS5 relay tasks
 /// against it and those tasks have exited) is sufficient to tear the tunnel down.
 pub type SharedTunnel = Arc<Tunnel>;
+
+/// A location's live tunnel, behind an indirection that lets the manager hot-swap which
+/// server a running SOCKS5 listener relays through — without rebinding the listener (so its
+/// port never changes) and without disturbing already-open client connections (each one
+/// captured its own `SharedTunnel` clone at accept time via [`crate::socks5::run_socks5`], so
+/// a swap here only changes which tunnel *new* connections get; old ones keep flowing through
+/// the tunnel they started on until they finish, and that tunnel tears down on its own once
+/// its last `SharedTunnel` clone — including this slot's, once overwritten — is dropped).
+pub type CurrentTunnel = Arc<std::sync::Mutex<SharedTunnel>>;

@@ -55,5 +55,6 @@ pub struct TunnelsTemplate {
 #[derive(Template)]
 #[template(path = "servers.html")]
 pub struct ServersTemplate {
+    pub location: String,
     pub servers: Vec<ServerSummary>,
 }

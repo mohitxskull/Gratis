@@ -42,6 +42,10 @@ pub fn router(manager: Arc<TunnelManager>) -> Router {
         .route("/ui/locations/:code/servers", get(ui_location_servers))
         .route("/ui/tunnels", get(ui_tunnels))
         .route("/ui/tunnels/:location/start", post(ui_start_tunnel))
+        .route(
+            "/ui/tunnels/:location/start/:server",
+            post(ui_start_tunnel_server),
+        )
         .route("/ui/tunnels/:location/stop", post(ui_stop_tunnel))
         .route("/api/locations", get(locations))
         .route("/api/tunnels", get(list_tunnels).post(start_tunnel))
@@ -76,7 +80,10 @@ async fn ui_location_servers(
     Path(code): Path<String>,
 ) -> Response {
     let servers = manager.list_servers_in(&code).await.unwrap_or_default();
-    render(ServersTemplate { servers })
+    render(ServersTemplate {
+        location: code,
+        servers,
+    })
 }
 
 /// Tunnels table fragment, for the "Refresh" button and after start/stop actions.
@@ -95,6 +102,18 @@ async fn ui_start_tunnel(
     Path(location): Path<String>,
 ) -> Response {
     let _ = manager.start(&location).await;
+    render(TunnelsTemplate {
+        tunnels: manager.tunnels(),
+    })
+}
+
+/// Start a tunnel to one specific server within a location, from the web UI. Same
+/// fragment-rendering contract as `ui_start_tunnel`.
+async fn ui_start_tunnel_server(
+    State(manager): State<Arc<TunnelManager>>,
+    Path((location, server)): Path<(String, String)>,
+) -> Response {
+    let _ = manager.start_server(&location, Some(&server)).await;
     render(TunnelsTemplate {
         tunnels: manager.tunnels(),
     })
@@ -124,6 +143,10 @@ async fn list_tunnels(State(manager): State<Arc<TunnelManager>>) -> Json<Vec<Tun
 #[derive(Deserialize)]
 struct StartRequest {
     location: String,
+    /// Specific server to connect to (e.g. `"US#1"`), matched case-insensitively. Omit to let
+    /// `TunnelManager` pick the lowest-load free-tier server in `location`, as before.
+    #[serde(default)]
+    server: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -136,7 +159,9 @@ async fn start_tunnel(
     State(manager): State<Arc<TunnelManager>>,
     Json(body): Json<StartRequest>,
 ) -> Result<Json<StartResponse>, ApiError> {
-    let socks_port = manager.start(&body.location).await?;
+    let socks_port = manager
+        .start_server(&body.location, body.server.as_deref())
+        .await?;
     Ok(Json(StartResponse {
         location: body.location,
         socks_port,
@@ -284,6 +309,18 @@ mod tests {
             .clone()
             .oneshot(
                 Request::post("/ui/tunnels/US/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // POST /ui/tunnels/:location/start/:server — per-server start, same contract.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/ui/tunnels/US/start/US%231")
                     .body(Body::empty())
                     .unwrap(),
             )
