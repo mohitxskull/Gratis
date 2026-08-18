@@ -20,6 +20,7 @@ dirs = "5"
 proton-srp = { version = "0.8", features = ["pgpinternal"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 x509-parser = "0.16"
+socket2 = { version = "0.5", features = ["all"] }
 
 [dev-dependencies]
 base64 = "0.22"
