@@ -1,43 +1,68 @@
-//! Ties together auth (`client.rs`), the userspace WireGuard tunnel (`wireguard.rs`), the
-//! SOCKS5 proxy (`socks5.rs`), and persisted credentials/state (`credentials.rs`) into a
-//! per-location tunnel manager used by the control API (`src/api.rs`).
+//! Ties together auth (`client.rs`), the userspace WireGuard tunnel (`wireguard.rs`), and the
+//! SOCKS5 proxy (`socks5.rs`) into per-server "slots" (`ServerSlot`) driven by the control API
+//! (`src/api.rs`).
+//!
+//! ## Port-per-server, lazily-connected, self-idling
+//!
+//! Right after login, `TunnelManager` assigns every free-tier server a fixed port (sequential
+//! from `port_range_start`) and immediately spawns an always-on SOCKS5 listener for it — no
+//! separate "connect" call is needed to make a server reachable. What *is* lazy is the
+//! WireGuard tunnel behind that listener: the first client connection to a server's port brings
+//! the tunnel up (see `ServerSlot::acquire`), and it's torn back down automatically once the
+//! last client connection to it closes and `IDLE_TIMEOUT` passes with no new one arriving (see
+//! `ServerSlot::release`) — the listener itself keeps running the whole time, ready to
+//! reconnect on the next hit. Any number of servers can have a live tunnel at once; each slot
+//! is entirely independent.
 //!
 //! ## No-root architecture
 //!
 //! Tunnels here are in-process userspace WireGuard sessions (see `wireguard.rs`), not real
-//! kernel network interfaces brought up via `sudo wg-quick`. A tunnel is exactly as
-//! long-lived as the `Arc<Tunnel>` referencing it and cannot outlive the daemon process — so
-//! there is no "leaked interface" failure mode, no privileged `is_up` check, and no boot
-//! reconciliation of stale kernel state to get wrong. `stop()` and process exit both simply
-//! drop the tunnel.
+//! kernel network interfaces brought up via `sudo wg-quick`. A tunnel is exactly as long-lived
+//! as the `Arc<Tunnel>` referencing it and cannot outlive the daemon process — so there is no
+//! "leaked interface" failure mode, no privileged `is_up` check, and no boot reconciliation of
+//! stale kernel state to get wrong.
 //!
-//! ## Restore-on-startup design decision
+//! ## No persistence
 //!
-//! `credentials::load_credentials()` returns a `VPNCredentials` (username/certificate/
-//! WireGuard keypair) — it does **not** persist a session access token or the Proton server
-//! list. `ProtonVPNClient::find_servers` operates on an in-memory `server_list` that is only
-//! populated by an authenticated `fetch_servers()` call, and `fetch_servers()` requires a bearer
-//! token from a live `login()`. There is therefore no way to serve `/api/locations` or `start()`
-//! from persisted state alone without re-authenticating against the API.
-//!
-//! Saved credentials are informational only at startup (`TunnelManager::has_saved_credentials`
-//! lets `main.rs` log "credentials found, but a fresh login is still required");
-//! `list_locations`/`start` always require an in-process `login()` (via `POST /api/login`) to
-//! populate `client` with a fresh token + server list. `POST /api/login` remains the single,
-//! always-working primary path.
+//! Nothing here is written to disk. Login is always a fresh `.env`-driven login at daemon
+//! startup (see `main.rs`); there is no saved-session restore, and no record of which slots
+//! were connected survives a restart — there wouldn't be anything meaningful to restore, since
+//! a tunnel cannot outlive the process that holds it anyway.
 use crate::client::ProtonVPNClient;
-use crate::credentials;
 use crate::errors::*;
 use crate::models::{VPNCredentials, VPNServer};
-use crate::socks5;
-use crate::wireguard::{self, CurrentTunnel, SharedTunnel, Tunnel, TunnelStats};
+use crate::socks5::{self, SourceError, TunnelSource};
+use crate::wireguard::{SharedTunnel, Tunnel, TunnelStats};
 use async_trait::async_trait;
 use serde::Serialize;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
+
+/// How long a slot's tunnel is kept up with zero open connections before it's torn down. The
+/// listener stays bound the whole time; only the WireGuard session underneath it is dropped.
+///
+/// Shortened under `cfg(test)` so idle-teardown behavior can actually be exercised in a unit
+/// test without a multi-minute sleep.
+#[cfg(not(test))]
+const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+#[cfg(test)]
+const IDLE_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// Account tier used to filter the server list to what's actually reachable.
+///
+/// `client.rs`/`models.rs` don't currently surface the account's actual tier anywhere the
+/// manager can read it. This was previously `i32::MAX` (disabling the filter entirely) — **
+/// confirmed live to be a real bug, not just a theoretical gap**: with the filter disabled,
+/// server selection picked servers regardless of tier, which for a free-tier test account
+/// selected a tier-2 (paid) server. The WireGuard handshake succeeded (it authenticates by
+/// keypair, not by tier), but Proton silently dropped all subsequent data traffic — the symptom
+/// was indistinguishable from a relay bug until traced back to server selection. Defaulting to
+/// `0` (free tier) is the safe, conservative choice: it never selects a server above what every
+/// account is entitled to.
+const PERMISSIVE_TIER: i32 = 0;
 
 /// Seam for testing `TunnelManager` without root/live WireGuard/network access.
 ///
@@ -53,14 +78,14 @@ pub trait TunnelDriver: Send + Sync {
         creds: &VPNCredentials,
     ) -> Result<SharedTunnel>;
 
-    /// Spawn whatever serves this location's SOCKS5 proxy, returning its `JoinHandle` so the
-    /// manager can `abort()` it on `stop()`. `tunnel` is a swappable slot (see
-    /// [`CurrentTunnel`]) rather than a fixed tunnel, so the manager can hot-swap which
-    /// server it points at later without respawning this task.
+    /// Spawn whatever serves this slot's SOCKS5 proxy, returning its `JoinHandle`. `source` is
+    /// how the listener gets a tunnel per accepted connection — see
+    /// [`crate::socks5::TunnelSource`] — rather than a fixed tunnel, so it can run for the
+    /// entire process lifetime whether or not a tunnel currently happens to be up.
     fn spawn_socks5(
         &self,
         listen_addr: String,
-        tunnel: CurrentTunnel,
+        source: Arc<dyn TunnelSource>,
         stats: Arc<Mutex<TunnelStats>>,
     ) -> JoinHandle<()>;
 }
@@ -83,402 +108,250 @@ impl TunnelDriver for RealDriver {
     fn spawn_socks5(
         &self,
         listen_addr: String,
-        tunnel: CurrentTunnel,
+        source: Arc<dyn TunnelSource>,
         stats: Arc<Mutex<TunnelStats>>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
-            if let Err(err) = socks5::run_socks5(&listen_addr, tunnel, stats).await {
+            if let Err(err) = socks5::run_socks5(&listen_addr, source, stats).await {
                 eprintln!("socks5 listener on {listen_addr} exited: {err}");
             }
         })
     }
 }
 
-/// The one currently active tunnel + SOCKS5 proxy, if any. `TunnelManager` runs at most one at
-/// a time: starting a different location or server swaps this in place (same `socks_port`,
-/// same SOCKS5 `task`, so already-open client connections are undisturbed — see
-/// [`CurrentTunnel`]) rather than running multiple tunnels side by side.
-struct RunningTunnel {
-    location: String,
-    server: String,
-    interface: String,
-    current: CurrentTunnel,
-    task: JoinHandle<()>,
-    started_at: Instant,
+/// One free-tier server: a fixed port with an always-on SOCKS5 listener, whose WireGuard tunnel
+/// is connected lazily on first use and torn down after `IDLE_TIMEOUT` idle (see the module
+/// doc comment). Implements [`TunnelSource`] so `run_socks5`'s accept loop can drive it
+/// directly.
+struct ServerSlot {
+    server: VPNServer,
+    creds: VPNCredentials,
+    driver: Arc<dyn TunnelDriver>,
+    port: u16,
     stats: Arc<Mutex<TunnelStats>>,
+
+    tunnel: Mutex<Option<SharedTunnel>>,
+    connected_at: Mutex<Option<Instant>>,
+    open_connections: AtomicU32,
+    /// Bumped on every `acquire` (including reuses of an already-connected tunnel). An
+    /// idle-teardown timer only acts if this hasn't moved since it was spawned — see
+    /// `release`'s doc comment for why that matters.
+    idle_generation: AtomicU64,
+    /// Serializes the actual `connect_tunnel` call so concurrent connections to the same
+    /// (not-yet-connected) server can't race each other into two tunnels.
+    connect_lock: AsyncMutex<()>,
+    /// Lets `release` spawn a self-referencing idle-teardown task without `ServerSlot` needing
+    /// to already know its own `Arc` at construction time (see `ServerSlot::new`).
+    self_ref: Weak<ServerSlot>,
 }
 
-/// A country available to connect to, derived from the logged-in client's server list.
-#[derive(Debug, Clone, Serialize)]
-pub struct CountryInfo {
-    pub code: String,
+impl ServerSlot {
+    fn new(
+        server: VPNServer,
+        creds: VPNCredentials,
+        driver: Arc<dyn TunnelDriver>,
+        port: u16,
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|weak| Self {
+            server,
+            creds,
+            driver,
+            port,
+            stats: Arc::new(Mutex::new(TunnelStats::default())),
+            tunnel: Mutex::new(None),
+            connected_at: Mutex::new(None),
+            open_connections: AtomicU32::new(0),
+            idle_generation: AtomicU64::new(0),
+            connect_lock: AsyncMutex::new(()),
+            self_ref: weak.clone(),
+        })
+    }
+
+    fn status(&self) -> ServerStatus {
+        let tunnel = self.tunnel.lock().unwrap().clone();
+        let connected_at = *self.connected_at.lock().unwrap();
+        let stats = self.stats.lock().unwrap();
+        ServerStatus {
+            name: self.server.name.clone(),
+            country: self.server.country.clone(),
+            country_code: self.server.country_code.clone(),
+            city: self.server.city.clone(),
+            port: self.port,
+            load: self.server.load,
+            connected: tunnel.is_some(),
+            open_connections: self.open_connections.load(Ordering::SeqCst),
+            uptime_secs: connected_at.map(|t| t.elapsed().as_secs()),
+            handshake_age_secs: tunnel
+                .as_ref()
+                .and_then(|t| t.time_since_last_handshake())
+                .map(|d| d.as_secs()),
+            bytes_sent: stats.bytes_sent,
+            bytes_received: stats.bytes_received,
+        }
+    }
+}
+
+#[async_trait]
+impl TunnelSource for ServerSlot {
+    async fn acquire(&self) -> std::result::Result<SharedTunnel, SourceError> {
+        self.open_connections.fetch_add(1, Ordering::SeqCst);
+        // Invalidates any idle-teardown timer spawned by a previous `release` — see that
+        // method's doc comment.
+        self.idle_generation.fetch_add(1, Ordering::SeqCst);
+
+        if let Some(tunnel) = self.tunnel.lock().unwrap().clone() {
+            return Ok(tunnel);
+        }
+
+        // Only one connect attempt per slot at a time; a second connection arriving while the
+        // first is still handshaking waits here, then finds `tunnel` already set below.
+        let _connect_guard = self.connect_lock.lock().await;
+        if let Some(tunnel) = self.tunnel.lock().unwrap().clone() {
+            return Ok(tunnel);
+        }
+
+        match self.driver.connect_tunnel(&self.server, &self.creds).await {
+            Ok(tunnel) => {
+                *self.tunnel.lock().unwrap() = Some(tunnel.clone());
+                *self.connected_at.lock().unwrap() = Some(Instant::now());
+                Ok(tunnel)
+            }
+            Err(err) => {
+                // Undo the increment above: this connection never got a tunnel, so it must not
+                // be counted as "open" for idle-teardown purposes.
+                self.open_connections.fetch_sub(1, Ordering::SeqCst);
+                Err(Box::new(err))
+            }
+        }
+    }
+
+    fn release(&self) {
+        let remaining = self.open_connections.fetch_sub(1, Ordering::SeqCst) - 1;
+        if remaining != 0 {
+            return;
+        }
+
+        // Snapshot the generation now, at the moment the connection count hit zero. If a new
+        // connection arrives before the sleep below finishes, `acquire` bumps the generation,
+        // so the check on wake won't match and this timer becomes a no-op — without this, a
+        // *stale* timer from an earlier idle window could tear down a tunnel that's only been
+        // idle for a few seconds of a brand new window (`open_connections == 0` alone can't
+        // distinguish "still the same idle period" from "a fresh one that also happens to be
+        // momentarily at zero").
+        let generation = self.idle_generation.load(Ordering::SeqCst);
+        let Some(slot) = self.self_ref.upgrade() else {
+            return;
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(IDLE_TIMEOUT).await;
+            if slot.open_connections.load(Ordering::SeqCst) == 0
+                && slot.idle_generation.load(Ordering::SeqCst) == generation
+            {
+                *slot.tunnel.lock().unwrap() = None;
+                *slot.connected_at.lock().unwrap() = None;
+            }
+        });
+    }
+}
+
+/// A snapshot of one server, as surfaced by `GET /api/servers` — the sole read API. Static
+/// fields (name/location/port/load) never change once assigned; the rest reflects live state.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct ServerStatus {
     pub name: String,
-    /// Lowest load (0-100) among that country's servers.
+    pub country: String,
+    pub country_code: String,
+    pub city: Option<String>,
+    /// Fixed for this server's whole process lifetime — connect a SOCKS5 client to
+    /// `127.0.0.1:<port>` to use it; the first connection lazily brings the tunnel up.
+    pub port: u16,
     pub load: f64,
-}
-
-/// One individual server within a country, shown when its country row is expanded.
-#[derive(Debug, Clone, Serialize)]
-pub struct ServerSummary {
-    pub name: String,
-    pub load: f64,
-}
-
-/// A snapshot of one active tunnel, as surfaced by `GET /api/tunnels`.
-#[derive(Debug, Clone, Serialize)]
-pub struct TunnelInfo {
-    pub location: String,
-    pub interface: String,
-    pub socks_port: u16,
-    /// Name of the specific server this tunnel is connected to (e.g. `"US#1"`).
-    pub server: String,
-    /// Whether the SOCKS5 task backing this tunnel is still running, derived from
-    /// `JoinHandle::is_finished()`.
+    /// Whether a WireGuard tunnel is currently up for this server.
     pub connected: bool,
-    /// Seconds the current tunnel session has been running.
-    pub uptime_secs: u64,
-    /// Seconds since the last WireGuard handshake, or `None` if not a real session.
+    pub open_connections: u32,
+    /// Seconds the current tunnel has been up, or `None` if not currently connected.
+    pub uptime_secs: Option<u64>,
+    /// Seconds since the last WireGuard handshake, or `None` if not currently connected.
     pub handshake_age_secs: Option<u64>,
-    /// Bytes relayed client→Internet (upload) by the SOCKS5 proxy.
     pub bytes_sent: u64,
-    /// Bytes relayed Internet→client (download) by the SOCKS5 proxy.
     pub bytes_received: u64,
 }
 
-/// Account tier used for `find_servers`'s `user_tier` filter.
-///
-/// `client.rs`/`models.rs` don't currently surface the account's actual tier anywhere the
-/// manager can read it. This was previously `i32::MAX` (disabling the filter entirely) — **
-/// confirmed live to be a real bug, not just a theoretical gap**: with the filter disabled,
-/// `find_servers` picks the globally lowest-load server regardless of tier, which for a
-/// free-tier test account selected a tier-2 (paid) server. The WireGuard handshake succeeded
-/// (it authenticates by keypair, not by tier), but Proton silently dropped all subsequent
-/// data traffic — the symptom was indistinguishable from a relay bug (TCP connects, a write
-/// succeeds, no response ever arrives) until traced back to the server selection. Defaulting
-/// to `0` (free tier) is the safe, conservative choice: it never selects a server above what
-/// every account is entitled to, at the cost of paid-tier accounts not getting access to
-/// plus-tier servers until the real account tier is threaded through from the API.
-const PERMISSIVE_TIER: i32 = 0;
-
 pub struct TunnelManager {
     client: AsyncMutex<Option<ProtonVPNClient>>,
-    /// Fixed SOCKS5 port for the single tunnel this manager ever runs. Never changes across a
-    /// location/server switch — only ever (re)bound once, the first time a tunnel starts.
-    socks_port: u16,
-    active: Mutex<Option<RunningTunnel>>,
     driver: Arc<dyn TunnelDriver>,
-    /// Serializes `start_server()`/`stop()` end-to-end, so concurrent calls (e.g. a
-    /// double-clicked button, or a switch racing a stop) can't interleave.
-    switch_lock: AsyncMutex<()>,
+    /// First port handed out; each free-tier server gets one more than the last, in a stable
+    /// (server-id-sorted) order.
+    port_range_start: u16,
+    slots: Mutex<Vec<Arc<ServerSlot>>>,
 }
 
 impl TunnelManager {
     /// Build a manager using the real tunnel/SOCKS5 driver.
-    pub fn new(socks_port: u16) -> Self {
-        Self::with_driver(socks_port, Arc::new(RealDriver))
+    pub fn new(port_range_start: u16) -> Self {
+        Self::with_driver(port_range_start, Arc::new(RealDriver))
     }
 
     /// Build a manager with an injected driver (used by tests to avoid touching real
     /// WireGuard/network state).
-    pub fn with_driver(socks_port: u16, driver: Arc<dyn TunnelDriver>) -> Self {
+    pub fn with_driver(port_range_start: u16, driver: Arc<dyn TunnelDriver>) -> Self {
         Self {
             client: AsyncMutex::new(None),
-            socks_port,
-            active: Mutex::new(None),
             driver,
-            switch_lock: AsyncMutex::new(()),
+            port_range_start,
+            slots: Mutex::new(Vec::new()),
         }
     }
 
-    /// Whether a previous session's credentials are present in the SQLite store. Informational
-    /// only — see the module doc comment on why this can't drive an unattended restore.
-    pub fn has_saved_credentials(&self) -> bool {
-        credentials::load_credentials().is_ok()
-    }
-
-    /// Authenticate via SRP, fetch the server list, persist credentials, and store the live
-    /// client for `list_locations`/`start` to use.
+    /// Authenticate via SRP, fetch the server list, and bind one port + one always-on SOCKS5
+    /// listener per free-tier server (see the module doc comment). Replaces any slots from a
+    /// previous login.
     pub async fn login(&self, email: &str, password: &str) -> Result<()> {
         let mut client = ProtonVPNClient::new(email);
         let creds = client.login(email, password).await?;
         client.fetch_servers().await?;
-        credentials::save_credentials(&creds)?;
+
+        let mut servers: Vec<VPNServer> = client
+            .server_list
+            .iter()
+            .filter(|s| s.tier <= PERMISSIVE_TIER)
+            .cloned()
+            .collect();
+        servers.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let mut slots = Vec::with_capacity(servers.len());
+        for (i, server) in servers.into_iter().enumerate() {
+            let offset = u16::try_from(i)
+                .map_err(|_| ProtonError::Config("too many servers for the port range".into()))?;
+            let port = self.port_range_start.checked_add(offset).ok_or_else(|| {
+                ProtonError::Config("ran out of ports for the free-tier server list".into())
+            })?;
+
+            let slot = ServerSlot::new(server, creds.clone(), self.driver.clone(), port);
+            // Fire-and-forget: this listener is meant to run for the rest of the process's
+            // life, so there's nothing useful to do with the JoinHandle (dropping it detaches
+            // the task rather than aborting it).
+            let _handle = self.driver.spawn_socks5(
+                format!("127.0.0.1:{port}"),
+                slot.clone(),
+                slot.stats.clone(),
+            );
+            slots.push(slot);
+        }
+
+        *self.slots.lock().unwrap() = slots;
         *self.client.lock().await = Some(client);
         Ok(())
     }
 
-    /// Distinct countries available from the logged-in client's server list, each with its
-    /// lowest current load.
-    pub async fn list_locations(&self) -> Result<Vec<CountryInfo>> {
-        let guard = self.client.lock().await;
-        let client = guard
-            .as_ref()
-            .ok_or_else(|| ProtonError::Config("not logged in".into()))?;
-
-        let mut by_code: HashMap<String, CountryInfo> = HashMap::new();
-        for server in client
-            .server_list
+    /// Every free-tier server this account can reach, each with its assigned port and current
+    /// connection status. The sole read API — see the module doc comment.
+    pub fn servers(&self) -> Vec<ServerStatus> {
+        self.slots
+            .lock()
+            .unwrap()
             .iter()
-            .filter(|s| s.tier <= PERMISSIVE_TIER)
-        {
-            by_code
-                .entry(server.country_code.clone())
-                .and_modify(|c| {
-                    if server.load < c.load {
-                        c.load = server.load;
-                    }
-                })
-                .or_insert_with(|| CountryInfo {
-                    code: server.country_code.clone(),
-                    name: server.country.clone(),
-                    load: server.load,
-                });
-        }
-
-        let mut list: Vec<CountryInfo> = by_code.into_values().collect();
-        list.sort_by(|a, b| a.code.cmp(&b.code));
-        Ok(list)
-    }
-
-    /// Individual servers within `country_code`, lowest-load first — the detail list shown
-    /// when a country row is expanded in the web UI. Informational only: starting a tunnel
-    /// still operates at country granularity (`start` picks the lowest-load match itself),
-    /// this doesn't let the caller pick a specific server yet.
-    pub async fn list_servers_in(&self, country_code: &str) -> Result<Vec<ServerSummary>> {
-        let guard = self.client.lock().await;
-        let client = guard
-            .as_ref()
-            .ok_or_else(|| ProtonError::Config("not logged in".into()))?;
-
-        Ok(client
-            .find_servers(Some(country_code), None, None, PERMISSIVE_TIER)
-            .into_iter()
-            .map(|s| ServerSummary {
-                name: s.name,
-                load: s.load,
-            })
-            .collect())
-    }
-
-    /// Normalize a caller-supplied `location` (country code) to the canonical form used
-    /// throughout (`active_tunnels` DB key, comparisons against the running tunnel's
-    /// location): uppercase, exactly two ASCII letters.
-    fn normalize_location(location: &str) -> Result<String> {
-        let upper = location.to_ascii_uppercase();
-        if upper.len() == 2 && upper.bytes().all(|b| b.is_ascii_alphabetic()) {
-            Ok(upper)
-        } else {
-            Err(ProtonError::Config(format!(
-                "invalid location {location:?}: expected a two-letter country code"
-            )))
-        }
-    }
-
-    /// Start the tunnel + SOCKS5 proxy pointed at `location` (a country code, e.g. `"US"`),
-    /// picking whichever free-tier server there currently has the lowest load. Idempotent if
-    /// already pointed at `location` (returns the existing port unchanged); otherwise brings
-    /// up a tunnel (if none is running yet) or hot-swaps the running one over to `location`
-    /// (see `start_server`). Returns the bound SOCKS5 port.
-    pub async fn start(&self, location: &str) -> Result<u16> {
-        self.start_server(location, None).await
-    }
-
-    /// Start the tunnel + SOCKS5 proxy pointed at `location`, connecting to `server_name`
-    /// specifically (matched case-insensitively against `find_servers`' free-tier results)
-    /// rather than letting `start` pick the lowest-load server. `None` behaves exactly like
-    /// `start`.
-    ///
-    /// `TunnelManager` runs at most one tunnel at a time. If none is running, this brings one
-    /// up. If one is already running — whether pointed at this same location or a completely
-    /// different one — and the request names a different target (different location, or same
-    /// location but a different server), this hot-swaps the underlying WireGuard tunnel in
-    /// place: the SOCKS5 listener is never rebound (so the port never changes) and already-open
-    /// client connections keep flowing through the tunnel they started on — see
-    /// [`wireguard::CurrentTunnel`]. New connections after the swap use the new target.
-    pub async fn start_server(&self, location: &str, server_name: Option<&str>) -> Result<u16> {
-        let location = Self::normalize_location(location)?;
-        let location = location.as_str();
-
-        // Serialize the whole resolve -> connect_tunnel -> swap/spawn sequence so concurrent
-        // calls (e.g. a double-clicked button in the web UI) can't race each other.
-        let _guard = self.switch_lock.lock().await;
-
-        let existing = self.active.lock().unwrap().as_ref().map(|a| {
-            (
-                a.current.clone(),
-                a.location.clone(),
-                a.server.clone(),
-                a.task.is_finished(),
-            )
-        });
-
-        if let Some((current, active_location, active_server, task_died)) = existing
-            && !task_died
-        {
-            let already_there = active_location.eq_ignore_ascii_case(location)
-                && match server_name {
-                    None => true,
-                    Some(name) => name.eq_ignore_ascii_case(&active_server),
-                };
-            if already_there {
-                return Ok(self.socks_port);
-            }
-
-            let (server, creds) = self.resolve_server(location, server_name).await?;
-            let tunnel = self.driver.connect_tunnel(&server, &creds).await?;
-            // Swapping this slot's contents is the entire switch: `run_socks5` reads it fresh
-            // per accepted connection, so this alone redirects future connections to the new
-            // target. The old `SharedTunnel` this overwrites stays alive for as long as
-            // already-accepted connections still hold their own clone of it, then tears down
-            // on its own once the last one finishes.
-            *current.lock().unwrap() = tunnel;
-
-            let interface = wireguard::interface_name(location);
-            if !active_location.eq_ignore_ascii_case(location) {
-                credentials::clear_active(&active_location)?;
-            }
-            credentials::set_active(location, &interface, self.socks_port)?;
-
-            if let Some(a) = self.active.lock().unwrap().as_mut() {
-                a.location = location.to_string();
-                a.server = server.name;
-                a.interface = interface;
-            }
-            return Ok(self.socks_port);
-        }
-
-        let (server, creds) = self.resolve_server(location, server_name).await?;
-        let tunnel = self.driver.connect_tunnel(&server, &creds).await?;
-
-        let interface = wireguard::interface_name(location);
-
-        // Record the active tunnel in the persisted store first, then spawn the proxy.
-        //
-        // If this fails (disk full, DB locked, permissions), nothing else has happened yet
-        // that needs cleanup: `tunnel` is our only reference to it, so returning here simply
-        // drops it — its background tasks abort via `Drop` (see `wireguard::SharedTunnel`'s
-        // doc comment). Unlike the old `sudo wg-quick`-based design, there is no real
-        // interface that could be left up with nothing tracking it.
-        credentials::set_active(location, &interface, self.socks_port)?;
-
-        let listen_addr = format!("127.0.0.1:{}", self.socks_port);
-        let current: CurrentTunnel = Arc::new(std::sync::Mutex::new(tunnel));
-        let stats = Arc::new(Mutex::new(TunnelStats::default()));
-        let started_at = Instant::now();
-        let task = self
-            .driver
-            .spawn_socks5(listen_addr, current.clone(), stats.clone());
-
-        // No race to check for here any more: `_guard` has held the switch lock for the
-        // entire sequence above, so no concurrent call could have run any of it meanwhile.
-        *self.active.lock().unwrap() = Some(RunningTunnel {
-            location: location.to_string(),
-            server: server.name,
-            interface,
-            current,
-            task,
-            started_at,
-            stats,
-        });
-        Ok(self.socks_port)
-    }
-
-    /// Resolve `server_name` (or, if `None`, the lowest-load server) within `location` to a
-    /// `VPNServer` + the account's `VPNCredentials`. Shared by `start_server`'s cold-start and
-    /// hot-swap paths.
-    async fn resolve_server(
-        &self,
-        location: &str,
-        server_name: Option<&str>,
-    ) -> Result<(VPNServer, VPNCredentials)> {
-        let guard = self.client.lock().await;
-        let client = guard
-            .as_ref()
-            .ok_or_else(|| ProtonError::Config("not logged in".into()))?;
-        let candidates = client.find_servers(Some(location), None, None, PERMISSIVE_TIER);
-        let server = match server_name {
-            Some(name) => candidates
-                .into_iter()
-                .find(|s| s.name.eq_ignore_ascii_case(name))
-                .ok_or_else(|| {
-                    ProtonError::Config(format!(
-                        "server {name:?} not found in location {location}"
-                    ))
-                })?,
-            None => candidates.into_iter().next().ok_or_else(|| {
-                ProtonError::Config(format!("no servers found for location {location}"))
-            })?,
-        };
-        let creds = client
-            .vpn_credentials
-            .clone()
-            .ok_or_else(|| ProtonError::Config("logged in but missing vpn credentials".into()))?;
-        Ok((server, creds))
-    }
-
-    /// Tear down the running tunnel + SOCKS5 proxy, if it's currently pointed at `location`.
-    ///
-    /// Unlike the old `sudo wg-quick`-based design, teardown cannot fail: there is no external
-    /// process to shell out to. Aborting the SOCKS5 task and dropping the tunnel's last
-    /// `Arc` reference is teardown.
-    pub async fn stop(&self, location: &str) -> Result<()> {
-        let location = Self::normalize_location(location)?;
-        let location = location.as_str();
-
-        // Shares the switch lock `start_server()` uses, so a `stop()` racing a start/switch
-        // can't interleave with the latter's connect/set_active/spawn sequence.
-        let _guard = self.switch_lock.lock().await;
-
-        let matches = self
-            .active
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|a| a.location.eq_ignore_ascii_case(location));
-        if !matches {
-            return Err(ProtonError::Config(format!(
-                "no active tunnel for location {location}"
-            )));
-        }
-        let running = self.active.lock().unwrap().take().unwrap();
-        running.task.abort();
-        drop(running); // drops the tunnel's Arc reference; background tasks abort via Drop
-
-        credentials::clear_active(location)?;
-        Ok(())
-    }
-
-    /// Snapshot of the currently-running tunnel, if any (0 or 1 entries — `TunnelManager` never
-    /// runs more than one at a time).
-    pub fn tunnels(&self) -> Vec<TunnelInfo> {
-        self.active
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|a| {
-                let started_at = a.started_at;
-                let stats = a.stats.lock().unwrap();
-                let (bytes_sent, bytes_received) = (stats.bytes_sent, stats.bytes_received);
-                drop(stats);
-                let handshake_age_secs = a
-                    .current
-                    .lock()
-                    .unwrap()
-                    .time_since_last_handshake()
-                    .map(|d| d.as_secs());
-                TunnelInfo {
-                    location: a.location.clone(),
-                    interface: a.interface.clone(),
-                    socks_port: self.socks_port,
-                    server: a.server.clone(),
-                    connected: !a.task.is_finished(),
-                    uptime_secs: started_at.elapsed().as_secs(),
-                    handshake_age_secs,
-                    bytes_sent,
-                    bytes_received,
-                }
-            })
-            .into_iter()
+            .map(|s| s.status())
             .collect()
     }
 }
@@ -486,15 +359,6 @@ impl TunnelManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `HOME`/`XDG_CONFIG_HOME` are process-global, but `cargo test` runs tests in this file
-    /// concurrently on separate OS threads by default. Every test below that points
-    /// `credentials::*`'s free functions (which read `HOME`/`XDG_CONFIG_HOME` on every call)
-    /// at a scratch tempdir must hold this lock for its *entire* body — not just while calling
-    /// `env::set_var` — so no two such tests interleave. A `tokio::sync::Mutex` (not
-    /// `std::sync::Mutex`) is used specifically so the guard can be held safely across `.await`
-    /// points.
-    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Records `connect_tunnel` calls (no real WireGuard/network) and spawns an inert task
     /// instead of a real SOCKS5 listener, so `TunnelManager` bookkeeping can be tested without
@@ -521,82 +385,22 @@ mod tests {
         fn spawn_socks5(
             &self,
             _listen_addr: String,
-            _tunnel: CurrentTunnel,
+            _source: Arc<dyn TunnelSource>,
             _stats: Arc<Mutex<TunnelStats>>,
         ) -> JoinHandle<()> {
             tokio::spawn(async {
-                // Stand in for `run_socks5`'s infinite accept loop: never returns on its own,
-                // only via `abort()`, matching the real driver's task shape.
+                // Stand in for `run_socks5`'s infinite accept loop: never returns on its own.
                 std::future::pending::<()>().await;
             })
         }
     }
 
-    fn test_manager() -> TunnelManager {
-        TunnelManager::with_driver(11000, Arc::new(FakeDriver::default()))
-    }
-
-    /// Directly exercises the tunnel-tracking bookkeeping without going through `start()`'s
-    /// network/login path (which needs a live client): inserts a tunnel directly through the
-    /// same private fields `start`/`stop` use.
-    #[tokio::test]
-    async fn manager_start_stop_tracks_state() {
-        let _env_guard = ENV_LOCK.lock().await;
-        let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: env vars are process-global; `_env_guard` (held for this whole test)
-        // serializes this test against the other `HOME`/`XDG_CONFIG_HOME`-mutating tests in
-        // this module so they never interleave.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
-        }
-
-        let manager = test_manager();
-
-        {
-            let current: CurrentTunnel =
-                Arc::new(std::sync::Mutex::new(Arc::new(Tunnel::loopback_for_testing())));
-            let stats = Arc::new(Mutex::new(TunnelStats::default()));
-            let task = manager.driver.spawn_socks5(
-                "127.0.0.1:11000".to_string(),
-                current.clone(),
-                stats.clone(),
-            );
-            *manager.active.lock().unwrap() = Some(RunningTunnel {
-                location: "US".to_string(),
-                server: "US#1".to_string(),
-                interface: wireguard::interface_name("US"),
-                current,
-                task,
-                started_at: Instant::now(),
-                stats,
-            });
-        }
-
-        let snapshot = manager.tunnels();
-        assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0].location, "US");
-        assert_eq!(snapshot[0].socks_port, 11000);
-        assert!(snapshot[0].connected);
-
-        // start() on an already-tracked location is idempotent and returns the existing port
-        // without touching the (unset) client.
-        let port = manager.start("US").await.unwrap();
-        assert_eq!(port, 11000);
-
-        manager.stop("US").await.unwrap();
-        assert!(manager.tunnels().is_empty());
-
-        // stop() on a location that isn't tracked is an error, not a panic.
-        assert!(manager.stop("US").await.is_err());
-    }
-
     const TEST_CERT_PEM: &str =
         "-----BEGIN CERTIFICATE-----\ntest-only-placeholder\n-----END CERTIFICATE-----";
 
-    fn test_server(location: &str) -> crate::models::VPNServer {
-        crate::models::VPNServer {
-            id: "srv-1".into(),
+    fn test_server(id: &str, location: &str) -> VPNServer {
+        VPNServer {
+            id: id.into(),
             name: format!("{location}-FREE#1"),
             country: "Testland".into(),
             country_code: location.into(),
@@ -614,8 +418,8 @@ mod tests {
         }
     }
 
-    fn test_creds() -> crate::models::VPNCredentials {
-        crate::models::VPNCredentials {
+    fn test_creds() -> VPNCredentials {
+        VPNCredentials {
             username: "testuser".into(),
             ed25519_seed_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             wg_public_key: "CLIENTPUBKEYBASE64==".into(),
@@ -625,268 +429,78 @@ mod tests {
         }
     }
 
-    /// Builds a `ProtonVPNClient` pre-populated with a fake server list + credentials, without
-    /// any network call (`ProtonVPNClient`'s fields are all `pub`, so this bypasses `login()`/
-    /// `fetch_servers()` entirely).
-    fn fake_logged_in_client(location: &str) -> ProtonVPNClient {
-        let mut client = ProtonVPNClient::new("test-user");
-        client.vpn_credentials = Some(test_creds());
-        client.server_list = vec![test_server(location)];
-        client
-    }
-
-    /// Like `fake_logged_in_client`, but with two distinct free-tier servers in the same
-    /// location (`"{location}-FREE#1"` and `"{location}-FREE#2"`), for exercising
-    /// `start_server`'s hot-swap-between-servers path.
-    fn fake_logged_in_client_two_servers(location: &str) -> ProtonVPNClient {
-        let mut client = ProtonVPNClient::new("test-user");
-        client.vpn_credentials = Some(test_creds());
-        let mut second = test_server(location);
-        second.name = format!("{location}-FREE#2");
-        client.server_list = vec![test_server(location), second];
-        client
-    }
-
-    /// Like `fake_logged_in_client`, but with one server per given location, for exercising
-    /// `start_server`'s hot-swap-*across-locations* path.
-    fn fake_logged_in_client_multi(locations: &[&str]) -> ProtonVPNClient {
-        let mut client = ProtonVPNClient::new("test-user");
-        client.vpn_credentials = Some(test_creds());
-        client.server_list = locations.iter().map(|l| test_server(l)).collect();
-        client
-    }
-
-    fn scratch_manager_with_driver(socks_port: u16, driver: Arc<FakeDriver>) -> TunnelManager {
-        let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: see the note in `manager_start_stop_tracks_state` above.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
-        }
-        // Leak the tempdir so it outlives the test (it's process-local scratch space cleaned
-        // up when the test process exits; nothing else depends on it being removed sooner).
-        std::mem::forget(tmp);
-        TunnelManager::with_driver(socks_port, driver)
-    }
-
-    fn scratch_manager(socks_port: u16) -> TunnelManager {
-        scratch_manager_with_driver(socks_port, Arc::new(FakeDriver::default()))
-    }
-
-    /// Drives `start()`'s real new-tunnel path (not just the idempotent short-circuit
-    /// `manager_start_stop_tracks_state` exercises): a logged-in (faked) client selects a
-    /// server, `connect_tunnel`/`spawn_socks5` are faked via `FakeDriver`, and the tunnel ends
-    /// up tracked with a deterministic port.
-    #[tokio::test]
-    async fn manager_start_drives_new_tunnel_path() {
-        let _env_guard = ENV_LOCK.lock().await;
-        let manager = scratch_manager(12000);
-        *manager.client.lock().await = Some(fake_logged_in_client("US"));
-
-        let port = manager.start("US").await.unwrap();
-        assert_eq!(port, 12000, "always the manager's fixed socks_port");
-
-        let snapshot = manager.tunnels();
-        assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0].location, "US");
-        assert_eq!(snapshot[0].interface, wireguard::interface_name("US"));
-        assert_eq!(snapshot[0].socks_port, 12000);
-        assert!(snapshot[0].connected);
-
-        // The active-tunnel row was actually persisted (via the real `credentials::set_active`
-        // free function, pointed at the scratch HOME).
-        let active = credentials::list_active().unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].location, "US");
-        assert_eq!(active[0].socks_port, 12000);
-
-        manager.stop("US").await.unwrap();
-        assert!(manager.tunnels().is_empty());
-        assert!(credentials::list_active().unwrap().is_empty());
-    }
-
-    /// Reproduces the double-start race a prior review flagged: two concurrent `start()` calls
-    /// for a location that isn't tracked yet (e.g. a double-clicked "Start" button) must not
-    /// both bring a tunnel up / both write `credentials::set_active` rows — the per-location
-    /// lock in `location_lock` must serialize them so exactly one `TunnelHandle` and one
-    /// persisted `active_tunnels` row result, both agreeing on the same port.
-    #[tokio::test]
-    async fn manager_start_concurrent_same_location_is_serialized() {
-        let _env_guard = ENV_LOCK.lock().await;
-        let manager = Arc::new(scratch_manager(13000));
-        *manager.client.lock().await = Some(fake_logged_in_client("NL"));
-
-        let a = manager.clone();
-        let b = manager.clone();
-        let (port_a, port_b) = tokio::join!(
-            tokio::spawn(async move { a.start("NL").await.unwrap() }),
-            tokio::spawn(async move { b.start("NL").await.unwrap() }),
-        );
-        let (port_a, port_b) = (port_a.unwrap(), port_b.unwrap());
-
-        // Both callers must observe the same winning port.
-        assert_eq!(port_a, port_b);
-
-        let snapshot = manager.tunnels();
-        assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0].socks_port, port_a);
-
-        let active = credentials::list_active().unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].socks_port, port_a);
-    }
-
-    /// If the post-`connect_tunnel` step (`credentials::set_active`) fails, `start()` must
-    /// leave nothing tracked/persisted — the tunnel `connect_tunnel` returned is simply
-    /// dropped (no real interface exists that could leak).
-    #[tokio::test]
-    async fn manager_start_cleans_up_on_set_active_failure() {
-        let _env_guard = ENV_LOCK.lock().await;
+    /// Builds a `TunnelManager` with a `FakeDriver` and one slot already inserted directly
+    /// (bypassing `login()`'s network path), for exercising `TunnelSource`/`servers()`
+    /// bookkeeping in isolation.
+    fn manager_with_one_slot(port: u16) -> (Arc<TunnelManager>, Arc<ServerSlot>) {
         let driver = Arc::new(FakeDriver::default());
-        let manager = scratch_manager_with_driver(14200, driver.clone());
-        *manager.client.lock().await = Some(fake_logged_in_client("US"));
+        let manager = Arc::new(TunnelManager::with_driver(port, driver.clone() as Arc<dyn TunnelDriver>));
+        let slot = ServerSlot::new(test_server("srv-1", "US"), test_creds(), driver, port);
+        manager.slots.lock().unwrap().push(slot.clone());
+        (manager, slot)
+    }
 
-        // Force the DB file into existence, then make it read-only so the `set_active` call
-        // inside `start()` fails with a permissions error.
-        credentials::set_active("ZZ", "proton-zz", 1).unwrap();
-        let db_path = credentials::db_path().unwrap();
-        let mut perms = std::fs::metadata(&db_path).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o400);
-        std::fs::set_permissions(&db_path, perms).unwrap();
+    #[test]
+    fn servers_reports_assigned_port_and_disconnected_by_default() {
+        let (manager, _slot) = manager_with_one_slot(20000);
+        let servers = manager.servers();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].port, 20000);
+        assert_eq!(servers[0].country_code, "US");
+        assert!(!servers[0].connected);
+        assert_eq!(servers[0].open_connections, 0);
+    }
 
-        let result = manager.start("US").await;
+    #[tokio::test]
+    async fn acquire_connects_once_and_reuses_for_concurrent_callers() {
+        let (manager, slot) = manager_with_one_slot(20100);
 
+        let (t1, t2) = tokio::join!(slot.acquire(), slot.acquire());
+        assert!(t1.is_ok());
+        assert!(t2.is_ok());
+        assert!(Arc::ptr_eq(&t1.unwrap(), &t2.unwrap()));
+
+        let servers = manager.servers();
+        assert!(servers[0].connected);
+        assert_eq!(servers[0].open_connections, 2);
+    }
+
+    #[tokio::test]
+    async fn release_to_zero_tears_down_after_idle_timeout() {
+        let (manager, slot) = manager_with_one_slot(20200);
+
+        slot.acquire().await.unwrap();
+        assert!(manager.servers()[0].connected);
+
+        slot.release();
+        assert_eq!(manager.servers()[0].open_connections, 0);
+        // Still connected immediately after the last connection closes — teardown only
+        // happens after the idle timer elapses, not the instant the count hits zero.
+        assert!(manager.servers()[0].connected);
+
+        tokio::time::sleep(IDLE_TIMEOUT * 3).await;
         assert!(
-            result.is_err(),
-            "start() must propagate the set_active failure"
-        );
-        assert!(
-            manager.tunnels().is_empty(),
-            "nothing should be left tracked"
-        );
-        assert_eq!(
-            driver.connect_calls.lock().unwrap().as_slice(),
-            ["US"],
-            "connect_tunnel must have been called once before the failure"
+            !manager.servers()[0].connected,
+            "tunnel must be torn down once the idle timeout has elapsed with no new connection"
         );
     }
 
-    /// `"us"` and `"US"` must resolve to the same tracked entry, closing the idempotence bug
-    /// where two distinct casings of the same location were tracked as two distinct entries
-    /// under two distinct per-location locks.
     #[tokio::test]
-    async fn manager_start_normalizes_location_case() {
-        let _env_guard = ENV_LOCK.lock().await;
-        let manager = scratch_manager(14300);
-        *manager.client.lock().await = Some(fake_logged_in_client("US"));
+    async fn a_new_connection_before_idle_timeout_keeps_the_tunnel_up() {
+        let (manager, slot) = manager_with_one_slot(20300);
 
-        let port_lower = manager.start("us").await.unwrap();
-        let port_upper = manager.start("US").await.unwrap();
-        assert_eq!(
-            port_lower, port_upper,
-            "\"us\" and \"US\" must resolve to the same tunnel"
-        );
+        slot.acquire().await.unwrap();
+        slot.release();
+        // A second connection arrives well before the idle timer fires.
+        slot.acquire().await.unwrap();
 
-        let snapshot = manager.tunnels();
-        assert_eq!(
-            snapshot.len(),
-            1,
-            "only one tracked entry, not one per casing"
-        );
-        assert_eq!(snapshot[0].location, "US");
-
-        // stop() with the other casing must find and tear down the same entry.
-        manager.stop("us").await.unwrap();
-        assert!(manager.tunnels().is_empty());
-    }
-
-    /// An invalid location must be rejected before it ever reaches `connect_tunnel` — proven
-    /// here by asserting the driver's `connect_tunnel` was never called for a
-    /// path-traversal-shaped value.
-    #[tokio::test]
-    async fn manager_start_rejects_invalid_location() {
-        let _env_guard = ENV_LOCK.lock().await;
-        let driver = Arc::new(FakeDriver::default());
-        let manager = scratch_manager_with_driver(14400, driver.clone());
-
-        let err = manager.start("../../x").await.unwrap_err();
-        assert!(err.to_string().contains("invalid location"));
-
-        let err = manager.start("usa").await.unwrap_err();
-        assert!(err.to_string().contains("invalid location"));
-
+        // Wait past the *first* connection's idle deadline — its now-stale timer must not tear
+        // the tunnel down out from under the second, still-open connection.
+        tokio::time::sleep(IDLE_TIMEOUT * 3).await;
         assert!(
-            driver.connect_calls.lock().unwrap().is_empty(),
-            "an invalid location must never reach connect_tunnel"
+            manager.servers()[0].connected,
+            "a fresh connection must invalidate the previous idle timer"
         );
-        assert!(manager.tunnels().is_empty());
-    }
-
-    /// Switching to a different server in an already-connected location must hot-swap the
-    /// underlying tunnel in place: same `socks_port` (the SOCKS5 listener is never rebound),
-    /// same `TunnelHandle`'s `task` (never respawned — proven by it still being tracked as
-    /// connected after the swap), and `tunnels()` must report the new server name.
-    #[tokio::test]
-    async fn manager_start_server_switches_without_changing_port() {
-        let _env_guard = ENV_LOCK.lock().await;
-        let manager = scratch_manager(15000);
-        *manager.client.lock().await = Some(fake_logged_in_client_two_servers("US"));
-
-        let port1 = manager
-            .start_server("US", Some("US-FREE#1"))
-            .await
-            .unwrap();
-        assert_eq!(manager.tunnels()[0].server, "US-FREE#1");
-
-        let port2 = manager
-            .start_server("US", Some("US-FREE#2"))
-            .await
-            .unwrap();
-
-        assert_eq!(port1, port2, "switching servers must not change the port");
-        let snapshot = manager.tunnels();
-        assert_eq!(snapshot.len(), 1, "still exactly one tunnel for US");
-        assert_eq!(snapshot[0].server, "US-FREE#2");
-        assert!(
-            snapshot[0].connected,
-            "the SOCKS5 task must still be the original one, never respawned"
-        );
-
-        // Re-requesting the server it's already on is a no-op, not a third connect_tunnel call.
-        let port3 = manager
-            .start_server("US", Some("US-FREE#2"))
-            .await
-            .unwrap();
-        assert_eq!(port3, port2);
-    }
-
-    /// `TunnelManager` runs at most one tunnel at a time: starting a *different* location while
-    /// one is already running must swap it in place (same port, no second tunnel tracked), and
-    /// the persisted `active_tunnels` row must move from the old location to the new one, not
-    /// accumulate both.
-    #[tokio::test]
-    async fn manager_start_switches_across_locations_keeping_one_tunnel() {
-        let _env_guard = ENV_LOCK.lock().await;
-        let manager = scratch_manager(15100);
-        *manager.client.lock().await = Some(fake_logged_in_client_multi(&["CH", "CA"]));
-
-        let port1 = manager.start("CH").await.unwrap();
-        assert_eq!(manager.tunnels()[0].location, "CH");
-
-        let port2 = manager.start("CA").await.unwrap();
-        assert_eq!(port1, port2, "switching locations must not change the port");
-
-        let snapshot = manager.tunnels();
-        assert_eq!(snapshot.len(), 1, "never more than one tunnel at a time");
-        assert_eq!(snapshot[0].location, "CA");
-        assert!(snapshot[0].connected);
-
-        let active = credentials::list_active().unwrap();
-        assert_eq!(
-            active.len(),
-            1,
-            "the old location's active_tunnels row must be cleared, not left stranded"
-        );
-        assert_eq!(active[0].location, "CA");
+        assert_eq!(manager.servers()[0].open_connections, 1);
     }
 }

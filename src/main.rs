@@ -1,16 +1,15 @@
-//! `gratis` daemon entry point. No CLI subcommands: a single `serve`-style entrypoint
-//! that starts the localhost control API + embedded web UI, optionally pre-starting a list of
-//! location passed via `--location`. There is no login route or login form — authentication
-//! happens exactly once, automatically, from a `.env` file in the current directory
-//! (`EMAIL=...` / `PASSWORD=...`, read literally with no shell interpretation) at startup.
-//! Credentials are never accepted as CLI arguments (they'd leak into `ps`/shell history).
+//! `gratis` daemon entry point. No CLI subcommands: a single `serve`-style entrypoint that
+//! starts the localhost control API + embedded web UI. There is no login route or login form —
+//! authentication happens exactly once, automatically, from a `.env` file in the current
+//! directory (`EMAIL=...` / `PASSWORD=...`, read literally with no shell interpretation) at
+//! startup. Credentials are never accepted as CLI arguments (they'd leak into `ps`/shell
+//! history), and nothing is persisted to disk — a fresh login (and a fresh port assignment for
+//! every free-tier server) happens on every start.
 //!
 //! Runs entirely unprivileged: tunnels are in-process userspace WireGuard sessions (see
 //! `wireguard.rs`), not real kernel interfaces, so there is nothing here to reconcile at boot
 //! or tear down at shutdown beyond normal process exit — a tunnel cannot outlive the process
-//! that holds it. `active_tunnels` rows from a previous run are therefore always stale (no
-//! process restart can "adopt" a tunnel that necessarily died with its process), so they're
-//! cleared unconditionally on startup, not reconciled against any live external state.
+//! that holds it.
 use clap::Parser;
 use gratis::api;
 use gratis::manager::TunnelManager;
@@ -23,42 +22,11 @@ struct Cli {
     #[arg(long, default_value = "9000")]
     control_port: u16,
 
-    /// SOCKS5 port the (single) tunnel listens on.
-    #[arg(long, default_value = "1080")]
-    socks_port: u16,
-
-    /// Location (country) code to start immediately at boot, e.g. `US`. `TunnelManager` runs
-    /// at most one tunnel at a time — this isn't a list any more; switching locations later
-    /// (via the API/web UI) hot-swaps this same tunnel rather than adding another.
-    #[arg(long)]
-    location: Option<String>,
-}
-
-/// Clear any `active_tunnels` rows left over from a previous run. They're always stale: a
-/// tunnel is in-process state that cannot survive its process exiting, so there is nothing to
-/// reconcile against — unlike the old `sudo wg-quick`-based design, no kernel interface could
-/// have outlived the previous process for this to check against.
-fn clear_stale_active_tunnels() {
-    let active = match gratis::credentials::list_active() {
-        Ok(rows) => rows,
-        Err(err) => {
-            eprintln!("gratis: failed to read active-tunnel state at boot: {err}");
-            return;
-        }
-    };
-
-    for row in active {
-        eprintln!(
-            "gratis: clearing stale active_tunnels row for location {} (from a previous run)",
-            row.location
-        );
-        if let Err(err) = gratis::credentials::clear_active(&row.location) {
-            eprintln!(
-                "gratis: failed to clear stale active-tunnel row for location {}: {err}",
-                row.location
-            );
-        }
-    }
+    /// First port handed out to the free-tier server list — each server gets a fixed port of
+    /// its own, one more than the last, in a stable order. Connecting a SOCKS5 client to a
+    /// server's port lazily brings its tunnel up; see `manager.rs`.
+    #[arg(long, default_value = "20000")]
+    port_range_start: u16,
 }
 
 /// Read `KEY=value` lines directly from a `.env` file, with NO shell interpretation — sourcing
@@ -77,63 +45,36 @@ fn read_dotenv_var(path: &std::path::Path, key: &str) -> Option<String> {
 async fn main() {
     let cli = Cli::parse();
 
-    clear_stale_active_tunnels();
-
-    let manager = Arc::new(TunnelManager::new(cli.socks_port));
+    let manager = Arc::new(TunnelManager::new(cli.port_range_start));
 
     // Auto-login from `.env` in the current directory, if present — the common "just run it"
-    // path. Restore-on-startup from *saved* credentials (below) still can't work (no session
-    // token or server list is persisted — see the design-decision doc comment on
-    // `manager.rs`/`TunnelManager`), but re-deriving a fresh login from `.env` on every start
-    // sidesteps that limitation entirely for anyone willing to keep a `.env` next to the
-    // binary.
+    // path. Logging in also assigns every free-tier server its port and spawns its listener
+    // (see `TunnelManager::login`), so nothing further is needed to make the daemon usable.
     let dotenv_path = std::path::Path::new(".env");
     let dotenv_creds = (
         read_dotenv_var(dotenv_path, "EMAIL"),
         read_dotenv_var(dotenv_path, "PASSWORD"),
     );
-    let logged_in_from_dotenv = match dotenv_creds {
+    match dotenv_creds {
         (Some(email), Some(password)) => match manager.login(&email, &password).await {
             Ok(()) => {
-                println!("gratis: logged in automatically from .env ({email})");
-                true
+                let count = manager.servers().len();
+                println!(
+                    "gratis: logged in automatically from .env ({email}), {count} servers ready"
+                );
             }
             Err(err) => {
                 eprintln!("gratis: auto-login from .env failed: {err}");
-                false
             }
         },
         (Some(_), None) | (None, Some(_)) => {
             eprintln!("gratis: .env found but must set both EMAIL and PASSWORD; ignoring it");
-            false
         }
-        (None, None) => false,
-    };
-
-    // Saved credentials (from a *previous* run's .env login) are informational only when
-    // .env didn't just log us in — see the module doc comment on why this can't drive an
-    // unattended restore on its own. With no login route, a missing/incomplete `.env` means
-    // no tunnel can ever be started this run.
-    if !logged_in_from_dotenv {
-        if manager.has_saved_credentials() {
+        (None, None) => {
             eprintln!(
-                "gratis: found saved credentials from a previous run, but no valid .env this time — no tunnel can be started until a valid .env (EMAIL + PASSWORD) is present at startup"
-            );
-        } else {
-            eprintln!(
-                "gratis: no .env (EMAIL + PASSWORD) found — no tunnel can be started until one is present at startup"
+                "gratis: no .env (EMAIL + PASSWORD) found — no servers can be listed or connected to until one is present at startup"
             );
         }
-    }
-
-    // Attempt to pre-start the requested location, if any. Succeeds immediately if .env just
-    // logged us in; otherwise fails with "not logged in" (no login route exists to fix this
-    // after the fact — restart with a valid .env). Per the brief: a failure here must never
-    // crash the daemon.
-    if let Some(location) = &cli.location
-        && let Err(err) = manager.start(location).await
-    {
-        eprintln!("gratis: failed to pre-start location {location}: {err}");
     }
 
     let router = api::router(manager.clone());
@@ -149,10 +90,6 @@ async fn main() {
 
     println!("gratis: control API + web UI listening on http://{addr}");
 
-    // Ctrl-C stops tracked tunnels before exiting, purely so `GET /api/tunnels` and the
-    // active_tunnels DB rows reflect reality if something outlives the process shutdown
-    // sequence briefly (e.g. a slow disk flush) — not required for correctness, since process
-    // exit alone already reclaims every tunnel's memory/sockets.
     tokio::select! {
         result = axum::serve(listener, router) => {
             if let Err(err) = result {
@@ -165,16 +102,7 @@ async fn main() {
                 eprintln!("gratis: failed to install Ctrl-C handler: {err}");
                 return;
             }
-            eprintln!("gratis: received shutdown signal, stopping tracked tunnels...");
-            for info in manager.tunnels() {
-                if let Err(err) = manager.stop(&info.location).await {
-                    eprintln!(
-                        "gratis: failed to stop tunnel for location {}: {err}",
-                        info.location
-                    );
-                }
-            }
-            eprintln!("gratis: shutdown complete");
+            eprintln!("gratis: received shutdown signal, exiting");
         }
     }
 }

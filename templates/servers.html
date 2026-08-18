@@ -1,27 +1,40 @@
-<ul id="servers-{{ location }}" hx-swap-oob="true" class="text-sm divide-y divide-ink/8">
+<div class="border border-ink/10 rounded divide-y divide-ink/10 bg-paper">
   {% for s in servers %}
-  <li class="flex items-center justify-between py-1.5 gap-3">
-    <span class="font-mono text-ink/75 truncate">{{ s.name }}</span>
-    <span class="flex items-center gap-3 shrink-0">
-      <span class="text-ink/50 tabular-nums text-xs">{{ s.load }}% load</span>
-      {% if s.connected %}
-      <span class="flex items-center gap-1.5 text-xs uppercase tracking-wide text-ink/50 border border-ink/15 rounded px-2.5 py-0.5">
-         <span class="inline-block w-1.5 h-1.5 rounded-full bg-connected"></span>Connected
-      </span>
-      {% else %}
-      <button
-        {% if s.location_connected %}disabled{% endif %}
-        hx-post="/ui/tunnels/{{ location }}/start/{{ s.name|urlencode_strict }}"
-        hx-target="#tunnels"
-        hx-swap="innerHTML"
-        hx-disabled-elt="this"
-        class="text-xs uppercase tracking-wide border border-ink/25 rounded px-2.5 py-0.5 hover:bg-ink hover:text-paper transition disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ink/30" title="Another server in this location is already connected"
-      >Connect</button>
+  <div class="flex flex-wrap items-center justify-between gap-y-2 px-4 py-3">
+    <div class="flex flex-wrap items-center gap-x-4 gap-y-1 min-w-0">
+      <span class="font-mono text-sm text-ink">{{ s.country_code }}</span>
+      <span class="font-mono text-xs text-ink/50 truncate">{{ s.name }}</span>
+      {% if let Some(city) = s.city %}
+      <span class="text-xs text-ink/40 truncate">{{ city }}</span>
       {% endif %}
-    </span>
-  </li>
+      <span class="text-xs text-ink/50 tabular-nums">{{ s.load }}% load</span>
+      <span class="font-mono text-xs text-ink/55 truncate">socks5://127.0.0.1:{{ s.port }}</span>
+      <button
+        onclick="clearTimeout(this._t); navigator.clipboard.writeText('socks5://127.0.0.1:{{ s.port }}'); this.textContent='copied'; this._t=setTimeout(() => this.textContent='copy', 1200)"
+        class="text-xs text-ink/40 hover:text-ink transition"
+        title="Copy"
+      >copy</button>
+    </div>
+    <div class="flex items-center gap-4 shrink-0">
+      <span class="flex items-center text-xs text-ink/55">
+        {% if s.connected %}
+        <span class="inline-block w-1.5 h-1.5 rounded-full bg-connected mr-1.5"></span>connected ({{ s.open_connections }} open)
+        {% else %}
+        <span class="inline-block w-1.5 h-1.5 rounded-full border border-ink/40 mr-1.5"></span>idle
+        {% endif %}
+      </span>
+    </div>
+    {% if s.connected %}
+    <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-ink/40 mt-1 w-full">
+      <span>up {{ s.uptime }}</span>
+      <span>handshake {{ s.handshake }}</span>
+      <span>↑ {{ s.sent }}</span>
+      <span>↓ {{ s.received }}</span>
+    </div>
+    {% endif %}
+  </div>
   {% endfor %}
   {% if servers.is_empty() %}
-  <li class="py-1.5 text-ink/40">No servers found.</li>
+  <div class="py-6 text-center text-ink/40 text-sm">No servers available. The daemon couldn't log in — check the credentials in your `.env` and restart it.</div>
   {% endif %}
-</ul>
+</div>

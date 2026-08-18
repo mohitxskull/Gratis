@@ -11,57 +11,21 @@
 
   <header class="mb-12 border-b border-ink/10 pb-6">
     <h1 class="text-3xl font-semibold tracking-tight">Gratis</h1>
-    <p class="text-sm text-ink/50 mt-1">Local Proton VPN control panel — start and manage SOCKS5 tunnels.</p>
+    <p class="text-sm text-ink/50 mt-1">Each server below has its own fixed SOCKS5 port — connect to it and the tunnel comes up on its own.</p>
   </header>
-
-  <div id="action-error" class="fixed top-4 right-4 z-50 max-w-sm w-[calc(100%-2rem)]"></div>
-
-  {% if let Some(err) = login_error %}
-  <div class="border border-ink/15 bg-paper-dim rounded p-4 text-sm mb-10">
-    <span class="font-semibold">Login failed.</span> <span class="text-ink/65">{{ err }}</span>
-  </div>
-  {% endif %}
-
-  <section class="mb-12">
-    <div class="flex items-baseline justify-between mb-4">
-      <h2 class="text-xs font-semibold tracking-widest uppercase text-ink/50">Active tunnels</h2>
-      <button
-        hx-get="/ui/tunnels"
-        hx-target="#tunnels"
-        hx-swap="innerHTML"
-        hx-indicator="#tunnels-spinner"
-        hx-disabled-elt="this"
-        class="flex items-center gap-1.5 text-xs uppercase tracking-wide text-ink/50 hover:text-ink transition disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ink/30"
-      >
-        <svg id="tunnels-spinner" class="htmx-indicator spinner w-3 h-3" viewBox="0 0 24 24" fill="none">
-          <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3" stroke-opacity="0.25"/>
-          <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
-        </svg>
-        Refresh
-      </button>
-    </div>
-    <div
-      id="tunnels"
-      hx-get="/ui/tunnels"
-      hx-trigger="every 3s[!(document.activeElement && document.activeElement.closest('#tunnels'))]"
-      hx-swap="innerHTML"
-    >
-      {% include "tunnels.html" %}
-    </div>
-  </section>
 
   <section>
     <div class="flex items-baseline justify-between mb-4">
-      <h2 class="text-xs font-semibold tracking-widest uppercase text-ink/50">Locations</h2>
+      <h2 class="text-xs font-semibold tracking-widest uppercase text-ink/50">Servers</h2>
       <button
-        hx-get="/ui/locations"
-        hx-target="#locations"
+        hx-get="/ui/servers"
+        hx-target="#servers"
         hx-swap="innerHTML"
-        hx-indicator="#locations-spinner"
+        hx-indicator="#servers-spinner"
         hx-disabled-elt="this"
         class="flex items-center gap-1.5 text-xs uppercase tracking-wide text-ink/50 hover:text-ink transition disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ink/30"
       >
-        <svg id="locations-spinner" class="htmx-indicator spinner w-3 h-3" viewBox="0 0 24 24" fill="none">
+        <svg id="servers-spinner" class="htmx-indicator spinner w-3 h-3" viewBox="0 0 24 24" fill="none">
           <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3" stroke-opacity="0.25"/>
           <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
         </svg>
@@ -70,42 +34,47 @@
     </div>
     <input
       type="text"
-      placeholder="Filter by code or country…"
-      oninput="filterLocations(this.value)"
+      placeholder="Filter by code, name, or country…"
+      oninput="filterServers(this.value)"
       class="w-full bg-paper border border-ink/20 rounded px-3 py-2 text-sm placeholder-ink/40 mb-3 focus:outline-none focus:border-ink/60 focus:ring-1 focus:ring-ink/20"
     >
-    <div id="locations">
-      {% include "locations.html" %}
+    <div
+      id="servers"
+      hx-get="/ui/servers"
+      hx-trigger="every 3s[!(document.activeElement && document.activeElement.closest('#servers'))]"
+      hx-swap="innerHTML"
+    >
+      {% include "servers.html" %}
     </div>
-    <div id="locations-empty" class="hidden py-6 text-center text-ink/40 text-sm">No locations match your filter.</div>
+    <div id="servers-empty" class="hidden py-6 text-center text-ink/40 text-sm">No servers match your filter.</div>
   </section>
 
 </div>
 <script>{{ htmx_js|safe }}</script>
 <script>
-let locationFilter = '';
+let serverFilter = '';
 
-function filterLocations(query) {
-  locationFilter = query.trim().toLowerCase();
-  applyLocationFilter();
+function filterServers(query) {
+  serverFilter = query.trim().toLowerCase();
+  applyServerFilter();
 }
 
-// Re-applies the current filter after any htmx swap of #locations — the "Refresh" button and
-// any Connect/Stop action's out-of-band server-list update both replace rows there, which would
-// otherwise silently drop the filter (rows reappear even though the input still shows a query).
-function applyLocationFilter() {
-  const rows = document.querySelectorAll('#locations details[data-code]');
+// Re-applies the current filter after any htmx swap of #servers — the "Refresh" button and the
+// 3s poll both replace rows there, which would otherwise silently drop the filter.
+function applyServerFilter() {
+  const rows = document.querySelectorAll('#servers > div');
   let anyVisible = false;
   rows.forEach((row) => {
-    const match = row.dataset.code.includes(locationFilter) || row.dataset.name.includes(locationFilter);
+    const text = row.textContent.toLowerCase();
+    const match = text.includes(serverFilter);
     row.classList.toggle('hidden', !match);
     if (match) anyVisible = true;
   });
-  document.getElementById('locations-empty').classList.toggle('hidden', rows.length === 0 || anyVisible || locationFilter === '');
+  document.getElementById('servers-empty').classList.toggle('hidden', rows.length === 0 || anyVisible || serverFilter === '');
 }
 
 document.body.addEventListener('htmx:afterSwap', (e) => {
-  if (e.target.id === 'locations') applyLocationFilter();
+  if (e.target.id === 'servers') applyServerFilter();
 });
 </script>
 </body>

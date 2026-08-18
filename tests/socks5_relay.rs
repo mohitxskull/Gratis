@@ -46,17 +46,35 @@ async fn spawn_echo_server() -> u16 {
     port
 }
 
-/// Start the SOCKS5 proxy against a loopback test tunnel (no WireGuard/root involved — see
-/// `wireguard::Tunnel::loopback_for_testing`), returning the port it is listening on.
+/// A `TunnelSource` that always hands back the same loopback test tunnel (no WireGuard/root
+/// involved — see `wireguard::Tunnel::loopback_for_testing`) and never tears it down —
+/// `run_socks5`'s relay behavior is what's under test here, not the lazy-connect/idle-teardown
+/// bookkeeping `gratis::manager::ServerSlot` layers on top in production.
+struct FixedTunnel(gratis::wireguard::SharedTunnel);
+
+#[async_trait::async_trait]
+impl gratis::socks5::TunnelSource for FixedTunnel {
+    async fn acquire(
+        &self,
+    ) -> Result<gratis::wireguard::SharedTunnel, gratis::socks5::SourceError> {
+        Ok(self.0.clone())
+    }
+
+    fn release(&self) {}
+}
+
+/// Start the SOCKS5 proxy against a loopback test tunnel, returning the port it is listening
+/// on.
 async fn spawn_proxy() -> u16 {
     let port = free_port();
     let listen_addr = format!("127.0.0.1:{port}");
     let tunnel = std::sync::Arc::new(gratis::wireguard::Tunnel::loopback_for_testing());
-    let current = std::sync::Arc::new(std::sync::Mutex::new(tunnel));
+    let source: std::sync::Arc<dyn gratis::socks5::TunnelSource> =
+        std::sync::Arc::new(FixedTunnel(tunnel));
     tokio::spawn(async move {
         let _ = gratis::socks5::run_socks5(
             &listen_addr,
-            current,
+            source,
             std::sync::Arc::new(std::sync::Mutex::new(
                 gratis::wireguard::TunnelStats::default(),
             )),

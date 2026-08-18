@@ -16,11 +16,14 @@
 //!   WebSocket connections with long quiet gaps must survive for as long as both ends keep the
 //!   connection open.
 //!
-//! One instance of [`run_socks5`] is intended to be spawned per WireGuard location by the
-//! tunnel manager. Each accepted client connection is handled on its own spawned task, so
-//! there is no artificial concurrency cap.
+//! One instance of [`run_socks5`] is intended to be spawned per server by the tunnel manager,
+//! bound for the lifetime of the process. Each accepted client connection is handled on its own
+//! spawned task, so there is no artificial concurrency cap. The listener never owns a tunnel
+//! directly — see [`TunnelSource`] — so it can keep accepting connections whether or not a
+//! tunnel currently happens to be up.
 
-use crate::wireguard::{CurrentTunnel, SharedTunnel, TunnelStats};
+use crate::wireguard::{SharedTunnel, TunnelStats};
+use async_trait::async_trait;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -44,19 +47,48 @@ const REP_GENERAL_FAILURE: u8 = 0x01;
 const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 
+/// Opaque error from [`TunnelSource::acquire`] — `socks5.rs` only ever maps an `Err` to a
+/// generic SOCKS5 failure reply, but this is boxed rather than `()` so callers (tests, logs)
+/// can still inspect what went wrong.
+pub type SourceError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Where a SOCKS5 listener gets the tunnel to relay a connection through, decoupling
+/// `run_socks5`'s accept loop from how — or whether — that tunnel is already up.
+/// `TunnelManager`'s per-server slot is the production implementation: `acquire` connects a
+/// WireGuard tunnel on first use and reuses it for as long as at least one connection is open;
+/// `release` is how the slot learns when to start its idle-teardown countdown.
+#[async_trait]
+pub trait TunnelSource: Send + Sync {
+    /// Get a tunnel to relay this connection through, connecting one if none is currently up.
+    /// Called once per accepted connection, before any bytes are relayed. Every `Ok` must be
+    /// paired with exactly one later call to `release` (regardless of how the connection ends
+    /// afterwards); an `Err` return is never paired with a `release` call.
+    async fn acquire(&self) -> std::result::Result<SharedTunnel, SourceError>;
+
+    /// Marks the connection the matching `acquire` call returned a tunnel for as finished.
+    fn release(&self);
+}
+
+/// Calls [`TunnelSource::release`] exactly once when dropped — RAII pairing for the `acquire`
+/// call that produced the tunnel this guard is holding open, so `release` still fires even if
+/// the connection's handling exits early via `?` or a panic.
+struct ReleaseGuard(Arc<dyn TunnelSource>);
+
+impl Drop for ReleaseGuard {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 /// Run the SOCKS5 proxy: bind `listen_addr`, accept clients forever, and relay each `CONNECT`
-/// through whichever tunnel `current` holds *at accept time*.
-///
-/// `current` is read fresh for every accepted connection, so `TunnelManager` can hot-swap it
-/// (e.g. switching which server a location's tunnel points at) without rebinding this
-/// listener: already-accepted connections keep using the tunnel clone they captured, only
-/// connections accepted after the swap pick up the new one.
+/// through a tunnel obtained from `source` — lazily connected on first use, per
+/// [`TunnelSource`].
 ///
 /// This future only returns (with `Err`) if the listener fails to bind; otherwise it runs
 /// forever, spawning one task per accepted connection.
 pub async fn run_socks5(
     listen_addr: &str,
-    current: CurrentTunnel,
+    source: Arc<dyn TunnelSource>,
     stats: Arc<Mutex<TunnelStats>>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(listen_addr).await?;
@@ -71,10 +103,10 @@ pub async fn run_socks5(
                 continue;
             }
         };
-        let tunnel = current.lock().unwrap().clone();
+        let source = source.clone();
         let stats = stats.clone();
         tokio::spawn(async move {
-            if let Err(_err) = handle_client(client, tunnel, stats.clone()).await {
+            if let Err(_err) = handle_client(client, source, stats.clone()).await {
                 // Best-effort relay: any I/O error just ends this connection's task.
             }
         });
@@ -83,7 +115,7 @@ pub async fn run_socks5(
 
 async fn handle_client(
     mut client: TcpStream,
-    tunnel: SharedTunnel,
+    source: Arc<dyn TunnelSource>,
     stats: Arc<Mutex<TunnelStats>>,
 ) -> io::Result<()> {
     negotiate_method(&mut client).await?;
@@ -119,6 +151,15 @@ async fn handle_client(
             return Ok(());
         }
     };
+
+    let tunnel = match source.acquire().await {
+        Ok(t) => t,
+        Err(_) => {
+            send_reply(&mut client, REP_GENERAL_FAILURE, local_v4_zero()).await?;
+            return Ok(());
+        }
+    };
+    let _release_guard = ReleaseGuard(source);
 
     let outbound = match tunnel.connect_tcp(addr).await {
         Ok(c) => c,

@@ -24,9 +24,6 @@ pub enum ProtonError {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("sqlite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
-
     #[error("tunnel error: {0}")]
     Tunnel(#[from] wireguard_netstack::Error),
 }

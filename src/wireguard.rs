@@ -32,13 +32,6 @@ pub const WG_PORT: u16 = 51820;
 /// per-connection at all.
 pub const CLIENT_ADDRESS: &str = "10.2.0.2";
 
-/// A purely descriptive, location-derived label (e.g. for `GET /api/tunnels` and the SQLite
-/// `active_tunnels.interface` column) — NOT a real OS network interface name any more. Kept as
-/// a small helper so displays/logs still have a stable, readable per-location tag.
-pub fn interface_name(location: &str) -> String {
-    format!("proton-{}", location.to_ascii_lowercase())
-}
-
 fn decode_key(b64: &str) -> Result<[u8; 32]> {
     let bytes = BASE64
         .decode(b64)
@@ -210,12 +203,3 @@ pub struct TunnelStats {
 /// `SharedTunnel` reference (once the manager has stopped spawning new SOCKS5 relay tasks
 /// against it and those tasks have exited) is sufficient to tear the tunnel down.
 pub type SharedTunnel = Arc<Tunnel>;
-
-/// A location's live tunnel, behind an indirection that lets the manager hot-swap which
-/// server a running SOCKS5 listener relays through — without rebinding the listener (so its
-/// port never changes) and without disturbing already-open client connections (each one
-/// captured its own `SharedTunnel` clone at accept time via [`crate::socks5::run_socks5`], so
-/// a swap here only changes which tunnel *new* connections get; old ones keep flowing through
-/// the tunnel they started on until they finish, and that tunnel tears down on its own once
-/// its last `SharedTunnel` clone — including this slot's, once overwritten — is dropped).
-pub type CurrentTunnel = Arc<std::sync::Mutex<SharedTunnel>>;

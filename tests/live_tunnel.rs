@@ -1,5 +1,6 @@
-//! Live end-to-end test against a real Proton account: login -> start a tunnel -> real HTTP
-//! request through the SOCKS5 proxy -> assert a real response comes back.
+//! Live end-to-end test against a real Proton account: login -> connect straight to a server's
+//! assigned SOCKS5 port (which lazily brings its tunnel up) -> real HTTP request through it ->
+//! assert a real response comes back.
 //!
 //! Requires a `.env` file (repo root) with `EMAIL=...`/`PASSWORD=...` for a real Proton
 //! account, real network access, and is NOT run by default `cargo test` (marked `#[ignore]`,
@@ -77,12 +78,16 @@ async fn live_tunnel_relays_real_http_request() {
     let manager = gratis::manager::TunnelManager::new(19900);
     println!("logging in...");
     manager.login(&email, &password).await.expect("login");
-
-    println!("starting US tunnel...");
-    let socks_port = manager.start("US").await.expect("start");
-    println!("tunnel up on 127.0.0.1:{socks_port}");
-    // `TunnelManager::new` uses `RealDriver`, so `start()` above already spun up a real SOCKS5
-    // listener bound to `127.0.0.1:{socks_port}` — nothing further to wire up.
+    // `login()` already assigned every free-tier server a port and spawned its listener (see
+    // `TunnelManager::login`) — nothing further to wire up. Pick the first US server's port;
+    // connecting to it below is what lazily brings its tunnel up.
+    let socks_port = manager
+        .servers()
+        .into_iter()
+        .find(|s| s.country_code.eq_ignore_ascii_case("US"))
+        .expect("at least one US server in the free-tier list")
+        .port;
+    println!("US server assigned port 127.0.0.1:{socks_port}");
 
     // api.ipify.org's resolved IP, hardcoded to isolate the relay/tunnel path from this
     // environment's flaky DNS resolver (verified separately as a live-account concern, not
@@ -115,6 +120,4 @@ async fn live_tunnel_relays_real_http_request() {
         response_text.contains("\"ip\":"),
         "expected api.ipify.org's JSON body, got: {response_text:?}"
     );
-
-    manager.stop("US").await.expect("stop");
 }

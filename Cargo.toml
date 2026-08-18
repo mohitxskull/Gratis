@@ -13,12 +13,10 @@ base64 = "0.22"
 thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-dirs = "5"
 # WHY pgpinternal: supplies RPGPVerifier to verify the PGP-signed SRP modulus Proton
 # requires before trusting it. Correctness reference for the auth/session flow:
 # https://github.com/ProtonVPN/proton-vpn-cli
 proton-srp = { version = "0.8", features = ["pgpinternal"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
 axum = "0.7"
 # WHY: the WireGuard client identity is generated locally, never issued by the server (Proton
 # hands back a signed certificate for a client-supplied public key, not a private key) —
