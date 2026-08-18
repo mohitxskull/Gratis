@@ -1,9 +1,9 @@
 //! WireGuard tunnel + active-tunnel state persistence tests, updated for the userspace
 //! WireGuard redesign (no more `sudo wg-quick`/text config generation — see `wireguard.rs`'s
 //! doc comment for why). No root privileges and no live WireGuard interface are required.
-use proton_proxy::credentials::Store;
-use proton_proxy::models::{PhysicalServer, VPNCredentials, VPNServer};
-use proton_proxy::wireguard::{CLIENT_ADDRESS, Tunnel, interface_name};
+use gratis::credentials::Store;
+use gratis::models::{PhysicalServer, VPNCredentials, VPNServer};
+use gratis::wireguard::{CLIENT_ADDRESS, Tunnel, interface_name};
 
 const TEST_CERT_PEM: &str =
     "-----BEGIN CERTIFICATE-----\ntest-only-placeholder\n-----END CERTIFICATE-----";
@@ -80,7 +80,7 @@ async fn tunnel_connect_errors_on_malformed_key() {
 #[test]
 fn active_connection_state_persist_and_clear() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db_path = dir.path().join("proton-proxy.db");
+    let db_path = dir.path().join("gratis.db");
     let store = Store::open(&db_path).expect("open store");
 
     // No active tunnels initially.
@@ -104,7 +104,7 @@ fn active_connection_state_persist_and_clear() {
 #[test]
 fn credentials_roundtrip_via_store() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db_path = dir.path().join("proton-proxy.db");
+    let db_path = dir.path().join("gratis.db");
     let store = Store::open(&db_path).expect("open store");
 
     let creds = test_creds();

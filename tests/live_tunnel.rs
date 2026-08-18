@@ -74,7 +74,7 @@ async fn live_tunnel_relays_real_http_request() {
     };
     let password = read_dotenv_var("PASSWORD").expect(".env has EMAIL but no PASSWORD");
 
-    let manager = proton_proxy::manager::TunnelManager::new(19900);
+    let manager = gratis::manager::TunnelManager::new(19900);
     println!("logging in...");
     manager.login(&email, &password).await.expect("login");
 
@@ -86,7 +86,7 @@ async fn live_tunnel_relays_real_http_request() {
 
     // api.ipify.org's resolved IP, hardcoded to isolate the relay/tunnel path from this
     // environment's flaky DNS resolver (verified separately as a live-account concern, not
-    // a proton-proxy one).
+    // a gratis one).
     let target_ip = [104, 26, 12, 205];
 
     println!("sending real HTTP GET through the SOCKS5 proxy...");

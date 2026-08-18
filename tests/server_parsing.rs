@@ -5,8 +5,8 @@
 //! No network access is required: these tests deserialize the checked-in fixtures in
 //! `tests/fixtures/` and exercise `ProtonVPNClient::find_servers` (a pure function over
 //! `server_list`) directly.
-use proton_proxy::client::ProtonVPNClient;
-use proton_proxy::models::{
+use gratis::client::ProtonVPNClient;
+use gratis::models::{
     CertificateResponse, LogicalServersResponse, PhysicalServer, VPNServer, features_to_strings,
 };
 

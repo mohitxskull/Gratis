@@ -1,4 +1,4 @@
-//! `proton-proxy` daemon entry point. No CLI subcommands: a single `serve`-style entrypoint
+//! `gratis` daemon entry point. No CLI subcommands: a single `serve`-style entrypoint
 //! that starts the localhost control API + embedded web UI, optionally pre-starting a list of
 //! locations passed via `--locations`. There is no login route or login form — authentication
 //! happens exactly once, automatically, from a `.env` file in the current directory
@@ -12,12 +12,12 @@
 //! process restart can "adopt" a tunnel that necessarily died with its process), so they're
 //! cleared unconditionally on startup, not reconciled against any live external state.
 use clap::Parser;
-use proton_proxy::api;
-use proton_proxy::manager::TunnelManager;
+use gratis::api;
+use gratis::manager::TunnelManager;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "proton-proxy", about = "Proton VPN client (WireGuard) daemon")]
+#[command(name = "gratis", about = "Proton VPN client (WireGuard) daemon")]
 struct Cli {
     /// Port the localhost control API + web UI listen on.
     #[arg(long, default_value = "9000")]
@@ -37,22 +37,22 @@ struct Cli {
 /// reconcile against — unlike the old `sudo wg-quick`-based design, no kernel interface could
 /// have outlived the previous process for this to check against.
 fn clear_stale_active_tunnels() {
-    let active = match proton_proxy::credentials::list_active() {
+    let active = match gratis::credentials::list_active() {
         Ok(rows) => rows,
         Err(err) => {
-            eprintln!("proton-proxy: failed to read active-tunnel state at boot: {err}");
+            eprintln!("gratis: failed to read active-tunnel state at boot: {err}");
             return;
         }
     };
 
     for row in active {
         eprintln!(
-            "proton-proxy: clearing stale active_tunnels row for location {} (from a previous run)",
+            "gratis: clearing stale active_tunnels row for location {} (from a previous run)",
             row.location
         );
-        if let Err(err) = proton_proxy::credentials::clear_active(&row.location) {
+        if let Err(err) = gratis::credentials::clear_active(&row.location) {
             eprintln!(
-                "proton-proxy: failed to clear stale active-tunnel row for location {}: {err}",
+                "gratis: failed to clear stale active-tunnel row for location {}: {err}",
                 row.location
             );
         }
@@ -93,16 +93,16 @@ async fn main() {
     let logged_in_from_dotenv = match dotenv_creds {
         (Some(email), Some(password)) => match manager.login(&email, &password).await {
             Ok(()) => {
-                println!("proton-proxy: logged in automatically from .env ({email})");
+                println!("gratis: logged in automatically from .env ({email})");
                 true
             }
             Err(err) => {
-                eprintln!("proton-proxy: auto-login from .env failed: {err}");
+                eprintln!("gratis: auto-login from .env failed: {err}");
                 false
             }
         },
         (Some(_), None) | (None, Some(_)) => {
-            eprintln!("proton-proxy: .env found but must set both EMAIL and PASSWORD; ignoring it");
+            eprintln!("gratis: .env found but must set both EMAIL and PASSWORD; ignoring it");
             false
         }
         (None, None) => false,
@@ -115,11 +115,11 @@ async fn main() {
     if !logged_in_from_dotenv {
         if manager.has_saved_credentials() {
             eprintln!(
-                "proton-proxy: found saved credentials from a previous run, but no valid .env this time — no tunnel can be started until a valid .env (EMAIL + PASSWORD) is present at startup"
+                "gratis: found saved credentials from a previous run, but no valid .env this time — no tunnel can be started until a valid .env (EMAIL + PASSWORD) is present at startup"
             );
         } else {
             eprintln!(
-                "proton-proxy: no .env (EMAIL + PASSWORD) found — no tunnel can be started until one is present at startup"
+                "gratis: no .env (EMAIL + PASSWORD) found — no tunnel can be started until one is present at startup"
             );
         }
     }
@@ -130,7 +130,7 @@ async fn main() {
     // the daemon.
     for location in &cli.locations {
         if let Err(err) = manager.start(location).await {
-            eprintln!("proton-proxy: failed to pre-start location {location}: {err}");
+            eprintln!("gratis: failed to pre-start location {location}: {err}");
         }
     }
 
@@ -140,13 +140,13 @@ async fn main() {
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(err) => {
-            eprintln!("proton-proxy: failed to bind {addr}: {err}");
+            eprintln!("gratis: failed to bind {addr}: {err}");
             std::process::exit(1);
         }
     };
 
-    println!("proton-proxy: control API + web UI listening on http://{addr}");
-    println!("proton-proxy: running unprivileged — no root/sudo required");
+    println!("gratis: control API + web UI listening on http://{addr}");
+    println!("gratis: running unprivileged — no root/sudo required");
 
     // Ctrl-C stops tracked tunnels before exiting, purely so `GET /api/tunnels` and the
     // active_tunnels DB rows reflect reality if something outlives the process shutdown
@@ -155,25 +155,25 @@ async fn main() {
     tokio::select! {
         result = axum::serve(listener, router) => {
             if let Err(err) = result {
-                eprintln!("proton-proxy: server error: {err}");
+                eprintln!("gratis: server error: {err}");
                 std::process::exit(1);
             }
         }
         signal_result = tokio::signal::ctrl_c() => {
             if let Err(err) = signal_result {
-                eprintln!("proton-proxy: failed to install Ctrl-C handler: {err}");
+                eprintln!("gratis: failed to install Ctrl-C handler: {err}");
                 return;
             }
-            eprintln!("proton-proxy: received shutdown signal, stopping tracked tunnels...");
+            eprintln!("gratis: received shutdown signal, stopping tracked tunnels...");
             for info in manager.tunnels() {
                 if let Err(err) = manager.stop(&info.location).await {
                     eprintln!(
-                        "proton-proxy: failed to stop tunnel for location {}: {err}",
+                        "gratis: failed to stop tunnel for location {}: {err}",
                         info.location
                     );
                 }
             }
-            eprintln!("proton-proxy: shutdown complete");
+            eprintln!("gratis: shutdown complete");
         }
     }
 }

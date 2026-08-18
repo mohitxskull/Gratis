@@ -1,4 +1,4 @@
-//! Integration tests for the SOCKS5 proxy engine (`proton_proxy::socks5`).
+//! Integration tests for the SOCKS5 proxy engine (`gratis::socks5`).
 //!
 //! These tests bind the proxy to the loopback interface (`interface = "lo"`) so they run
 //! without root/`CAP_NET_RAW` and without a live WireGuard interface. The SOCKS5 client side is
@@ -51,9 +51,9 @@ async fn spawn_echo_server() -> u16 {
 async fn spawn_proxy() -> u16 {
     let port = free_port();
     let listen_addr = format!("127.0.0.1:{port}");
-    let tunnel = std::sync::Arc::new(proton_proxy::wireguard::Tunnel::loopback_for_testing());
+    let tunnel = std::sync::Arc::new(gratis::wireguard::Tunnel::loopback_for_testing());
     tokio::spawn(async move {
-        let _ = proton_proxy::socks5::run_socks5(&listen_addr, tunnel).await;
+        let _ = gratis::socks5::run_socks5(&listen_addr, tunnel).await;
     });
 
     // Give the listener a moment to bind before clients try to connect.

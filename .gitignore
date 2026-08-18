@@ -1,6 +1,7 @@
 /target/
 /tmp/
 .env
+node_modules/
 **/*.rs.bk
 *.pdb
 

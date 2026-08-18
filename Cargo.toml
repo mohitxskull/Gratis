@@ -1,5 +1,5 @@
 [package]
-name = "proton-proxy"
+name = "gratis"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94.0"
@@ -35,6 +35,7 @@ sha2 = "0.10"
 # root-requiring design the plan originally specified.
 wireguard-netstack = "0.3"
 async-trait = "0.1"
+askama = "0.16"
 
 [dev-dependencies]
 base64 = "0.22"

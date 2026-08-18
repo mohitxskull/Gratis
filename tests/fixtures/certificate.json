@@ -7,7 +7,7 @@
     "ExpirationTime": 1999999999,
     "RefreshTime": 1999900000,
     "Mode": "session",
-    "DeviceName": "proton-proxy-fixture",
+    "DeviceName": "gratis-fixture",
     "ServerPublicKeyMode": "EC",
     "ServerPublicKey": "fixture-server-public-key"
 }

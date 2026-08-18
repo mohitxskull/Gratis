@@ -7,8 +7,8 @@
 //! `proton-srp` crate's own test-suite (MIT/Apache). It is verified by `RPGPVerifier`, the
 //! same verifier the real flow uses, so `prove` exercises the genuine PGP path.
 use base64::Engine as _;
-use proton_proxy::models::AuthResponse;
-use proton_proxy::srp::prove;
+use gratis::models::AuthResponse;
+use gratis::srp::prove;
 use proton_srp::SrpHashVersion;
 
 /// PGP-signed SRP modulus fixture (proton-srp test-suite). Verified by `RPGPVerifier`.

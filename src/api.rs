@@ -1,36 +1,104 @@
 //! Localhost control API (axum 0.7) — the primary way to drive `TunnelManager`: list
-//! locations, and start/stop per-location tunnels. Also serves the embedded web UI at `/`.
-//! `main.rs` binds this router to `127.0.0.1:<control_port>` only — never `0.0.0.0`.
+//! locations, and start/stop per-location tunnels (as JSON, under `/api/*`). Also serves the
+//! Askama+htmx+Tailwind web UI: `GET /` renders the full page, `GET/POST /ui/*` renders HTML
+//! fragments htmx swaps into it. `main.rs` binds this router to `127.0.0.1:<control_port>`
+//! only — never `0.0.0.0`.
 //!
 //! No login route: authentication happens once, automatically, at daemon startup from a
 //! `.env` file (see `main.rs`) — there is no supported way to log in via this API or the web
 //! UI, and `TunnelManager::login` is only ever called from `main.rs`'s startup sequence.
 use crate::errors::ProtonError;
 use crate::manager::{CountryInfo, TunnelInfo, TunnelManager};
-use crate::webui;
+use crate::webui::{IndexTemplate, LocationsTemplate, TunnelsTemplate};
+use askama::Template;
 use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
-    routing::{delete, get},
+    routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// Build the router: `/`, `GET /api/locations`, `GET /api/tunnels`, `POST /api/tunnels`,
-/// `DELETE /api/tunnels/:location`.
+/// Render an Askama template to an HTML response, mapping a render failure (should never
+/// happen for these templates — they don't do anything fallible) to a 500.
+fn render<T: Template>(template: T) -> Response {
+    match template.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("template error: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Build the router: `/` + `/ui/*` (the web UI), `/api/*` (the JSON control API).
 pub fn router(manager: Arc<TunnelManager>) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/ui/locations", get(ui_locations))
+        .route("/ui/tunnels", get(ui_tunnels))
+        .route("/ui/tunnels/:location/start", post(ui_start_tunnel))
+        .route("/ui/tunnels/:location/stop", post(ui_stop_tunnel))
         .route("/api/locations", get(locations))
         .route("/api/tunnels", get(list_tunnels).post(start_tunnel))
         .route("/api/tunnels/:location", delete(stop_tunnel))
         .with_state(manager)
 }
 
-async fn index() -> Html<&'static str> {
-    Html(webui::INDEX_HTML)
+/// Full page: locations + tunnels rendered inline. `list_locations()` fails with
+/// "not logged in" if `.env` auto-login didn't succeed at startup — shown as an inline error
+/// banner rather than a 500, since it's an expected, recoverable-by-restarting state.
+async fn index(State(manager): State<Arc<TunnelManager>>) -> Response {
+    let (login_error, locations) = match manager.list_locations().await {
+        Ok(locs) => (None, locs),
+        Err(e) => (Some(e.to_string()), Vec::new()),
+    };
+    render(IndexTemplate::new(
+        login_error,
+        locations,
+        manager.tunnels(),
+    ))
+}
+
+/// Locations table fragment, for the "Refresh" button.
+async fn ui_locations(State(manager): State<Arc<TunnelManager>>) -> Response {
+    let locations = manager.list_locations().await.unwrap_or_default();
+    render(LocationsTemplate { locations })
+}
+
+/// Tunnels table fragment, for the "Refresh" button and after start/stop actions.
+async fn ui_tunnels(State(manager): State<Arc<TunnelManager>>) -> Response {
+    render(TunnelsTemplate {
+        tunnels: manager.tunnels(),
+    })
+}
+
+/// Start a tunnel from the web UI. Renders the refreshed tunnels fragment regardless of
+/// success — a failed start simply leaves the table unchanged; there's no per-action error
+/// surface in the fragment-swap model yet (a reasonable v1 scope limit, not a bug: the JSON
+/// `/api/tunnels` route below is available for callers that need the failure reason).
+async fn ui_start_tunnel(
+    State(manager): State<Arc<TunnelManager>>,
+    Path(location): Path<String>,
+) -> Response {
+    let _ = manager.start(&location).await;
+    render(TunnelsTemplate {
+        tunnels: manager.tunnels(),
+    })
+}
+
+/// Stop a tunnel from the web UI. Same fragment-rendering contract as `ui_start_tunnel`.
+async fn ui_stop_tunnel(
+    State(manager): State<Arc<TunnelManager>>,
+    Path(location): Path<String>,
+) -> Response {
+    let _ = manager.stop(&location).await;
+    render(TunnelsTemplate {
+        tunnels: manager.tunnels(),
+    })
 }
 
 async fn locations(
@@ -182,5 +250,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // GET /ui/locations — a fragment, always 200 even when not logged in (falls back to
+        // an empty list rather than erroring, per ui_locations's contract).
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/ui/locations").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // GET /ui/tunnels
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/ui/tunnels").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // POST /ui/tunnels/:location/start — always 200 (renders the tunnels fragment
+        // regardless of whether the start actually succeeded, per its documented contract).
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/ui/tunnels/US/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // POST /ui/tunnels/:location/stop — same contract.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/ui/tunnels/US/stop")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

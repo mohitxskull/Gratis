@@ -1,0 +1,30 @@
+<table class="w-full text-sm border-collapse">
+  <thead>
+    <tr class="text-left text-gray-400 border-b border-gray-800">
+      <th class="py-2 pr-4 font-medium">Code</th>
+      <th class="py-2 pr-4 font-medium">Country</th>
+      <th class="py-2 pr-4 font-medium">Load</th>
+      <th class="py-2"></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for loc in locations %}
+    <tr class="border-b border-gray-900 hover:bg-gray-900/50">
+      <td class="py-2 pr-4 font-mono">{{ loc.code }}</td>
+      <td class="py-2 pr-4">{{ loc.name }}</td>
+      <td class="py-2 pr-4">{{ loc.load }}%</td>
+      <td class="py-2 text-right">
+        <button
+          hx-post="/ui/tunnels/{{ loc.code }}/start"
+          hx-target="#tunnels"
+          hx-swap="innerHTML"
+          class="text-xs px-2 py-1 rounded bg-blue-600 hover:bg-blue-500 transition text-white"
+        >Start</button>
+      </td>
+    </tr>
+    {% endfor %}
+    {% if locations.is_empty() %}
+    <tr><td colspan="4" class="py-4 text-center text-gray-500">No locations available — is the daemon logged in?</td></tr>
+    {% endif %}
+  </tbody>
+</table>

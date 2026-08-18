@@ -1,6 +1,6 @@
 //! Credentials + active-connection state storage.
 //!
-//! Backed by a single-file SQLite database at `~/.config/proton-proxy/proton-proxy.db`,
+//! Backed by a single-file SQLite database at `~/.config/gratis/gratis.db`,
 //! created with `0600` permissions (owner read/write only) so secrets on disk are not
 //! world/group readable. There is one Proton account at a time, so the `credentials` table
 //! is a single upserted row (`id = 1`); `active_tunnels` tracks zero or more live WireGuard
@@ -17,13 +17,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 fn config_dir() -> Result<PathBuf> {
     dirs::config_dir()
-        .map(|d| d.join("proton-proxy"))
+        .map(|d| d.join("gratis"))
         .ok_or_else(|| ProtonError::Config("cannot resolve config dir".into()))
 }
 
 /// Path to the SQLite database used by the real (non-test) `save_credentials` etc.
 pub fn db_path() -> Result<PathBuf> {
-    Ok(config_dir()?.join("proton-proxy.db"))
+    Ok(config_dir()?.join("gratis.db"))
 }
 
 /// One row of `active_tunnels`: a live (or recently-started) WireGuard interface.
@@ -38,7 +38,7 @@ pub struct ActiveTunnel {
 /// The SQLite-backed credentials/state store.
 ///
 /// `Store::open` takes an explicit path so tests can point it at a tempdir instead of the
-/// real `~/.config/proton-proxy/` directory; the free functions in this module (
+/// real `~/.config/gratis/` directory; the free functions in this module (
 /// `save_credentials`, `load_credentials`, `set_active`, `clear_active`, `list_active`) are
 /// thin wrappers that call `Store::open(&db_path()?)`.
 pub struct Store {
@@ -185,7 +185,7 @@ impl Store {
     }
 }
 
-/// Persist credentials to the real (`~/.config/proton-proxy/proton-proxy.db`) store.
+/// Persist credentials to the real (`~/.config/gratis/gratis.db`) store.
 pub fn save_credentials(creds: &VPNCredentials) -> Result<()> {
     Store::open(&db_path()?)?.save_credentials(creds)
 }
