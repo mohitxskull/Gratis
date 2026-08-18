@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Runs the checks that CI's `check` job runs, before the commit exists.
+#
+# Install once:   git config core.hooksPath .githooks
+#
+# Escape hatch: `git commit --no-verify`. Use it for work-in-progress commits
+# on a branch, not for anything you are about to push to main.
+set -uo pipefail
+
+# Only check the crate, not whatever directory the commit was invoked from.
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+fail=0
+run() {
+    local label="$1"
+    shift
+    printf '  %-28s' "$label"
+    if out=$("$@" 2>&1); then
+        printf 'ok\n'
+    else
+        printf 'FAILED\n'
+        printf '%s\n' "$out" | sed 's/^/    /'
+        fail=1
+    fi
+}
+
+echo "pre-commit:"
+
+# Ordered cheapest-first so an obvious formatting slip fails in under a second
+# rather than after a clippy build.
+run "cargo fmt --check"  cargo fmt --check --all
+run "cargo clippy"       cargo clippy --all-targets -- -D warnings
+run "cargo doc"          env RUSTDOCFLAGS=-Dwarnings cargo doc --no-deps --quiet
+run "cargo test"         cargo test --quiet
+
+if [ "$fail" -ne 0 ]; then
+    echo
+    echo "pre-commit failed. Fix the above, or bypass with: git commit --no-verify"
+    exit 1
+fi
+
+echo "pre-commit: all checks passed"

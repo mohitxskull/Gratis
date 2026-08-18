@@ -1,0 +1,146 @@
+name: Release
+
+# Tagging `vX.Y.Z` builds release binaries for Linux/macOS (x86_64 + aarch64)
+# and opens a GitHub Release with them attached, with notes generated from
+# Conventional Commits since the previous tag.
+#
+# The tag is the only trigger, and deliberately so: a published GitHub
+# Release is meant to mark a deliberate point, not every push to main. A
+# commit-message trigger would tie a fairly irreversible, public action to
+# the most frequent event in the repo.
+#
+# This is GitHub Releases only — gratis is a daemon binary, not a published
+# crate, so there is no crates.io step here.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Everything that can fail cheaply runs before anything irreversible
+  # (building/uploading binaries, publishing a public Release).
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Refuse to release if the tag and the manifest disagree — the most
+      # common release mistake, and silent if unchecked.
+      - name: Tag matches Cargo.toml version
+        run: |
+          manifest="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$manifest" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest"
+            exit 1
+          fi
+          echo "version $manifest"
+
+      # The changelog must actually mention this version. Cheap guard against
+      # tagging before writing the entry.
+      - name: Changelog has an entry for this version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          if ! grep -q "^## \[$tag\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$tag]' section"
+            exit 1
+          fi
+
+      - name: Tests
+        run: cargo test
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  # One native-compiled binary per target — no cross/docker toolchain needed
+  # since every target below has a hosted GitHub-native runner.
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # One self-contained tarball per target: the binary plus the docs a
+      # downloader would otherwise have to go find on GitHub separately.
+      - name: Package
+        run: |
+          name="gratis-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/gratis" "$name/"
+          cp README.md CHANGELOG.md LICENSE "$name/"
+          tar czf "$name.tar.gz" "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gratis-${{ matrix.target }}
+          path: gratis-*.tar.gz
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    # Only git-cliff, artifact download, and an API call; no compilation.
+    timeout-minutes: 15
+    permissions:
+      contents: write # to create the GitHub Release
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # git-cliff needs full history and tags
+
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: gratis-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate release notes
+        uses: orhun/git-cliff-action@v4
+        id: cliff
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: RELEASE_NOTES.md
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          body_path: RELEASE_NOTES.md
+          files: dist/*.tar.gz
+          # Pre-1.0 and pre-release tags are marked as such.
+          prerelease: ${{ contains(github.ref_name, '-') }}

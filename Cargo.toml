@@ -3,6 +3,9 @@ name = "gratis"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94.0"
+license = "MIT"
+repository = "https://github.com/mohitxskull/Gratis"
+description = "No-root Proton VPN (free tier) client — every server exposed as its own lazily-connecting, self-idling local SOCKS5 proxy."
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
