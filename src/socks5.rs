@@ -54,7 +54,18 @@ pub async fn run_socks5(listen_addr: &str, interface: &str) -> io::Result<()> {
     let listener = TcpListener::bind(listen_addr).await?;
 
     loop {
-        let (client, _peer) = listener.accept().await?;
+        let (client, _peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(err) => {
+                // Transient accept errors (EMFILE/ENFILE/ECONNABORTED, etc.) must not take
+                // down the whole listener — a single failed accept should not kill every
+                // other client this proxy instance is serving. Log and keep looping; a
+                // `TcpListener` that already bound successfully essentially never becomes
+                // permanently unusable via accept() failures alone.
+                eprintln!("socks5: accept() failed, continuing to listen: {err}");
+                continue;
+            }
+        };
         let interface = interface.to_string();
         tokio::spawn(async move {
             if let Err(_err) = handle_client(client, &interface).await {
