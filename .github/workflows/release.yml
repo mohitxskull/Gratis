@@ -104,7 +104,7 @@ jobs:
           cp README.md CHANGELOG.md LICENSE "$name/"
           tar czf "$name.tar.gz" "$name"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: gratis-${{ matrix.target }}
           path: gratis-*.tar.gz
@@ -122,7 +122,7 @@ jobs:
         with:
           fetch-depth: 0 # git-cliff needs full history and tags
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           pattern: gratis-*
           path: dist
