@@ -123,6 +123,14 @@ pub struct TunnelManager {
     /// down listener on the same port.
     next_port_index: AtomicU16,
     driver: Arc<dyn TunnelDriver>,
+    /// Per-location async locks serializing `start()`/`stop()` for a given location, so the
+    /// whole `wg_up -> credentials::set_active -> spawn_socks5 -> tunnels.insert` sequence
+    /// (and the mirrored `stop()` sequence) is atomic with respect to concurrent calls for the
+    /// *same* location — see `location_lock`. Distinct locations proceed independently: each
+    /// gets its own `tokio::sync::Mutex`. Entries are never removed once created (the key
+    /// space is bounded by the small, roughly-fixed set of country codes Proton exposes, so
+    /// this is a deliberate, harmless simplification rather than an unbounded leak).
+    start_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
 }
 
 impl TunnelManager {
@@ -140,7 +148,19 @@ impl TunnelManager {
             tunnels: Mutex::new(HashMap::new()),
             next_port_index: AtomicU16::new(0),
             driver,
+            start_locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Get (creating if absent) the per-location async lock used to serialize `start()`/
+    /// `stop()` for `location`.
+    fn location_lock(&self, location: &str) -> Arc<AsyncMutex<()>> {
+        self.start_locks
+            .lock()
+            .unwrap()
+            .entry(location.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     }
 
     /// Whether a previous session's credentials are present in the SQLite store. Informational
@@ -197,6 +217,22 @@ impl TunnelManager {
             return Ok(port);
         }
 
+        // Serialize the whole wg_up -> set_active -> spawn -> insert sequence per location so
+        // two concurrent `start()` calls for a location that isn't tracked yet (e.g. a
+        // double-clicked "Start" button in the web UI, which has no in-flight guard) can't
+        // both bring the WireGuard interface up and both write a `credentials::set_active`
+        // row keyed by the same location — whichever write landed second used to silently win
+        // in SQLite regardless of which racer's in-memory `TunnelHandle` ended up tracked.
+        // Distinct locations use distinct locks and are unaffected.
+        let lock = self.location_lock(location);
+        let _guard = lock.lock().await;
+
+        // Re-check after acquiring the lock: another `start()` call may have completed the
+        // full sequence for this location while we were waiting for it.
+        if let Some(port) = self.existing_port(location) {
+            return Ok(port);
+        }
+
         let (server, creds) = {
             let guard = self.client.lock().await;
             let client = guard
@@ -235,18 +271,10 @@ impl TunnelManager {
         let listen_addr = format!("127.0.0.1:{socks_port}");
         let task = self.driver.spawn_socks5(listen_addr, interface.clone());
 
-        let mut tunnels = self.tunnels.lock().unwrap();
-        if let Some(existing) = tunnels.get(location) {
-            // Lost a race with a concurrent start() of the same location: keep the winner's
-            // tunnel, abort the one we just spawned. The WireGuard interface we brought up is
-            // left as-is (bringing the same interface up twice via wg-quick is itself
-            // idempotent-ish in practice) — documented known edge case, not expected under the
-            // single-caller-at-a-time control API in front of this manager.
-            let port = existing.socks_port;
-            task.abort();
-            return Ok(port);
-        }
-        tunnels.insert(
+        // No race to check for here any more: `_guard` has held this location's lock for the
+        // entire `wg_up -> set_active -> spawn` sequence above, so no concurrent `start()` for
+        // `location` could have run any of it in the meantime.
+        self.tunnels.lock().unwrap().insert(
             location.to_string(),
             TunnelHandle {
                 interface,
@@ -267,6 +295,12 @@ impl TunnelManager {
 
     /// Tear down the tunnel + SOCKS5 proxy for `location`.
     pub async fn stop(&self, location: &str) -> Result<()> {
+        // Shares the same per-location lock `start()` uses, so a `stop()` racing a `start()`
+        // for the same location can't interleave with the latter's wg_up/set_active/spawn
+        // sequence.
+        let lock = self.location_lock(location);
+        let _guard = lock.lock().await;
+
         let handle = self.tunnels.lock().unwrap().remove(location);
         let Some(handle) = handle else {
             return Err(ProtonError::Config(format!(
@@ -306,6 +340,16 @@ impl TunnelManager {
 mod tests {
     use super::*;
 
+    /// `HOME`/`XDG_CONFIG_HOME` are process-global, but `cargo test` runs tests in this file
+    /// concurrently on separate OS threads by default. Every test below that points
+    /// `credentials::*`'s free functions (which read `HOME`/`XDG_CONFIG_HOME` on every call)
+    /// at a scratch tempdir must hold this lock for its *entire* body — not just while calling
+    /// `env::set_var` — so no two such tests interleave (one test's tempdir could otherwise be
+    /// torn down, or its env vars overwritten, mid another test's `credentials::set_active`/
+    /// `list_active` call). A `tokio::sync::Mutex` (not `std::sync::Mutex`) is used
+    /// specifically so the guard can be held safely across `.await` points.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// Records `wg_up`/`wg_down` calls (no real WireGuard) and spawns an inert task instead of
     /// a real SOCKS5 listener, so `TunnelManager` bookkeeping can be tested without root.
     struct FakeDriver;
@@ -340,12 +384,13 @@ mod tests {
     /// and SOCKS5 side effects are faked too.
     #[tokio::test]
     async fn manager_start_stop_tracks_state() {
+        let _env_guard = ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: no other threads read/write HOME concurrently in this single-threaded-per-
-        // test process; `#[tokio::test]` runs each test in its own process-wide async runtime
-        // but env vars are still process-global, so this test must not run concurrently with
-        // another test that depends on the real HOME. It doesn't (credentials tests use
-        // `Store::open` with an explicit path, not the free functions).
+        // SAFETY: env vars are process-global; `_env_guard` (held for this whole test)
+        // serializes this test against the other `HOME`/`XDG_CONFIG_HOME`-mutating tests in
+        // this module so they never interleave. Tests elsewhere in the crate that touch
+        // credentials use `Store::open` with an explicit path, not the free functions, so
+        // they're unaffected either way.
         unsafe {
             std::env::set_var("HOME", tmp.path());
             std::env::set_var("XDG_CONFIG_HOME", tmp.path());
@@ -392,5 +437,145 @@ mod tests {
 
         // stop() on a location that isn't tracked is an error, not a panic.
         assert!(manager.stop("US").await.is_err());
+    }
+
+    /// A self-signed test certificate (RSA-2048, `CN=proton-test`) with a single SAN IP entry
+    /// of `10.2.0.5` — the same fixture `tests/wireguard_config.rs` uses (duplicated here
+    /// since unit tests in `src/` can't reach files under `tests/`). Contains no real account
+    /// data.
+    const TEST_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIDHjCCAgagAwIBAgIUa/5mCrPYf855/Ob4AvhLmbKnZwAwDQYJKoZIhvcNAQEL
+BQAwFjEUMBIGA1UEAwwLcHJvdG9uLXRlc3QwHhcNMjYwODE4MTAxNDA4WhcNMzYw
+ODE1MTAxNDA4WjAWMRQwEgYDVQQDDAtwcm90b24tdGVzdDCCASIwDQYJKoZIhvcN
+AQEBBQADggEPADCCAQoCggEBAJ7s1rNtRRsqNoiIt9ov2P+J0sy8Cl68Y1YmM7lG
+aQZ7rqajQqBlF0HSEv2OTF5biPHb9aaTxeZoPeoull7qWPbQwmqXxLSWu0Swtxga
+KWXclWrXlh3zPsoVcTZDarhHk0oTs4v9fXkuctacNB/sHm0Auv8DshAJLXNYpoWH
+peaUzDsd5/jT375E7RRkCeInov7c7hso5JyMxY7U8EFawUexObbe6Q5WELpTcIFz
+rino9srIz6+bhx5cIltluPXoTH279Lmr9q1sXTedwMbtrErJxZrAiP/JmsPeaNvc
+JUxwSt6lvgMAJZSWT8vQKMbEuwLYYzrMrKtn5c0sJrPDW+MCAwEAAaNkMGIwHQYD
+VR0OBBYEFABogFWxB2xkPbxu9+mJPG9uTIqKMB8GA1UdIwQYMBaAFABogFWxB2xk
+Pbxu9+mJPG9uTIqKMA8GA1UdEwEB/wQFMAMBAf8wDwYDVR0RBAgwBocECgIABTAN
+BgkqhkiG9w0BAQsFAAOCAQEAVgl0pqpn0wfdxBC/m07PA8+ngXXN4eLHypQYePSF
+QsEiyu8ZfSPy2CRaIa/660Z9cMcwxaMABesO4Cu0R0GEvuSQSE5ZCSfiAQqmb/nw
+/OGp7+4zfDqbaaxuZSoozAgj1VoOCp1OCUWxfcdvoXwqUbwslS+BrdymNOdr1d7y
+TJcG6MxOvCjdoIEyDVsXmOFhqEtpvte7jRvPncz8DdG1n4ukl5cdVvuAzY4jHP8j
+rxA/XsUNPp08PNpGI34w1X7prwi/VLkAkGEeY1wNufP1/IVXW+ahOfNvcGLJQJVf
+eRd1dKRVcDggq2K+vBNH5fXpGufy8FPBsFFnA5ZDGFrqpg==
+-----END CERTIFICATE-----";
+
+    fn test_server(location: &str) -> crate::models::VPNServer {
+        crate::models::VPNServer {
+            id: "srv-1".into(),
+            name: format!("{location}-FREE#1"),
+            country: "Testland".into(),
+            country_code: location.into(),
+            city: None,
+            tier: 0,
+            load: 12.0,
+            features: vec![],
+            ips: vec!["203.0.113.9".into()],
+            status: 1,
+            wg_public_key: "SERVERPUBKEYBASE64==".into(),
+        }
+    }
+
+    fn test_creds() -> crate::models::VPNCredentials {
+        crate::models::VPNCredentials {
+            username: "testuser".into(),
+            password: "unused-in-wg-config".into(),
+            certificate: TEST_CERT_PEM.into(),
+            wg_public_key: "CLIENTPUBKEYBASE64==".into(),
+            wg_private_key: "CLIENTPRIVKEYBASE64==".into(),
+        }
+    }
+
+    /// Builds a `ProtonVPNClient` pre-populated with a fake server list + credentials, without
+    /// any network call (`ProtonVPNClient`'s fields are all `pub`, so this bypasses `login()`/
+    /// `fetch_servers()` entirely — the same trick Task 02/03's own tests use for the DTOs).
+    fn fake_logged_in_client(location: &str) -> ProtonVPNClient {
+        let mut client = ProtonVPNClient::new("test-user");
+        client.vpn_credentials = Some(test_creds());
+        client.server_list = vec![test_server(location)];
+        client
+    }
+
+    fn scratch_manager(base_port: u16) -> TunnelManager {
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: see the note in `manager_start_stop_tracks_state` above.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        }
+        // Leak the tempdir so it outlives the test (it's process-local scratch space cleaned
+        // up when the test process exits; nothing else depends on it being removed sooner).
+        std::mem::forget(tmp);
+        TunnelManager::with_driver(base_port, Arc::new(FakeDriver))
+    }
+
+    /// Drives `start()`'s real new-tunnel path (not just the idempotent short-circuit
+    /// `manager_start_stop_tracks_state` exercises): a logged-in (faked) client selects a
+    /// server, `wg_up`/`spawn_socks5` are faked via `FakeDriver`, and the tunnel ends up
+    /// tracked with a deterministic port.
+    #[tokio::test]
+    async fn manager_start_drives_new_tunnel_path() {
+        let _env_guard = ENV_LOCK.lock().await;
+        let manager = scratch_manager(12000);
+        *manager.client.lock().await = Some(fake_logged_in_client("US"));
+
+        let port = manager.start("US").await.unwrap();
+        assert_eq!(port, 12000, "first location gets socks_base_port + 0");
+
+        let snapshot = manager.tunnels();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].location, "US");
+        assert_eq!(snapshot[0].interface, wireguard::interface_name("US"));
+        assert_eq!(snapshot[0].socks_port, 12000);
+        assert!(snapshot[0].connected);
+
+        // The active-tunnel row was actually persisted (via the real `credentials::set_active`
+        // free function, pointed at the scratch HOME).
+        let active = credentials::list_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].location, "US");
+        assert_eq!(active[0].socks_port, 12000);
+
+        manager.stop("US").await.unwrap();
+        assert!(manager.tunnels().is_empty());
+        assert!(credentials::list_active().unwrap().is_empty());
+    }
+
+    /// Reproduces the double-start race the review flagged: two concurrent `start()` calls for
+    /// a location that isn't tracked yet (e.g. a double-clicked "Start" button) must not both
+    /// bring the tunnel up / both write `credentials::set_active` rows — the per-location lock
+    /// in `location_lock` must serialize them so exactly one `TunnelHandle` and one persisted
+    /// `active_tunnels` row result, both agreeing on the same port.
+    #[tokio::test]
+    async fn manager_start_concurrent_same_location_is_serialized() {
+        let _env_guard = ENV_LOCK.lock().await;
+        let manager = Arc::new(scratch_manager(13000));
+        *manager.client.lock().await = Some(fake_logged_in_client("NL"));
+
+        let a = manager.clone();
+        let b = manager.clone();
+        let (port_a, port_b) = tokio::join!(
+            tokio::spawn(async move { a.start("NL").await.unwrap() }),
+            tokio::spawn(async move { b.start("NL").await.unwrap() }),
+        );
+        let (port_a, port_b) = (port_a.unwrap(), port_b.unwrap());
+
+        // Both callers must observe the same winning port.
+        assert_eq!(port_a, port_b);
+
+        // Exactly one tracked tunnel, and the persisted store agrees with the in-memory map on
+        // which port won — this is the specific desync the review flagged (`set_active` being
+        // called unconditionally by both racers, independent of which racer's in-memory
+        // `TunnelHandle` ended up tracked).
+        let snapshot = manager.tunnels();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].socks_port, port_a);
+
+        let active = credentials::list_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].socks_port, port_a);
     }
 }

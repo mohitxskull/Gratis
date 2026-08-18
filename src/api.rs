@@ -118,9 +118,13 @@ mod tests {
     use tower::ServiceExt;
 
     fn stub_manager() -> Arc<TunnelManager> {
-        // No login performed — routes are reachable and return well-formed error responses
-        // rather than 404s, which is all `api_routes_wired` needs to prove without a live
-        // account.
+        // `RealDriver` only stands in for the WireGuard/SOCKS5 side of `TunnelManager` (see
+        // `manager.rs`) — it does not touch `ProtonVPNClient`/the network. That's fine here:
+        // no login is performed, so every handler this test exercises other than
+        // `POST /api/login` short-circuits on "not logged in" before ever consulting the
+        // driver or the network. The login route itself is exercised with a body that never
+        // reaches the handler (see below), so `RealDriver` here never actually drives a real
+        // `wg-quick`/socket call either.
         Arc::new(TunnelManager::with_driver(9500, Arc::new(RealDriver)))
     }
 
@@ -136,22 +140,26 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // POST /api/login (bad creds -> reaches the handler, not a 404; network call will
-        // fail since there's no real Proton account here, surfacing as a non-2xx JSON error
-        // rather than "route not found").
+        // POST /api/login — deliberately sent with a malformed JSON body so axum's `Json`
+        // extractor rejects it *before* the handler runs, proving the route is wired without
+        // ever calling `TunnelManager::login` (which would otherwise call
+        // `ProtonVPNClient::login` and make a real outbound HTTPS request to Proton's
+        // production API — unacceptable in an offline/sandboxed `cargo test` run). A rejected
+        // extraction is a 4xx that is never 404 (route not found) or 200 (would imply the
+        // handler ran).
         let resp = app
             .clone()
             .oneshot(
                 Request::post("/api/login")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({"email": "a@example.com", "password": "x"}).to_string(),
-                    ))
+                    .body(Body::from("not valid json"))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+        assert_ne!(resp.status(), StatusCode::OK);
+        assert!(resp.status().is_client_error());
 
         // GET /api/locations (not logged in -> 400, not 404)
         let resp = app
