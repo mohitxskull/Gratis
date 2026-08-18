@@ -6,28 +6,36 @@
 <title>Gratis</title>
 <style>{{ tailwind_css|safe }}</style>
 </head>
-<body class="bg-white text-black min-h-screen antialiased font-sans">
+<body class="bg-paper text-ink min-h-screen antialiased font-sans">
 <div class="max-w-3xl mx-auto px-6 py-12">
 
-  <header class="mb-12 border-b border-black/10 pb-6">
+  <header class="mb-12 border-b border-ink/10 pb-6">
     <h1 class="text-3xl font-semibold tracking-tight">Gratis</h1>
   </header>
 
   {% if let Some(err) = login_error %}
-  <div class="border border-black/20 rounded p-4 text-sm mb-10">
-    <span class="font-semibold">Login failed.</span> <span class="text-black/60">{{ err }}</span>
+  <div class="border border-ink/15 bg-paper-dim rounded p-4 text-sm mb-10">
+    <span class="font-semibold">Login failed.</span> <span class="text-ink/65">{{ err }}</span>
   </div>
   {% endif %}
 
   <section class="mb-12">
     <div class="flex items-baseline justify-between mb-4">
-      <h2 class="text-xs font-semibold tracking-widest uppercase text-black/40">Active tunnels</h2>
+      <h2 class="text-xs font-semibold tracking-widest uppercase text-ink/50">Active tunnels</h2>
       <button
         hx-get="/ui/tunnels"
         hx-target="#tunnels"
         hx-swap="innerHTML"
-        class="text-xs uppercase tracking-wide text-black/40 hover:text-black transition"
-      >Refresh</button>
+        hx-indicator="#tunnels-spinner"
+        hx-disabled-elt="this"
+        class="flex items-center gap-1.5 text-xs uppercase tracking-wide text-ink/50 hover:text-ink transition disabled:opacity-40"
+      >
+        <svg id="tunnels-spinner" class="htmx-indicator spinner w-3 h-3" viewBox="0 0 24 24" fill="none">
+          <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3" stroke-opacity="0.25"/>
+          <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+        </svg>
+        Refresh
+      </button>
     </div>
     <div id="tunnels">
       {% include "tunnels.html" %}
@@ -36,19 +44,27 @@
 
   <section>
     <div class="flex items-baseline justify-between mb-4">
-      <h2 class="text-xs font-semibold tracking-widest uppercase text-black/40">Locations</h2>
+      <h2 class="text-xs font-semibold tracking-widest uppercase text-ink/50">Locations</h2>
       <button
         hx-get="/ui/locations"
         hx-target="#locations"
         hx-swap="innerHTML"
-        class="text-xs uppercase tracking-wide text-black/40 hover:text-black transition"
-      >Refresh</button>
+        hx-indicator="#locations-spinner"
+        hx-disabled-elt="this"
+        class="flex items-center gap-1.5 text-xs uppercase tracking-wide text-ink/50 hover:text-ink transition disabled:opacity-40"
+      >
+        <svg id="locations-spinner" class="htmx-indicator spinner w-3 h-3" viewBox="0 0 24 24" fill="none">
+          <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3" stroke-opacity="0.25"/>
+          <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+        </svg>
+        Refresh
+      </button>
     </div>
     <input
       type="text"
       placeholder="Filter by code or country…"
       oninput="filterLocations(this.value)"
-      class="w-full bg-transparent border border-black/20 rounded px-3 py-2 text-sm placeholder-black/30 mb-3 focus:outline-none focus:border-black/50"
+      class="w-full bg-paper border border-ink/20 rounded px-3 py-2 text-sm placeholder-ink/40 mb-3 focus:outline-none focus:border-ink/60 focus:ring-1 focus:ring-ink/20"
     >
     <div id="locations">
       {% include "locations.html" %}
