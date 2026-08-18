@@ -1,7 +1,10 @@
+pub mod api;
 pub mod client;
 pub mod credentials;
 pub mod errors;
+pub mod manager;
 pub mod models;
 pub mod socks5;
 pub mod srp;
+pub mod webui;
 pub mod wireguard;
