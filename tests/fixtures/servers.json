@@ -1,0 +1,82 @@
+{
+    "Servers": [
+        {
+            "ID": "srv-us-free-1",
+            "Name": "US-FREE#1",
+            "EntryCountry": "US",
+            "City": "New York",
+            "Tier": 0,
+            "Load": 42.0,
+            "Features": 1,
+            "IsSecureCore": false,
+            "Status": 1,
+            "Addresses": [{ "IP": "203.0.113.10" }],
+            "WGPublicKey": "USfree1WgPubKeyBase64AAAAAAAAAAAAAAAAAAAAAA="
+        },
+        {
+            "ID": "srv-us-free-2",
+            "Name": "US-FREE#2",
+            "EntryCountry": "US",
+            "City": "Los Angeles",
+            "Tier": 0,
+            "Load": 11.0,
+            "Features": 0,
+            "IsSecureCore": false,
+            "Status": 1,
+            "Addresses": [{ "IP": "203.0.113.11" }],
+            "WGPublicKey": "USfree2WgPubKeyBase64BBBBBBBBBBBBBBBBBBBBBB="
+        },
+        {
+            "ID": "srv-us-plus-1",
+            "Name": "US-PLUS#1",
+            "EntryCountry": "US",
+            "City": "Chicago",
+            "Tier": 2,
+            "Load": 5.0,
+            "Features": 9,
+            "IsSecureCore": false,
+            "Status": 1,
+            "Addresses": [{ "IP": "203.0.113.12" }],
+            "WGPublicKey": "USplus1WgPubKeyBase64CCCCCCCCCCCCCCCCCCCCCC="
+        },
+        {
+            "ID": "srv-nl-free-1",
+            "Name": "NL-FREE#1",
+            "EntryCountry": "NL",
+            "City": "Amsterdam",
+            "Tier": 0,
+            "Load": 20.0,
+            "Features": 8,
+            "IsSecureCore": false,
+            "Status": 1,
+            "Addresses": [{ "IP": "203.0.113.20" }],
+            "WGPublicKey": "NLfree1WgPubKeyBase64DDDDDDDDDDDDDDDDDDDDDD="
+        },
+        {
+            "ID": "srv-se-sc-1",
+            "Name": "SE-SC#1",
+            "EntryCountry": "SE",
+            "City": "Stockholm",
+            "Tier": 2,
+            "Load": 8.0,
+            "Features": 0,
+            "IsSecureCore": true,
+            "Status": 1,
+            "Addresses": [{ "IP": "203.0.113.30" }],
+            "WGPublicKey": "SEsc1WgPubKeyBase64EEEEEEEEEEEEEEEEEEEEEEEE="
+        },
+        {
+            "ID": "srv-de-maint-1",
+            "Name": "DE#1",
+            "EntryCountry": "DE",
+            "City": "Frankfurt",
+            "Tier": 0,
+            "Load": 1.0,
+            "Features": 0,
+            "IsSecureCore": false,
+            "Status": 0,
+            "Addresses": [{ "IP": "203.0.113.40" }],
+            "WGPublicKey": "DEmaint1WgPubKeyBase64FFFFFFFFFFFFFFFFFFFFFF="
+        }
+    ]
+}
