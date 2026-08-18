@@ -63,7 +63,13 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
   # One native-compiled binary per target — no cross/docker toolchain needed
-  # since every target below has a hosted GitHub-native runner.
+  # since every target below has a hosted GitHub-native runner. Pin explicit
+  # OS versions (not "-latest") for the macOS runners specifically: GitHub
+  # deprecates and removes older macOS images on its own schedule (macos-13
+  # was removed outright — a build queued against it forever with no runner
+  # ever assigned), so an explicit, currently-supported version is safer than
+  # a moving target. See https://github.com/actions/runner-images for the
+  # current image/label list before bumping these.
   build:
     needs: verify
     strategy:
@@ -75,9 +81,9 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15-intel
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
