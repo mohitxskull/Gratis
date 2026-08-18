@@ -23,6 +23,9 @@ pub enum ProtonError {
 
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
 }
 
 pub type Result<T> = std::result::Result<T, ProtonError>;

@@ -18,9 +18,12 @@ dirs = "5"
 # requires before trusting it. Correctness reference for the auth/session flow:
 # https://github.com/ProtonVPN/proton-vpn-cli
 proton-srp = { version = "0.8", features = ["pgpinternal"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+x509-parser = "0.16"
 
 [dev-dependencies]
 base64 = "0.22"
+tempfile = "3"
 
 [profile.release]
 # dev tool; keep default.

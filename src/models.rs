@@ -3,6 +3,7 @@
 //! Field names follow the JSON from Proton's API. The correctness reference for the
 //! auth/session/WireGuard flow is the official client:
 //! <https://github.com/ProtonVPN/proton-vpn-cli>
+use crate::errors::{ProtonError, Result};
 use serde::Deserialize;
 
 pub const PROTON_API_URL: &str = "https://api.protonvpn.ch";
@@ -37,11 +38,52 @@ pub struct VPNCredentials {
     pub wg_private_key: String,
 }
 
+/// Derive the client's WireGuard tunnel address from the X.509 Subject Alternative Name
+/// (IP entry) embedded in `VPNCredentials.certificate` (the `CertificatePEM` field).
+///
+/// **UNVERIFIED (Flagged gap #3):** no live Proton account was available to confirm that
+/// the client WireGuard tunnel address is in fact carried as a SAN IP entry on the client
+/// certificate. This is a best-effort inference based on how Proton's certificate-based
+/// WireGuard auth is documented to work (the cert binds the client to an IP that the server
+/// also assigns as the tunnel peer address). **This must be checked against a real login
+/// response before relying on it in production** — if wrong, swap this out for whatever
+/// field the live `/vpn/v2/account` (or connect) response actually carries.
+pub fn client_address_from_certificate(pem: &str) -> Result<String> {
+    let (_, pem_block) = x509_parser::pem::parse_x509_pem(pem.as_bytes())
+        .map_err(|e| ProtonError::Config(format!("invalid certificate PEM: {e}")))?;
+    let cert = pem_block
+        .parse_x509()
+        .map_err(|e| ProtonError::Config(format!("invalid X.509 certificate: {e}")))?;
+
+    let san = cert
+        .subject_alternative_name()
+        .map_err(|e| ProtonError::Config(format!("failed to read SAN extension: {e}")))?
+        .ok_or_else(|| ProtonError::Config("certificate has no SAN extension".into()))?;
+
+    for name in san.value.general_names.iter() {
+        if let x509_parser::extensions::GeneralName::IPAddress(ip) = name {
+            return match ip.len() {
+                4 => Ok(std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]).to_string()),
+                16 => {
+                    let mut octets = [0u8; 16];
+                    octets.copy_from_slice(ip);
+                    Ok(std::net::Ipv6Addr::from(octets).to_string())
+                }
+                _ => continue,
+            };
+        }
+    }
+
+    Err(ProtonError::Config(
+        "certificate SAN has no IP address entry".into(),
+    ))
+}
+
 /// `POST /auth/v4/info` response (SRP parameters).
 #[derive(Debug, Deserialize)]
 pub struct AuthInfo {
-    pub version: u32, // Protocol version (e.g. 4)
-    pub salt: String, // base64
+    pub version: u32,             // Protocol version (e.g. 4)
+    pub salt: String,             // base64
     pub server_ephemeral: String, // base64 (B)
     pub srp_session: String,
     pub modulus: String, // PGP-signed modulus message
