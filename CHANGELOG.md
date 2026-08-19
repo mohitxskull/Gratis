@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-08-19
+
+### Added
+
+- **bench**: Add a latency/throughput benchmark example
+
+### Documentation
+
+- Add CI/release badges, lead installation with binary download
+
+### Fixed
+
+- Lift Proton's restricted-session block via the local agent (#1)
+
+### Performance
+
+- **socks5**: Use atomic counters for tunnel stats instead of a mutex
+
 ## [0.1.0] — 2026-08-18
 
 ### Added
