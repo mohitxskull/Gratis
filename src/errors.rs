@@ -26,6 +26,13 @@ pub enum ProtonError {
 
     #[error("tunnel error: {0}")]
     Tunnel(#[from] wireguard_netstack::Error),
+
+    /// Failure anywhere in the Proton "local agent" handshake (`agent.rs`) — TLS setup,
+    /// the handshake itself, framing, or a reply that reports the session as jailed/restricted.
+    /// Always a soft failure from the caller's point of view: `manager.rs` falls back to the
+    /// readiness-probe wait rather than failing the connection outright.
+    #[error("local agent error: {0}")]
+    LocalAgent(String),
 }
 
 pub type Result<T> = std::result::Result<T, ProtonError>;

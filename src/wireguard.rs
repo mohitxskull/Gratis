@@ -1,8 +1,11 @@
 //! Userspace WireGuard tunnel — no root, no `sudo`, no real network interface.
 //!
 //! Verified live: a raw WireGuard handshake plus a real HTTP request/response through a
-//! tunnel built from exactly this key/config shape both succeeded, with no additional
-//! "Local Agent" authorization step Proton's official client otherwise performs. That means
+//! tunnel built from exactly this key/config shape both succeeded, without performing the
+//! "local agent" authorization step Proton's official client does. That is *nearly* true, with
+//! one important caveat found later: skipping the local agent leaves each new session in a
+//! restricted state for its first few seconds, during which external TLS specifically is
+//! blocked — see `Tunnel::wait_until_data_path_ready`, which waits that window out. That means
 //! this daemon can speak WireGuard entirely in-process via [`wireguard_netstack`] (itself
 //! built on `gotatun` + `smoltcp`) instead of shelling out to `sudo wg-quick` against a real
 //! kernel interface — a much better fit for "just run the binary" than the plan's original
@@ -16,7 +19,7 @@ use crate::models::{VPNCredentials, VPNServer};
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
@@ -31,6 +34,73 @@ pub const WG_PORT: u16 = 51820;
 /// (`wg_config.ipv4.address = "10.2.0.2"`, prefix `/32`): this is NOT derived per-account or
 /// per-connection at all.
 pub const CLIENT_ADDRESS: &str = "10.2.0.2";
+
+/// Endpoint used by [`Tunnel::wait_until_data_path_ready`]'s readiness probe.
+///
+/// A hard-coded anycast IP rather than a hostname on purpose: the probe runs while a tunnel is
+/// still coming up, and resolving a name first would add a DNS round trip (and a DNS failure
+/// mode) to a health check whose whole job is to answer one narrow question. `1.1.1.1:443` is a
+/// stable, globally anycast TLS endpoint, and the probe only needs *some* well-known TLS peer —
+/// no data is exchanged with it beyond a ClientHello and the first record of the reply.
+const PROBE_ENDPOINT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443);
+
+/// How long a fresh tunnel is given to become usable before it is served anyway. Measured
+/// live at ~4-5s across independent servers, so this is generous headroom for a slow one.
+const PROBE_BUDGET: Duration = Duration::from_secs(30);
+
+/// Gap between readiness probes.
+const PROBE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long a single probe waits for the peer's first TLS record before giving up on it.
+const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// TLS record content type for `Handshake` (RFC 8446 §5.1) — what a ServerHello arrives as.
+const TLS_CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
+
+/// A minimal, static TLS 1.2 ClientHello used solely as a readiness probe.
+///
+/// Hand-built rather than pulled from a TLS library because the probe never completes a
+/// handshake: it only needs enough of a valid ClientHello for the peer to answer with a
+/// ServerHello record, which is the signal that the tunnel's data path is live. Deliberately
+/// small (~90 bytes, one TCP segment) so the probe tests tunnel readiness rather than
+/// segmentation behaviour.
+fn probe_client_hello() -> Vec<u8> {
+    const SNI_HOST: &[u8] = b"one.one.one.one";
+
+    let mut extensions = Vec::new();
+    // server_name (0x0000)
+    extensions.extend_from_slice(&[0x00, 0x00]);
+    extensions.extend_from_slice(&((SNI_HOST.len() + 5) as u16).to_be_bytes());
+    extensions.extend_from_slice(&((SNI_HOST.len() + 3) as u16).to_be_bytes());
+    extensions.push(0x00); // host_name
+    extensions.extend_from_slice(&(SNI_HOST.len() as u16).to_be_bytes());
+    extensions.extend_from_slice(SNI_HOST);
+    // supported_groups (0x000a): secp256r1
+    extensions.extend_from_slice(&[0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x17]);
+    // ec_point_formats (0x000b): uncompressed
+    extensions.extend_from_slice(&[0x00, 0x0b, 0x00, 0x02, 0x01, 0x00]);
+    // signature_algorithms (0x000d): rsa_pkcs1_sha256
+    extensions.extend_from_slice(&[0x00, 0x0d, 0x00, 0x04, 0x00, 0x02, 0x04, 0x01]);
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x03, 0x03]); // client_version: TLS 1.2
+    body.extend_from_slice(&[0xAA; 32]); // random (fixed: nothing is negotiated)
+    body.push(0x00); // session_id: empty
+    body.extend_from_slice(&2u16.to_be_bytes());
+    body.extend_from_slice(&[0xc0, 0x2f]); // ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    body.extend_from_slice(&[0x01, 0x00]); // compression: null
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(&extensions);
+
+    let mut handshake = vec![0x01]; // ClientHello
+    handshake.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]); // u24 length
+    handshake.extend_from_slice(&body);
+
+    let mut record = vec![TLS_CONTENT_TYPE_HANDSHAKE, 0x03, 0x01];
+    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    record.extend_from_slice(&handshake);
+    record
+}
 
 fn decode_key(b64: &str) -> Result<[u8; 32]> {
     let bytes = BASE64
@@ -154,6 +224,102 @@ impl Tunnel {
         Ok(Self::Real(managed))
     }
 
+    /// Block until external TLS actually works through this tunnel, or [`PROBE_BUDGET`] elapses.
+    ///
+    /// ## The bug this fixes
+    ///
+    /// Proton admits a new WireGuard session in a **restricted state** and only lifts that
+    /// restriction once its "local agent" authenticates — or, if no agent ever shows up, after a
+    /// grace period of roughly four seconds. `gratis` does not implement the local agent (see
+    /// [`crate::models::VPNCredentials::certificate`]), so every fresh session spends those first
+    /// seconds restricted, and whichever client connection arrives first lands in that window and
+    /// fails.
+    ///
+    /// The restriction is oddly selective, which is what made this look like a random TLS bug:
+    ///
+    /// - TCP through the tunnel connects normally, and the far end even ACKs application data.
+    /// - Plain-HTTP requests succeed, including large multi-packet ones.
+    /// - But an external TLS handshake dies — the peer ACKs the entire ClientHello and then
+    ///   closes with a bare FIN, surfacing to users as `curl: (35)` /
+    ///   `SSL routines::unexpected eof while reading`.
+    ///
+    /// Evidence that this is Proton-side session state and not a local transport fault: during
+    /// the failing window a TLS connection to Proton's own local-agent endpoint
+    /// (`10.2.0.1:65432`) is answered *immediately* with a well-formed TLS alert, i.e. the tunnel
+    /// and its TLS path are fully functional while external TLS is being blocked.
+    ///
+    /// Ruled out by direct experiment: payload size (a hand-built 93-byte single-packet
+    /// ClientHello fails too), TCP segmentation and packet reordering (single packets fail, and a
+    /// 100 KiB plain-HTTP download through the same tunnel is byte-identical to a direct one),
+    /// tunnel MTU (1420 and 900 both tested; 1420 breaks the tunnel outright by exceeding the
+    /// path MTU after encapsulation), and destination reputation (two unrelated destinations fail
+    /// and then recover in lockstep on the same tunnel).
+    ///
+    /// ## Why a TLS probe
+    ///
+    /// The restriction only affects external TLS, so the readiness check has to *be* an external
+    /// TLS handshake. A bare TCP connect succeeds throughout the restricted window and would be a
+    /// useless signal. Measured live, a fresh tunnel passes after ~4 probes / 4-5s, consistently
+    /// across independent servers.
+    ///
+    /// Implementing the local agent would remove the wait entirely rather than wait it out, and
+    /// is the natural follow-up; it needs client-certificate TLS over the userspace tunnel plus
+    /// Proton's proprietary agent protocol, which is well beyond this fix.
+    ///
+    /// Best-effort by design: if the budget runs out the tunnel is still used, so a slow or
+    /// unhealthy server surfaces as a normal connection error rather than a silent stall.
+    pub(crate) async fn wait_until_data_path_ready(&self, server_name: &str) {
+        // The test loopback "tunnel" is a plain local TcpStream with no WireGuard session, so
+        // there is no warm-up window to wait out and no external endpoint to probe.
+        if matches!(self, Self::Loopback) {
+            return;
+        }
+
+        // Escape hatch for diagnosing the readiness window itself (see this method's docs):
+        // with the probe skipped, a fresh tunnel exhibits the raw upstream behaviour.
+        if std::env::var_os("GRATIS_SKIP_READINESS_PROBE").is_some() {
+            return;
+        }
+
+        let started = std::time::Instant::now();
+        let mut attempts = 0u32;
+
+        while started.elapsed() < PROBE_BUDGET {
+            attempts += 1;
+            if self.probe_once().await {
+                return;
+            }
+            tokio::time::sleep(PROBE_INTERVAL).await;
+        }
+
+        eprintln!(
+            "gratis: tunnel to {server_name} did not pass its readiness probe after {attempts} \
+             attempt(s) in {:?}; serving it anyway",
+            started.elapsed()
+        );
+    }
+
+    /// One readiness probe: open a TCP connection through the tunnel and perform the start of a
+    /// real TLS handshake, returning `true` only once the peer answers with a TLS record.
+    async fn probe_once(&self) -> bool {
+        let Ok(conn) = self.connect_tcp(PROBE_ENDPOINT).await else {
+            return false;
+        };
+
+        if conn.write_all(&probe_client_hello()).await.is_err() {
+            return false;
+        }
+
+        let mut buf = [0u8; 8];
+        let read = tokio::time::timeout(PROBE_READ_TIMEOUT, conn.read(&mut buf)).await;
+        conn.shutdown();
+
+        // TLS content type 0x16 = Handshake: the peer answered our ClientHello, so the data
+        // path genuinely works in both directions. Anything else (timeout, EOF, error) is
+        // exactly the failure mode being waited out.
+        matches!(read, Ok(Ok(n)) if n > 0 && buf[0] == TLS_CONTENT_TYPE_HANDSHAKE)
+    }
+
     /// A tunnel stand-in for tests — see [`Tunnel::Loopback`]'s doc comment.
     pub fn loopback_for_testing() -> Self {
         Self::Loopback
@@ -203,3 +369,49 @@ pub struct TunnelStats {
 /// `SharedTunnel` reference (once the manager has stopped spawning new SOCKS5 relay tasks
 /// against it and those tasks have exited) is sufficient to tear the tunnel down.
 pub type SharedTunnel = Arc<Tunnel>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The readiness probe is only meaningful if what it sends is a well-formed ClientHello —
+    /// a malformed one would draw an alert (or a close) from any peer and read as "still
+    /// restricted" forever, silently turning the readiness gate into a fixed delay.
+    #[test]
+    fn probe_client_hello_is_a_well_formed_handshake_record() {
+        let hello = probe_client_hello();
+
+        assert_eq!(
+            hello[0], TLS_CONTENT_TYPE_HANDSHAKE,
+            "TLS record: Handshake"
+        );
+        assert_eq!(
+            &hello[1..3],
+            &[0x03, 0x01],
+            "record version TLS 1.0 (compat)"
+        );
+
+        let record_len = u16::from_be_bytes([hello[3], hello[4]]) as usize;
+        assert_eq!(
+            record_len,
+            hello.len() - 5,
+            "record length must cover exactly the handshake that follows"
+        );
+
+        assert_eq!(hello[5], 0x01, "handshake type: ClientHello");
+        let handshake_len = u32::from_be_bytes([0, hello[6], hello[7], hello[8]]) as usize;
+        assert_eq!(
+            handshake_len,
+            hello.len() - 9,
+            "ClientHello body length must cover exactly the rest"
+        );
+
+        // Small enough to be a single TCP segment even at the tunnel's conservative MTU, so the
+        // probe measures Proton's session restriction rather than segmentation behaviour.
+        assert!(
+            hello.len() < 400,
+            "probe must fit one segment, got {}",
+            hello.len()
+        );
+    }
+}

@@ -16,7 +16,13 @@ use gratis::manager::TunnelManager;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "gratis", about = "Proton VPN client (WireGuard) daemon")]
+// `version` so a bug report can state exactly which build it came from — the README asks for
+// it when reporting a local-agent fallback (see `manager.rs`'s fallback log message).
+#[command(
+    name = "gratis",
+    version,
+    about = "Proton VPN client (WireGuard) daemon"
+)]
 struct Cli {
     /// Port the localhost control API + web UI listen on.
     #[arg(long, default_value = "9000")]
@@ -43,6 +49,7 @@ fn read_dotenv_var(path: &std::path::Path, key: &str) -> Option<String> {
 
 #[tokio::main]
 async fn main() {
+    env_logger::init();
     let cli = Cli::parse();
 
     let manager = Arc::new(TunnelManager::new(cli.port_range_start));

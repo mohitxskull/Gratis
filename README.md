@@ -131,9 +131,37 @@ with a `!` suffix or a `BREAKING CHANGE:` footer is flagged as breaking.
   whichever tunnel a `ServerSlot` currently holds.
 - **`src/client.rs`** — the Proton API client (SRP login, certificate issuance, server
   list).
+- **`src/agent.rs`** — Proton's "local agent" handshake. Proton admits a new WireGuard
+  session in a *restricted* state in which external TLS is blocked for a few seconds;
+  authenticating to the agent (client-certificate TLS to `10.2.0.1:65432`, verified against
+  Proton's pinned CAs in `assets/certs/`) lifts that immediately, which is what makes the
+  first connection to a server fast.
 
 Nothing is persisted to disk: every run is a fresh login, and no tunnel or server-list
 state survives a restart.
+
+## If gratis gets slow — please report it
+
+`gratis` depends on one piece of Proton behaviour that is undocumented and could change
+without warning: the local-agent handshake described above, including the Proton CA
+certificates pinned in `assets/certs/`.
+
+If Proton rotates those CAs or changes that protocol, **gratis keeps working** — it falls
+back to simply waiting out the restriction instead. You lose speed, not function. The
+symptom is that the **first** connection to each server becomes noticeably slower (roughly
+5 seconds instead of ~2), while later connections to the same server stay fast.
+
+When that happens the daemon prints, once per server, a line like:
+
+```
+gratis: local-agent handshake for US-FREE#1 failed (...); falling back to the readiness probe
+```
+
+**Please [open an issue](https://github.com/mohitxskull/Gratis/issues) and include that
+line**, plus the version you are running (`gratis --version` or the release you downloaded).
+The fallback means nothing is broken for you, so this is easy to miss — but it is the only
+signal that the pinned CAs or the agent protocol need updating, and a report is what makes
+that fix possible.
 
 ## Releasing
 
