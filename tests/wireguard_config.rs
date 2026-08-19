@@ -69,3 +69,58 @@ async fn tunnel_connect_errors_on_malformed_key() {
     };
     assert!(format!("{err}").contains("invalid base64 key"));
 }
+
+/// `connect_tcp` retries a failed attempt internally (see `wireguard.rs`'s
+/// `TCP_CONNECT_RETRY_BUDGET` doc comment for why: a fresh WireGuard tunnel needs a brief
+/// settling window before it reliably passes traffic, verified live against a real `gratis`
+/// daemon). This proves that retry actually recovers, using a real TCP listener that only
+/// starts accepting after a short delay to stand in for that settling window.
+///
+/// This is an integration test (not a `src/`-level unit test), so it links a normal
+/// (non-`cfg(test)`) build of the library — `TCP_CONNECT_RETRY_BUDGET` here is the real
+/// production value, not the shortened one `cargo test --lib` sees. Timings below are sized
+/// for that.
+#[tokio::test]
+async fn loopback_connect_tcp_retries_past_a_transient_refusal() {
+    // Reserve a port, then release it immediately — for a moment after this, connecting to it
+    // is refused (nothing listening), exactly like a tunnel whose data path isn't ready yet.
+    let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = reserved.local_addr().unwrap();
+    drop(reserved);
+
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if let Ok(listener) = tokio::net::TcpListener::bind(addr).await {
+            let _ = listener.accept().await;
+        }
+    });
+
+    let result = Tunnel::loopback_for_testing().connect_tcp(addr).await;
+    assert!(
+        result.is_ok(),
+        "a connect that's refused before the listener comes up must still succeed once it does, \
+         within the retry budget"
+    );
+}
+
+/// The other half of the same guarantee: `connect_tcp` must not retry forever when nothing is
+/// ever going to answer. See the note on the sibling test above about production-scale timing.
+#[tokio::test]
+async fn loopback_connect_tcp_gives_up_when_nothing_ever_listens() {
+    let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = reserved.local_addr().unwrap();
+    drop(reserved); // nothing listens on `addr` from here on
+
+    let started = std::time::Instant::now();
+    let result = Tunnel::loopback_for_testing().connect_tcp(addr).await;
+    assert!(
+        result.is_err(),
+        "a genuinely dead target must eventually fail, not hang forever"
+    );
+    // Generous upper bound: this only needs to prove the wait is actually bounded, not pin the
+    // exact production retry budget.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "must give up promptly rather than exhausting some much larger budget"
+    );
+}

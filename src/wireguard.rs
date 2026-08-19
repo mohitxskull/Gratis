@@ -57,6 +57,34 @@ const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(4);
 /// TLS record content type for `Handshake` (RFC 8446 §5.1) — what a ServerHello arrives as.
 const TLS_CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
 
+/// How long [`Tunnel::connect_tcp`] retries a fresh TCP connect through the tunnel before
+/// giving up.
+///
+/// Verified live: a `connect_tcp` attempt made immediately after a tunnel's WireGuard
+/// handshake completes regularly failed outright (SYN never answered, socket state going
+/// straight to `Closed`) while a retry moments later succeeded — for **plain, non-TLS**
+/// destinations too, so this is a different, more basic phenomenon than the TLS-specific
+/// restricted-session block `wait_until_data_path_ready`'s doc comment describes (that one
+/// claims bare TCP is unaffected). It also only reproduced reliably while many tunnels were
+/// being brought up concurrently, so it may be this process's userspace WireGuard/netstack
+/// tasks (each polling every 1ms — see `run_poll_loop` in the `wireguard-netstack` crate)
+/// losing the race for CPU time under load rather than anything server-side. Either way, a
+/// short retry here is the same defensive answer regardless of which it is, and unlike
+/// `wait_until_data_path_ready`'s ~30s TLS-probe budget (which only runs as a fallback when
+/// the local-agent unlock fails — see `manager.rs::unlock_tunnel`), this covers *every*
+/// `connect_tcp` call, including ones made right after a successful agent unlock that
+/// `unlock_tunnel` currently trusts without any further readiness check.
+#[cfg(not(test))]
+const TCP_CONNECT_RETRY_BUDGET: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const TCP_CONNECT_RETRY_BUDGET: Duration = Duration::from_millis(60);
+
+/// Pause between `connect_tcp` retries within [`TCP_CONNECT_RETRY_BUDGET`].
+#[cfg(not(test))]
+const TCP_CONNECT_RETRY_BACKOFF: Duration = Duration::from_millis(200);
+#[cfg(test)]
+const TCP_CONNECT_RETRY_BACKOFF: Duration = Duration::from_millis(5);
+
 /// A minimal, static TLS 1.2 ClientHello used solely as a readiness probe.
 ///
 /// Hand-built rather than pulled from a TLS library because the probe never completes a
@@ -325,8 +353,26 @@ impl Tunnel {
         Self::Loopback
     }
 
-    /// Open a TCP connection to `addr` through this tunnel.
+    /// Open a TCP connection to `addr` through this tunnel, retrying a failed attempt for a
+    /// short bounded window (see `TCP_CONNECT_RETRY_BUDGET`'s doc comment in this module's
+    /// source for why).
     pub async fn connect_tcp(&self, addr: SocketAddr) -> Result<Box<dyn TunnelConnection>> {
+        let deadline = std::time::Instant::now() + TCP_CONNECT_RETRY_BUDGET;
+        loop {
+            match self.connect_tcp_once(addr).await {
+                Ok(conn) => return Ok(conn),
+                Err(err) => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(err);
+                    }
+                    tokio::time::sleep(TCP_CONNECT_RETRY_BACKOFF.min(remaining)).await;
+                }
+            }
+        }
+    }
+
+    async fn connect_tcp_once(&self, addr: SocketAddr) -> Result<Box<dyn TunnelConnection>> {
         match self {
             Self::Real(managed) => {
                 let conn =
