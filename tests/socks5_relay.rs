@@ -75,9 +75,7 @@ async fn spawn_proxy() -> u16 {
         let _ = gratis::socks5::run_socks5(
             &listen_addr,
             source,
-            std::sync::Arc::new(std::sync::Mutex::new(
-                gratis::wireguard::TunnelStats::default(),
-            )),
+            std::sync::Arc::new(gratis::wireguard::TunnelStats::default()),
         )
         .await;
     });

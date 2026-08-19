@@ -26,7 +26,7 @@ use crate::wireguard::{SharedTunnel, TunnelStats};
 use async_trait::async_trait;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -89,7 +89,7 @@ impl Drop for ReleaseGuard {
 pub async fn run_socks5(
     listen_addr: &str,
     source: Arc<dyn TunnelSource>,
-    stats: Arc<Mutex<TunnelStats>>,
+    stats: Arc<TunnelStats>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(listen_addr).await?;
 
@@ -116,7 +116,7 @@ pub async fn run_socks5(
 async fn handle_client(
     mut client: TcpStream,
     source: Arc<dyn TunnelSource>,
-    stats: Arc<Mutex<TunnelStats>>,
+    stats: Arc<TunnelStats>,
 ) -> io::Result<()> {
     negotiate_method(&mut client).await?;
 
@@ -299,7 +299,7 @@ fn local_v4_zero() -> SocketAddr {
 async fn relay(
     client: TcpStream,
     outbound: Box<dyn crate::wireguard::TunnelConnection>,
-    stats: Arc<Mutex<TunnelStats>>,
+    stats: Arc<TunnelStats>,
 ) -> io::Result<()> {
     let (mut client_rd, mut client_wr) = client.into_split();
 
@@ -311,7 +311,7 @@ async fn relay(
                 break;
             }
             outbound.write_all(&buf[..n]).await?;
-            stats.lock().unwrap().bytes_sent += n as u64;
+            stats.add_sent(n as u64);
         }
         outbound.shutdown();
         Ok::<(), io::Error>(())
@@ -325,7 +325,7 @@ async fn relay(
                 break;
             }
             client_wr.write_all(&buf[..n]).await?;
-            stats.lock().unwrap().bytes_received += n as u64;
+            stats.add_received(n as u64);
         }
         let _ = client_wr.shutdown().await;
         Ok::<(), io::Error>(())

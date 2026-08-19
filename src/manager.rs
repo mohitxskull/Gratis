@@ -95,7 +95,7 @@ pub trait TunnelDriver: Send + Sync {
         &self,
         listen_addr: String,
         source: Arc<dyn TunnelSource>,
-        stats: Arc<Mutex<TunnelStats>>,
+        stats: Arc<TunnelStats>,
     ) -> JoinHandle<()>;
 }
 
@@ -118,7 +118,7 @@ impl TunnelDriver for RealDriver {
         &self,
         listen_addr: String,
         source: Arc<dyn TunnelSource>,
-        stats: Arc<Mutex<TunnelStats>>,
+        stats: Arc<TunnelStats>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             if let Err(err) = socks5::run_socks5(&listen_addr, source, stats).await {
@@ -137,7 +137,7 @@ struct ServerSlot {
     creds: VPNCredentials,
     driver: Arc<dyn TunnelDriver>,
     port: u16,
-    stats: Arc<Mutex<TunnelStats>>,
+    stats: Arc<TunnelStats>,
 
     tunnel: Mutex<Option<SharedTunnel>>,
     connected_at: Mutex<Option<Instant>>,
@@ -179,7 +179,7 @@ impl ServerSlot {
             creds,
             driver,
             port,
-            stats: Arc::new(Mutex::new(TunnelStats::default())),
+            stats: Arc::new(TunnelStats::default()),
             tunnel: Mutex::new(None),
             connected_at: Mutex::new(None),
             idle_deadline: Mutex::new(None),
@@ -255,7 +255,6 @@ impl ServerSlot {
         let tunnel = self.tunnel.lock().unwrap().clone();
         let connected_at = *self.connected_at.lock().unwrap();
         let idle_deadline = *self.idle_deadline.lock().unwrap();
-        let stats = self.stats.lock().unwrap();
         ServerStatus {
             name: self.server.name.clone(),
             country: self.server.country.clone(),
@@ -272,8 +271,8 @@ impl ServerSlot {
                 .map(|d| d.as_secs()),
             idle_countdown_secs: idle_deadline
                 .map(|d| d.saturating_duration_since(Instant::now()).as_secs()),
-            bytes_sent: stats.bytes_sent,
-            bytes_received: stats.bytes_received,
+            bytes_sent: self.stats.bytes_sent(),
+            bytes_received: self.stats.bytes_received(),
         }
     }
 }
@@ -503,7 +502,7 @@ mod tests {
             &self,
             _listen_addr: String,
             _source: Arc<dyn TunnelSource>,
-            _stats: Arc<Mutex<TunnelStats>>,
+            _stats: Arc<TunnelStats>,
         ) -> JoinHandle<()> {
             tokio::spawn(async {
                 // Stand in for `run_socks5`'s infinite accept loop: never returns on its own.

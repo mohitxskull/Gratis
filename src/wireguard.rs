@@ -353,12 +353,34 @@ impl Tunnel {
 }
 
 /// Cumulative bytes relayed through a tunnel's SOCKS5 proxy.
+///
+/// Atomic counters rather than a `Mutex`-guarded struct: `relay`'s two directions each bump
+/// one of these on every single read, and a blocking lock has no reason to sit on that path
+/// when a lock-free `fetch_add` does the same job.
 #[derive(Default)]
 pub struct TunnelStats {
     /// Bytes from the local client out to the tunnel/Internet (upload).
-    pub bytes_sent: u64,
+    bytes_sent: std::sync::atomic::AtomicU64,
     /// Bytes from the tunnel/Internet back to the local client (download).
-    pub bytes_received: u64,
+    bytes_received: std::sync::atomic::AtomicU64,
+}
+
+impl TunnelStats {
+    pub fn add_sent(&self, n: u64) {
+        self.bytes_sent.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn add_received(&self, n: u64) {
+        self.bytes_received.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn bytes_sent(&self) -> u64 {
+        self.bytes_sent.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn bytes_received(&self) -> u64 {
+        self.bytes_received.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Shared handle to a running tunnel, so both the manager and the SOCKS5 relay tasks it spawns
