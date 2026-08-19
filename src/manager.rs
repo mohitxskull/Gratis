@@ -51,6 +51,45 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 #[cfg(test)]
 const IDLE_TIMEOUT: Duration = Duration::from_millis(150);
 
+/// How long `acquire` keeps retrying a fresh WireGuard connect attempt for a cold slot before
+/// giving up and failing the caller's SOCKS5 connection.
+///
+/// Free-tier Proton exits are flaky enough that a single failed handshake attempt often just
+/// means "try again," not "this server is down" — verified live: a cold port's very first
+/// touch regularly failed outright while a retry moments later succeeded. Without this, every
+/// caller unlucky enough to be first to touch a cold slot ate that one failed attempt instead
+/// of the tunnel it asked for.
+///
+/// Shortened under `cfg(test)` for the same reason as [`IDLE_TIMEOUT`]: exercising the
+/// give-up-after-budget path shouldn't require a real multi-second sleep in the test suite.
+#[cfg(not(test))]
+const CONNECT_RETRY_BUDGET: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const CONNECT_RETRY_BUDGET: Duration = Duration::from_millis(100);
+
+/// Pause between connect retries within [`CONNECT_RETRY_BUDGET`], so a persistently-dead server
+/// doesn't get hammered with back-to-back handshake attempts for the whole budget.
+#[cfg(not(test))]
+const CONNECT_RETRY_BACKOFF: Duration = Duration::from_millis(300);
+#[cfg(test)]
+const CONNECT_RETRY_BACKOFF: Duration = Duration::from_millis(10);
+
+/// Hard cap on a single connect attempt within the retry loop, enforced by wrapping the
+/// attempt in [`tokio::time::timeout`] ourselves rather than trusting `wireguard-netstack`'s
+/// own internal timing.
+///
+/// This matters because `wireguard-netstack::Tunnel::connect()` defaults to a **10-second**
+/// handshake timeout, and its `netstack.rs` has several more internal 30-second polling loops
+/// that aren't even bounded by that parameter — so a single attempt against a genuinely
+/// unresponsive server (the dominant failure mode for free-tier exits, as opposed to an instant
+/// rejection) could otherwise burn most or all of [`CONNECT_RETRY_BUDGET`] on its own, leaving
+/// no room to actually retry. Capping each attempt well below the overall budget guarantees
+/// multiple independent attempts fit inside it.
+#[cfg(not(test))]
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(test)]
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(25);
+
 /// How long a successful readiness check is trusted before `acquire` re-checks.
 ///
 /// Proton's restricted-session window is not a one-off at connect time: WireGuard rekeys roughly
@@ -201,6 +240,47 @@ impl ServerSlot {
             .is_some_and(|t| t.elapsed() < READINESS_TTL)
     }
 
+    /// Bring up a fresh tunnel for this slot, retrying a failed handshake attempt rather than
+    /// failing the caller on the first miss — see [`CONNECT_RETRY_BUDGET`]. Only called with
+    /// `connect_lock` already held, so retries here never race a concurrent connect attempt for
+    /// the same slot.
+    async fn connect_with_retry(&self) -> Result<SharedTunnel> {
+        let deadline = Instant::now() + CONNECT_RETRY_BUDGET;
+        let mut last_err = ProtonError::Config("connect retry budget was zero".into());
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(last_err);
+            }
+
+            // Cap each attempt well below the overall budget ourselves — see
+            // `CONNECT_ATTEMPT_TIMEOUT`'s doc comment for why the underlying crate's own
+            // timeout can't be trusted to bound this on its own.
+            let attempt_timeout = remaining.min(CONNECT_ATTEMPT_TIMEOUT);
+            match tokio::time::timeout(
+                attempt_timeout,
+                self.driver.connect_tunnel(&self.server, &self.creds),
+            )
+            .await
+            {
+                Ok(Ok(tunnel)) => return Ok(tunnel),
+                Ok(Err(err)) => last_err = err,
+                Err(_elapsed) => {
+                    last_err = ProtonError::Config(format!(
+                        "connect attempt did not finish within {attempt_timeout:?}"
+                    ));
+                }
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(last_err);
+            }
+            tokio::time::sleep(CONNECT_RETRY_BACKOFF.min(remaining)).await;
+        }
+    }
+
     /// Make a freshly (re)connected tunnel immediately usable.
     ///
     /// Primary path: Proton's "local agent" handshake (`agent.rs`), which — verified live
@@ -306,7 +386,7 @@ impl TunnelSource for ServerSlot {
         let already_connected = self.tunnel.lock().unwrap().clone();
         let tunnel = match already_connected {
             Some(tunnel) => tunnel,
-            None => match self.driver.connect_tunnel(&self.server, &self.creds).await {
+            None => match self.connect_with_retry().await {
                 Ok(tunnel) => {
                     *self.tunnel.lock().unwrap() = Some(tunnel.clone());
                     *self.connected_at.lock().unwrap() = Some(Instant::now());
@@ -511,6 +591,130 @@ mod tests {
         }
     }
 
+    /// Fails `connect_tunnel` the first `fail_count` times it's called, then succeeds — stands
+    /// in for a flaky free-tier server that answers on a retry rather than the first attempt.
+    struct FlakyDriver {
+        remaining_failures: std::sync::atomic::AtomicU32,
+    }
+
+    #[async_trait]
+    impl TunnelDriver for FlakyDriver {
+        async fn connect_tunnel(
+            &self,
+            _server: &VPNServer,
+            _creds: &VPNCredentials,
+        ) -> Result<SharedTunnel> {
+            if self
+                .remaining_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    if n == 0 { None } else { Some(n - 1) }
+                })
+                .is_ok()
+            {
+                return Err(ProtonError::Config("simulated flaky handshake".into()));
+            }
+            Ok(Arc::new(Tunnel::loopback_for_testing()))
+        }
+
+        fn spawn_socks5(
+            &self,
+            _listen_addr: String,
+            _source: Arc<dyn TunnelSource>,
+            _stats: Arc<TunnelStats>,
+        ) -> JoinHandle<()> {
+            tokio::spawn(async {
+                std::future::pending::<()>().await;
+            })
+        }
+    }
+
+    /// Always fails `connect_tunnel` — stands in for a genuinely dead server.
+    #[derive(Default)]
+    struct AlwaysFailDriver;
+
+    #[async_trait]
+    impl TunnelDriver for AlwaysFailDriver {
+        async fn connect_tunnel(
+            &self,
+            _server: &VPNServer,
+            _creds: &VPNCredentials,
+        ) -> Result<SharedTunnel> {
+            Err(ProtonError::Config("simulated dead server".into()))
+        }
+
+        fn spawn_socks5(
+            &self,
+            _listen_addr: String,
+            _source: Arc<dyn TunnelSource>,
+            _stats: Arc<TunnelStats>,
+        ) -> JoinHandle<()> {
+            tokio::spawn(async {
+                std::future::pending::<()>().await;
+            })
+        }
+    }
+
+    /// Never resolves on its first call, then succeeds instantly after that — stands in for a
+    /// server whose handshake just never completes (as opposed to failing outright), which is
+    /// the failure mode [`CONNECT_ATTEMPT_TIMEOUT`] exists to bound.
+    struct HangsOnceThenSucceedsDriver {
+        hung_once: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl TunnelDriver for HangsOnceThenSucceedsDriver {
+        async fn connect_tunnel(
+            &self,
+            _server: &VPNServer,
+            _creds: &VPNCredentials,
+        ) -> Result<SharedTunnel> {
+            if !self.hung_once.swap(true, Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+                unreachable!("pending() never resolves");
+            }
+            Ok(Arc::new(Tunnel::loopback_for_testing()))
+        }
+
+        fn spawn_socks5(
+            &self,
+            _listen_addr: String,
+            _source: Arc<dyn TunnelSource>,
+            _stats: Arc<TunnelStats>,
+        ) -> JoinHandle<()> {
+            tokio::spawn(async {
+                std::future::pending::<()>().await;
+            })
+        }
+    }
+
+    /// Never resolves, ever — stands in for a server that's completely unresponsive on every
+    /// attempt.
+    #[derive(Default)]
+    struct AlwaysHangsDriver;
+
+    #[async_trait]
+    impl TunnelDriver for AlwaysHangsDriver {
+        async fn connect_tunnel(
+            &self,
+            _server: &VPNServer,
+            _creds: &VPNCredentials,
+        ) -> Result<SharedTunnel> {
+            std::future::pending::<()>().await;
+            unreachable!("pending() never resolves");
+        }
+
+        fn spawn_socks5(
+            &self,
+            _listen_addr: String,
+            _source: Arc<dyn TunnelSource>,
+            _stats: Arc<TunnelStats>,
+        ) -> JoinHandle<()> {
+            tokio::spawn(async {
+                std::future::pending::<()>().await;
+            })
+        }
+    }
+
     const TEST_CERT_PEM: &str =
         "-----BEGIN CERTIFICATE-----\ntest-only-placeholder\n-----END CERTIFICATE-----";
 
@@ -549,11 +753,14 @@ mod tests {
     /// (bypassing `login()`'s network path), for exercising `TunnelSource`/`servers()`
     /// bookkeeping in isolation.
     fn manager_with_one_slot(port: u16) -> (Arc<TunnelManager>, Arc<ServerSlot>) {
-        let driver = Arc::new(FakeDriver::default());
-        let manager = Arc::new(TunnelManager::with_driver(
-            port,
-            driver.clone() as Arc<dyn TunnelDriver>,
-        ));
+        slot_with_driver(port, Arc::new(FakeDriver::default()))
+    }
+
+    fn slot_with_driver(
+        port: u16,
+        driver: Arc<dyn TunnelDriver>,
+    ) -> (Arc<TunnelManager>, Arc<ServerSlot>) {
+        let manager = Arc::new(TunnelManager::with_driver(port, driver.clone()));
         let slot = ServerSlot::new(test_server("srv-1", "US"), test_creds(), driver, port);
         manager.slots.lock().unwrap().push(slot.clone());
         (manager, slot)
@@ -621,5 +828,77 @@ mod tests {
             "a fresh connection must invalidate the previous idle timer"
         );
         assert_eq!(manager.servers()[0].open_connections, 1);
+    }
+
+    #[tokio::test]
+    async fn acquire_retries_past_a_transient_connect_failure() {
+        let driver = Arc::new(FlakyDriver {
+            remaining_failures: std::sync::atomic::AtomicU32::new(2),
+        });
+        let (manager, slot) = slot_with_driver(20400, driver);
+
+        let result = slot.acquire().await;
+        assert!(
+            result.is_ok(),
+            "a connect attempt that fails twice then succeeds must still yield a tunnel \
+             within the retry budget"
+        );
+        assert!(manager.servers()[0].connected);
+    }
+
+    #[tokio::test]
+    async fn acquire_gives_up_once_the_retry_budget_is_exceeded() {
+        let (_manager, slot) = slot_with_driver(20500, Arc::new(AlwaysFailDriver));
+
+        let started = Instant::now();
+        let result = slot.acquire().await;
+        assert!(
+            result.is_err(),
+            "a permanently dead server must eventually fail"
+        );
+        assert!(
+            started.elapsed() >= CONNECT_RETRY_BUDGET,
+            "must not give up before spending the full retry budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_abandons_an_attempt_that_never_finishes_and_retries() {
+        let driver = Arc::new(HangsOnceThenSucceedsDriver {
+            hung_once: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (manager, slot) = slot_with_driver(20600, driver);
+
+        let started = Instant::now();
+        let result = slot.acquire().await;
+        assert!(
+            result.is_ok(),
+            "an attempt stuck past CONNECT_ATTEMPT_TIMEOUT must be abandoned and retried, not \
+             left to block the whole retry budget"
+        );
+        assert!(manager.servers()[0].connected);
+        assert!(
+            started.elapsed() < CONNECT_RETRY_BUDGET,
+            "recovering on the second attempt must not cost the entire retry budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_gives_up_promptly_when_every_attempt_hangs_forever() {
+        let (_manager, slot) = slot_with_driver(20700, Arc::new(AlwaysHangsDriver));
+
+        let started = Instant::now();
+        let result = slot.acquire().await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "a server that never responds must eventually fail, not hang the caller forever"
+        );
+        assert!(
+            elapsed < CONNECT_RETRY_BUDGET * 3,
+            "must give up close to the retry budget even when every individual attempt hangs \
+             indefinitely (elapsed: {elapsed:?})"
+        );
     }
 }
