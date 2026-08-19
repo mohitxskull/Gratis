@@ -367,11 +367,13 @@ pub struct TunnelStats {
 
 impl TunnelStats {
     pub fn add_sent(&self, n: u64) {
-        self.bytes_sent.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        self.bytes_sent
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn add_received(&self, n: u64) {
-        self.bytes_received.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        self.bytes_received
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn bytes_sent(&self) -> u64 {
@@ -379,7 +381,8 @@ impl TunnelStats {
     }
 
     pub fn bytes_received(&self) -> u64 {
-        self.bytes_received.load(std::sync::atomic::Ordering::Relaxed)
+        self.bytes_received
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

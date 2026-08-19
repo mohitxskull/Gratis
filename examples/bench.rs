@@ -89,16 +89,7 @@ async fn main() -> Result<()> {
     let mut reports = Vec::new();
 
     println!("--- direct (no proxy) baseline ---");
-    reports.push(
-        bench_target(
-            "direct",
-            None,
-            latency_ip,
-            throughput_ip,
-            &args,
-        )
-        .await?,
-    );
+    reports.push(bench_target("direct", None, latency_ip, throughput_ip, &args).await?);
 
     for port in targets {
         let label = servers
@@ -107,9 +98,7 @@ async fn main() -> Result<()> {
             .map(|s| format!("{port} ({})", s.name))
             .unwrap_or_else(|| port.to_string());
         println!("--- {label} ---");
-        reports.push(
-            bench_target(&label, Some(port), latency_ip, throughput_ip, &args).await?,
-        );
+        reports.push(bench_target(&label, Some(port), latency_ip, throughput_ip, &args).await?);
     }
 
     print_summary(&reports);
@@ -149,7 +138,11 @@ async fn resolve_one(host: &str) -> Result<IpAddr> {
         .with_context(|| format!("{host} resolved to no addresses"))
 }
 
-fn build_client(port: Option<u16>, latency_ip: IpAddr, throughput_ip: IpAddr) -> Result<reqwest::Client> {
+fn build_client(
+    port: Option<u16>,
+    latency_ip: IpAddr,
+    throughput_ip: IpAddr,
+) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
 
     if let Some(port) = port {
@@ -234,7 +227,11 @@ async fn time_request(client: &reqwest::Client) -> Result<Duration> {
 async fn time_download(client: &reqwest::Client, bytes: usize) -> Result<(usize, Duration)> {
     let url = format!("{THROUGHPUT_URL}?bytes={bytes}");
     let started = Instant::now();
-    let resp = client.get(&url).send().await.context("throughput request")?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .context("throughput request")?;
     let body = resp.bytes().await.context("reading throughput response")?;
     Ok((body.len(), started.elapsed()))
 }
