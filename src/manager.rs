@@ -51,6 +51,15 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 #[cfg(test)]
 const IDLE_TIMEOUT: Duration = Duration::from_millis(150);
 
+/// How long a successful readiness check is trusted before `acquire` re-checks.
+///
+/// Proton's restricted-session window is not a one-off at connect time: WireGuard rekeys roughly
+/// every two minutes, and a connection opened just after a rekey hits the same restriction (
+/// verified live — a slot idle for ~2 minutes failed its next 3-4 TLS connections, while a
+/// continuously-used slot stayed at 5/5). Re-verifying after this much inactivity covers that
+/// without charging the probe to back-to-back connections, which are the common case.
+const READINESS_TTL: Duration = Duration::from_secs(30);
+
 /// Account tier used to filter the server list to what's actually reachable.
 ///
 /// `client.rs`/`models.rs` don't currently surface the account's actual tier anywhere the
@@ -141,8 +150,12 @@ struct ServerSlot {
     /// idle-teardown timer only acts if this hasn't moved since it was spawned — see
     /// `release`'s doc comment for why that matters.
     idle_generation: AtomicU64,
-    /// Serializes the actual `connect_tunnel` call so concurrent connections to the same
-    /// (not-yet-connected) server can't race each other into two tunnels.
+    /// When external TLS through this slot's tunnel was last confirmed to work. Drives
+    /// re-verification in `acquire` — see [`READINESS_TTL`].
+    verified_at: Mutex<Option<Instant>>,
+    /// Serializes the actual `connect_tunnel` call — and the readiness check that follows it —
+    /// so concurrent connections to the same server can't race each other into two tunnels or
+    /// into redundant probes.
     connect_lock: AsyncMutex<()>,
     /// Lets `release` spawn a self-referencing idle-teardown task without `ServerSlot` needing
     /// to already know its own `Arc` at construction time (see `ServerSlot::new`).
@@ -167,9 +180,19 @@ impl ServerSlot {
             idle_deadline: Mutex::new(None),
             open_connections: AtomicU32::new(0),
             idle_generation: AtomicU64::new(0),
+            verified_at: Mutex::new(None),
             connect_lock: AsyncMutex::new(()),
             self_ref: weak.clone(),
         })
+    }
+
+    /// Whether external TLS through this slot was confirmed working recently enough to trust
+    /// without re-checking — see [`READINESS_TTL`].
+    fn recently_verified(&self) -> bool {
+        self.verified_at
+            .lock()
+            .unwrap()
+            .is_some_and(|t| t.elapsed() < READINESS_TTL)
     }
 
     fn status(&self) -> ServerStatus {
@@ -209,30 +232,49 @@ impl TunnelSource for ServerSlot {
         self.idle_generation.fetch_add(1, Ordering::SeqCst);
         *self.idle_deadline.lock().unwrap() = None;
 
-        if let Some(tunnel) = self.tunnel.lock().unwrap().clone() {
+        // Fast path: an already-connected tunnel that was recently confirmed working. This is
+        // every connection after the first, so the common case takes no locks beyond these.
+        let existing = self.tunnel.lock().unwrap().clone();
+        if let Some(tunnel) = existing
+            && self.recently_verified()
+        {
             return Ok(tunnel);
         }
 
-        // Only one connect attempt per slot at a time; a second connection arriving while the
-        // first is still handshaking waits here, then finds `tunnel` already set below.
+        // Only one connect-and-verify per slot at a time; concurrent connections arriving while
+        // the first is still establishing wait here rather than racing into two tunnels or
+        // firing redundant readiness probes.
         let _connect_guard = self.connect_lock.lock().await;
-        if let Some(tunnel) = self.tunnel.lock().unwrap().clone() {
-            return Ok(tunnel);
+
+        // Bind the clone out of the guard first: holding a std MutexGuard across the `await`
+        // below would make this future non-Send.
+        let already_connected = self.tunnel.lock().unwrap().clone();
+        let tunnel = match already_connected {
+            Some(tunnel) => tunnel,
+            None => match self.driver.connect_tunnel(&self.server, &self.creds).await {
+                Ok(tunnel) => {
+                    *self.tunnel.lock().unwrap() = Some(tunnel.clone());
+                    *self.connected_at.lock().unwrap() = Some(Instant::now());
+                    // A newly connected tunnel is restricted by Proton until it proves otherwise.
+                    *self.verified_at.lock().unwrap() = None;
+                    tunnel
+                }
+                Err(err) => {
+                    // Undo the increment above: this connection never got a tunnel, so it must
+                    // not be counted as "open" for idle-teardown purposes.
+                    self.open_connections.fetch_sub(1, Ordering::SeqCst);
+                    return Err(Box::new(err));
+                }
+            },
+        };
+
+        // Re-check under the lock: a concurrent caller may have just verified this tunnel.
+        if !self.recently_verified() {
+            tunnel.wait_until_data_path_ready(&self.server.name).await;
+            *self.verified_at.lock().unwrap() = Some(Instant::now());
         }
 
-        match self.driver.connect_tunnel(&self.server, &self.creds).await {
-            Ok(tunnel) => {
-                *self.tunnel.lock().unwrap() = Some(tunnel.clone());
-                *self.connected_at.lock().unwrap() = Some(Instant::now());
-                Ok(tunnel)
-            }
-            Err(err) => {
-                // Undo the increment above: this connection never got a tunnel, so it must not
-                // be counted as "open" for idle-teardown purposes.
-                self.open_connections.fetch_sub(1, Ordering::SeqCst);
-                Err(Box::new(err))
-            }
-        }
+        Ok(tunnel)
     }
 
     fn release(&self) {

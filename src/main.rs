@@ -43,6 +43,7 @@ fn read_dotenv_var(path: &std::path::Path, key: &str) -> Option<String> {
 
 #[tokio::main]
 async fn main() {
+    env_logger::init();
     let cli = Cli::parse();
 
     let manager = Arc::new(TunnelManager::new(cli.port_range_start));
