@@ -38,6 +38,14 @@ wireguard-netstack = "0.3"
 async-trait = "0.1"
 askama = "0.16"
 env_logger = "0.11.11"
+# WHY: implements Proton's "local agent" handshake (see `agent.rs`) — client-cert TLS to
+# 10.2.0.1:65432 through the userspace tunnel, which is what actually lifts Proton's
+# restricted-session block instead of waiting it out. Pinned to the same rustls major `reqwest`
+# already pulls in via its `rustls-tls` feature (see the lockfile) so there is only ever one
+# rustls dependency graph in the binary, not two competing majors.
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
 
 [dev-dependencies]
 base64 = "0.22"

@@ -35,7 +35,7 @@ use crate::socks5::{self, SourceError, TunnelSource};
 use crate::wireguard::{SharedTunnel, Tunnel, TunnelStats};
 use async_trait::async_trait;
 use serde::Serialize;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
@@ -153,6 +153,11 @@ struct ServerSlot {
     /// When external TLS through this slot's tunnel was last confirmed to work. Drives
     /// re-verification in `acquire` — see [`READINESS_TTL`].
     verified_at: Mutex<Option<Instant>>,
+    /// Whether the current run of local-agent handshake failures for this slot has already been
+    /// logged — see `unlock_tunnel`. Set on the first failure, cleared on the next success, so a
+    /// persistent problem (e.g. a genuinely jailed account) prints once instead of on every
+    /// `READINESS_TTL` re-verification.
+    agent_failure_logged: AtomicBool,
     /// Serializes the actual `connect_tunnel` call — and the readiness check that follows it —
     /// so concurrent connections to the same server can't race each other into two tunnels or
     /// into redundant probes.
@@ -181,6 +186,7 @@ impl ServerSlot {
             open_connections: AtomicU32::new(0),
             idle_generation: AtomicU64::new(0),
             verified_at: Mutex::new(None),
+            agent_failure_logged: AtomicBool::new(false),
             connect_lock: AsyncMutex::new(()),
             self_ref: weak.clone(),
         })
@@ -193,6 +199,51 @@ impl ServerSlot {
             .lock()
             .unwrap()
             .is_some_and(|t| t.elapsed() < READINESS_TTL)
+    }
+
+    /// Make a freshly (re)connected tunnel immediately usable.
+    ///
+    /// Primary path: Proton's "local agent" handshake (`agent.rs`), which — verified live
+    /// — lifts Proton's restricted-session block in well under a second instead of the ~4-5s the
+    /// old readiness probe had to wait out. Any failure there (network hiccup, TLS/cert issue, a
+    /// protocol change on Proton's side, or a reply that reports the session as genuinely
+    /// jailed/restricted) is logged and followed by the readiness probe as a fallback, so a
+    /// broken local-agent path degrades gratis back to its previous behaviour rather than
+    /// breaking connections.
+    async fn unlock_tunnel(&self, tunnel: &Tunnel) {
+        let sni = self.server.pick_physical().map(|p| p.domain.as_str());
+
+        let agent_result = match sni {
+            Some(sni) => crate::agent::unlock(tunnel, sni, &self.creds).await,
+            None => Err(ProtonError::Config(format!(
+                "server {} has no physical servers to derive a local-agent SNI from",
+                self.server.name
+            ))),
+        };
+
+        match agent_result {
+            Ok(()) => {
+                // A successful handshake means whatever was previously failing (if anything) is
+                // no longer happening — clear the flag so a genuinely new failure later gets
+                // logged again rather than staying silent because of an old one.
+                self.agent_failure_logged.store(false, Ordering::SeqCst);
+            }
+            Err(err) => {
+                // Log the first occurrence of a given failure loudly, but not every single
+                // acquire while the same problem persists (e.g. a jailed account gets
+                // re-verified every `READINESS_TTL`) — that would just be the same message
+                // repeated forever alongside the ~5s fallback wait it already costs.
+                if !self.agent_failure_logged.swap(true, Ordering::SeqCst) {
+                    eprintln!(
+                        "gratis: local-agent handshake for {} failed ({err}); falling back to \
+                         the readiness probe (further repeats of this failure will be silent \
+                         until it clears)",
+                        self.server.name
+                    );
+                }
+                tunnel.wait_until_data_path_ready(&self.server.name).await;
+            }
+        }
     }
 
     fn status(&self) -> ServerStatus {
@@ -270,7 +321,7 @@ impl TunnelSource for ServerSlot {
 
         // Re-check under the lock: a concurrent caller may have just verified this tunnel.
         if !self.recently_verified() {
-            tunnel.wait_until_data_path_ready(&self.server.name).await;
+            self.unlock_tunnel(tunnel.as_ref()).await;
             *self.verified_at.lock().unwrap() = Some(Instant::now());
         }
 
