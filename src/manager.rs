@@ -236,8 +236,13 @@ impl ServerSlot {
                 if !self.agent_failure_logged.swap(true, Ordering::SeqCst) {
                     eprintln!(
                         "gratis: local-agent handshake for {} failed ({err}); falling back to \
-                         the readiness probe (further repeats of this failure will be silent \
-                         until it clears)",
+                         the readiness probe, so connections still work but the first one to \
+                         each server is ~5s slower (further repeats of this failure will be \
+                         silent until it clears).\n\
+                         gratis: if this persists, Proton has most likely changed the agent \
+                         protocol or rotated its pinned CAs — please report it with this \
+                         message at https://github.com/mohitxskull/Gratis/issues so it can be \
+                         updated.",
                         self.server.name
                     );
                 }
