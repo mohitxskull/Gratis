@@ -380,6 +380,16 @@ impl ServerSlot {
                          updated.",
                         self.server.name
                     );
+                    crate::notify::notify_clickable(
+                        "gratis: local-agent handshake failed",
+                        &format!(
+                            "Falling back to the slower readiness probe for {} — connections \
+                             still work, just slower. Click to report it (Proton may have \
+                             changed the agent protocol or rotated its pinned CAs).",
+                            self.server.name
+                        ),
+                        "https://github.com/mohitxskull/Gratis/issues/new",
+                    );
                 }
                 tunnel.wait_until_data_path_ready(&self.server.name).await;
             }

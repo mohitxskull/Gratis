@@ -5,6 +5,7 @@ pub mod errors;
 pub mod keys;
 pub mod manager;
 pub mod models;
+pub mod notify;
 pub mod service;
 pub mod session;
 pub mod socks5;

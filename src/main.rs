@@ -412,6 +412,11 @@ async fn cmd_run(
                 eprintln!(
                     "gratis: stored session is no longer valid ({err}) — run `gratis login` again"
                 );
+                gratis::notify::notify_clickable(
+                    "gratis: session expired",
+                    "Run `gratis login` again to reconnect. Click to open the dashboard.",
+                    &format!("http://127.0.0.1:{control_port}/"),
+                );
             }
         },
         Ok(None) => {
@@ -446,6 +451,10 @@ async fn cmd_run(
         Ok(l) => l,
         Err(err) => {
             eprintln!("gratis: failed to bind {addr}: {err}");
+            gratis::notify::notify(
+                "gratis: failed to start",
+                &format!("Could not bind {addr}: {err}"),
+            );
             std::process::exit(1);
         }
     };

@@ -52,6 +52,7 @@ rustls-pemfile = "2"
 # (no libsecret/D-Bus C bindings) backend that talks to the Secret Service over D-Bus.
 keyring = { version = "4.1.6", default-features = false, features = ["v1", "zbus-secret-service-keyring-store"] }
 console = "0.16.4"
+notify-rust = { version = "4.18.0", default-features = false, features = ["zbus", "serde", "async"] }
 
 [dev-dependencies]
 base64 = "0.22"
