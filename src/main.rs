@@ -378,6 +378,10 @@ async fn cmd_status() -> anyhow::Result<()> {
         "persist (start on login): {}",
         if enabled { "on" } else { "off" }
     );
+    println!(
+        "flags: {}",
+        flags_from_unit().unwrap_or_else(|| "(could not read unit file)".to_string())
+    );
 
     if active {
         match server_count().await {
@@ -392,6 +396,16 @@ async fn cmd_status() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Reads everything after `run` on the installed unit file's `ExecStart` line — i.e. exactly
+/// the flags `gratis up` was given, since that's the one place a running service's settings
+/// live (see `service.rs`). Lets `gratis status` show this without the user needing to grep
+/// the unit file by hand.
+fn flags_from_unit() -> Option<String> {
+    let unit = std::fs::read_to_string(service::unit_path().ok()?).ok()?;
+    let exec_start = unit.lines().find(|l| l.starts_with("ExecStart="))?;
+    Some(exec_start.split_once(" run ")?.1.trim().to_string())
 }
 
 /// Reads the control port out of the installed unit file's `ExecStart` line rather than

@@ -119,6 +119,10 @@ pub struct IndexTemplate {
     /// ToS-risk banner, not just a one-time login warning, since the risk is ongoing for as
     /// long as the daemon runs this way.
     pub unlimited: bool,
+    /// Whether this daemon was started with `--evict-lru` — shown as a small informational
+    /// note (not a warning banner like `unlimited`, since it's not a ToS risk) so it's visible
+    /// on the dashboard instead of only via `gratis status`/the unit file.
+    pub evict_lru: bool,
     /// The logged-in account, or `None` before the first successful login.
     pub account: Option<AccountSummary>,
 }
@@ -127,6 +131,7 @@ impl IndexTemplate {
     pub fn new(
         servers: Vec<ServerStatus>,
         unlimited: bool,
+        evict_lru: bool,
         account: Option<AccountSummary>,
     ) -> Self {
         let servers = server_rows(servers);
@@ -137,6 +142,7 @@ impl IndexTemplate {
             servers,
             connected_count,
             unlimited,
+            evict_lru,
             account,
         }
     }

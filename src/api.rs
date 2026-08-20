@@ -55,6 +55,7 @@ async fn index(
     render(IndexTemplate::new(
         manager.servers(),
         manager.unlimited(),
+        manager.evict_lru(),
         manager.account(),
     ))
 }
