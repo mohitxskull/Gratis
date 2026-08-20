@@ -1,0 +1,148 @@
+//! systemd `--user` unit management for the background daemon. `gratis up` writes/starts a
+//! unit that runs `gratis run` (the actual foreground daemon, see `main.rs`) with the flags it
+//! was given baked into `ExecStart` — that's the one place daemon settings live, there is no
+//! separate config file.
+use crate::errors::*;
+use std::path::PathBuf;
+use std::process::Command;
+
+const UNIT_NAME: &str = "gratis.service";
+
+fn unit_dir() -> Result<PathBuf> {
+    let home = std::env::var("HOME").map_err(|_| ProtonError::Config("HOME is not set".into()))?;
+    Ok(PathBuf::from(home).join(".config/systemd/user"))
+}
+
+pub fn unit_path() -> Result<PathBuf> {
+    Ok(unit_dir()?.join(UNIT_NAME))
+}
+
+pub fn is_installed() -> Result<bool> {
+    Ok(unit_path()?.is_file())
+}
+
+/// Absolute path to the currently-running `gratis` binary — what `ExecStart` points at.
+fn binary_path() -> Result<PathBuf> {
+    std::env::current_exe().map_err(ProtonError::Io)
+}
+
+fn unit_contents(
+    control_port: u16,
+    port_range_start: u16,
+    unlimited_connections: bool,
+) -> Result<String> {
+    let bin = binary_path()?;
+    let bin = bin
+        .to_str()
+        .ok_or_else(|| ProtonError::Config("gratis binary path is not valid UTF-8".into()))?;
+    let unlimited_flag = if unlimited_connections {
+        " --unlimited-connections"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "[Unit]\n\
+         Description=gratis - Proton VPN (free tier) client\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={bin} run --control-port {control_port} --port-range-start \
+         {port_range_start}{unlimited_flag}\n\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n"
+    ))
+}
+
+/// Write (or overwrite) the unit file with the given flags, then `daemon-reload` so systemd
+/// picks up the change. Does not start or enable it.
+pub fn install(
+    control_port: u16,
+    port_range_start: u16,
+    unlimited_connections: bool,
+) -> Result<()> {
+    let dir = unit_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(
+        unit_path()?,
+        unit_contents(control_port, port_range_start, unlimited_connections)?,
+    )?;
+    daemon_reload()
+}
+
+/// Stop + disable if installed, delete the unit file, `daemon-reload`. A no-op if the unit was
+/// never installed.
+pub fn uninstall() -> Result<()> {
+    if !is_installed()? {
+        return Ok(());
+    }
+    let _ = stop();
+    let _ = disable();
+    std::fs::remove_file(unit_path()?)?;
+    daemon_reload()
+}
+
+fn systemctl(args: &[&str]) -> Result<std::process::Output> {
+    Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .output()
+        .map_err(ProtonError::Io)
+}
+
+fn run_ok(args: &[&str]) -> Result<()> {
+    let out = systemctl(args)?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    Err(ProtonError::Config(format!(
+        "systemctl --user {} failed: {}",
+        args.join(" "),
+        stderr.trim()
+    )))
+}
+
+fn daemon_reload() -> Result<()> {
+    run_ok(&["daemon-reload"])
+}
+
+pub fn start() -> Result<()> {
+    run_ok(&["start", UNIT_NAME])
+}
+
+pub fn stop() -> Result<()> {
+    run_ok(&["stop", UNIT_NAME])
+}
+
+pub fn restart() -> Result<()> {
+    run_ok(&["restart", UNIT_NAME])
+}
+
+pub fn enable() -> Result<()> {
+    run_ok(&["enable", UNIT_NAME])
+}
+
+pub fn disable() -> Result<()> {
+    run_ok(&["disable", UNIT_NAME])
+}
+
+/// `systemctl --user is-active` exits non-zero for every state that isn't "active" (inactive,
+/// failed, activating, ...) — that's expected, not an error, so this reports `false` rather
+/// than propagating the exit code as a `Result::Err`.
+pub fn is_active() -> Result<bool> {
+    Ok(systemctl(&["is-active", "--quiet", UNIT_NAME])?
+        .status
+        .success())
+}
+
+/// Same reasoning as `is_active`: a non-zero exit means "not enabled", not a failure.
+pub fn is_enabled() -> Result<bool> {
+    Ok(systemctl(&["is-enabled", "--quiet", UNIT_NAME])?
+        .status
+        .success())
+}
