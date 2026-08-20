@@ -46,6 +46,12 @@ env_logger = "0.11.11"
 rustls = "0.23"
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
+# WHY v1: keyring 4's default (unversioned) API changed shape from the 3.x line most
+# examples reference; the `v1` feature keeps the familiar Entry::new/get_password/
+# set_password/delete_credential surface. zbus-secret-service-keyring-store is the pure-Rust
+# (no libsecret/D-Bus C bindings) backend that talks to the Secret Service over D-Bus.
+keyring = { version = "4.1.6", default-features = false, features = ["v1", "zbus-secret-service-keyring-store"] }
+console = "0.16.4"
 
 [dev-dependencies]
 base64 = "0.22"
@@ -54,3 +60,10 @@ tower = { version = "0.4", features = ["util"] }
 
 [profile.release]
 # dev tool; keep default.
+
+[profile.dev]
+# Full DWARF debug info is the single biggest driver of target/debug size for a dependency
+# tree this large (wireguard-netstack, zbus, the rustls stack, ...). Line tables are enough
+# for backtraces/line numbers in `cargo test`/`cargo run` output — this project doesn't rely
+# on full local-variable inspection in a debugger.
+debug = "line-tables-only"
