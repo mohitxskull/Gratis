@@ -49,6 +49,12 @@ enum Command {
         /// understand and accept the ToS risk of exceeding it.
         #[arg(long)]
         unlimited_connections: bool,
+        /// When the MaxConnect cap is reached, disconnect the least-recently-used idle server
+        /// to make room for a new one instead of refusing the new connection. Never evicts a
+        /// server with active traffic. Has no effect with --unlimited-connections (nothing
+        /// ever hits the cap).
+        #[arg(long)]
+        evict_lru: bool,
     },
     /// Stop the background service.
     Down,
@@ -74,6 +80,8 @@ enum Command {
         port_range_start: u16,
         #[arg(long)]
         unlimited_connections: bool,
+        #[arg(long)]
+        evict_lru: bool,
     },
 }
 
@@ -89,7 +97,13 @@ async fn main() {
             control_port,
             port_range_start,
             unlimited_connections,
-        } => cmd_up(control_port, port_range_start, unlimited_connections),
+            evict_lru,
+        } => cmd_up(
+            control_port,
+            port_range_start,
+            unlimited_connections,
+            evict_lru,
+        ),
         Command::Down => cmd_down(),
         Command::Status => cmd_status().await,
         Command::Persist { off } => cmd_persist(off),
@@ -99,7 +113,16 @@ async fn main() {
             control_port,
             port_range_start,
             unlimited_connections,
-        } => cmd_run(control_port, port_range_start, unlimited_connections).await,
+            evict_lru,
+        } => {
+            cmd_run(
+                control_port,
+                port_range_start,
+                unlimited_connections,
+                evict_lru,
+            )
+            .await
+        }
     };
 
     if let Err(err) = result {
@@ -251,11 +274,17 @@ fn cmd_up(
     control_port: u16,
     port_range_start: u16,
     unlimited_connections: bool,
+    evict_lru: bool,
 ) -> anyhow::Result<()> {
     if session::load()?.is_none() {
         anyhow::bail!("not logged in — run `gratis login` first");
     }
-    service::install(control_port, port_range_start, unlimited_connections)?;
+    service::install(
+        control_port,
+        port_range_start,
+        unlimited_connections,
+        evict_lru,
+    )?;
     service::start()?;
     println!("gratis: service starting — see `gratis status`");
     Ok(())
@@ -455,8 +484,13 @@ async fn cmd_run(
     control_port: u16,
     port_range_start: u16,
     unlimited_connections: bool,
+    evict_lru: bool,
 ) -> anyhow::Result<()> {
-    let manager = Arc::new(TunnelManager::new(port_range_start, unlimited_connections));
+    let manager = Arc::new(TunnelManager::new(
+        port_range_start,
+        unlimited_connections,
+        evict_lru,
+    ));
 
     // Bind and start serving *before* logging in — see `resume_or_login`'s doc comment for
     // why. `manager` starts with an empty server list, which the web UI and `/api/servers`

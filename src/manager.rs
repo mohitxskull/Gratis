@@ -125,18 +125,34 @@ const FALLBACK_TIER: i32 = 0;
 struct ConnectionLimiter {
     max: Option<u32>,
     current: AtomicU32,
+    /// Opt-in (`gratis up --evict-lru`): when the cap is reached, evict the least-recently-used
+    /// *idle* connected slot instead of rejecting the new connection. Every slot from one login
+    /// registers itself here (see `register`) so eviction can scan across all of them.
+    evict_lru: bool,
+    slots: Mutex<Vec<Weak<ServerSlot>>>,
 }
 
 impl ConnectionLimiter {
-    fn new(max: Option<u32>) -> Self {
+    fn new(max: Option<u32>, evict_lru: bool) -> Self {
         Self {
             max,
             current: AtomicU32::new(0),
+            evict_lru,
+            slots: Mutex::new(Vec::new()),
         }
     }
 
-    /// Reserve one connection slot. Returns `false` (reserving nothing) if already at `max`;
-    /// always succeeds if `max` is `None`.
+    /// Register a slot as an eviction candidate. Only needed when `evict_lru` is set, but
+    /// harmless to call unconditionally — an unused registry is never scanned.
+    fn register(&self, slot: &Arc<ServerSlot>) {
+        self.slots.lock().unwrap().push(Arc::downgrade(slot));
+    }
+
+    /// Reserve one connection slot. If at capacity and `evict_lru` is set, first tears down
+    /// the least-recently-used *idle* (zero open connections) connected slot to make room —
+    /// never one with active traffic, so this can never interrupt an in-progress transfer.
+    /// Returns `false` (reserving nothing) if still at capacity after that — either eviction is
+    /// off, or every connected slot is actively busy; always succeeds if `max` is `None`.
     fn try_acquire(&self) -> bool {
         let Some(max) = self.max else {
             self.current.fetch_add(1, Ordering::SeqCst);
@@ -144,22 +160,53 @@ impl ConnectionLimiter {
         };
         loop {
             let cur = self.current.load(Ordering::SeqCst);
-            if cur >= max {
+            if cur < max {
+                if self
+                    .current
+                    .compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    return true;
+                }
+                continue;
+            }
+            if !self.evict_lru || !self.evict_least_recently_used() {
                 return false;
             }
-            if self
-                .current
-                .compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                return true;
+            // `evict_least_recently_used` already called `release()` for the victim it tore
+            // down — loop back around to reserve the slot it just freed.
+        }
+    }
+
+    /// Tear down the connected slot that's been idle (zero open connections) the longest,
+    /// chosen by the earliest `idle_deadline` — that's already exactly "been idle since the
+    /// longest ago" (see `ServerSlot::release`), so no separate last-used timestamp is needed.
+    /// Returns `false` if no idle connected slot exists (every connected slot has active
+    /// traffic) — eviction never touches those.
+    fn evict_least_recently_used(&self) -> bool {
+        let victim = self
+            .slots
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|s| {
+                s.tunnel.lock().unwrap().is_some() && s.open_connections.load(Ordering::SeqCst) == 0
+            })
+            .min_by_key(|s| *s.idle_deadline.lock().unwrap());
+
+        match victim {
+            Some(slot) => {
+                slot.evict();
+                true
             }
+            None => false,
         }
     }
 
     /// Release a slot reserved by a successful `try_acquire` — call exactly once per tunnel
     /// that goes from connected back to disconnected (a failed connect attempt that never
-    /// actually reserved doesn't call this; see the two call sites in `ServerSlot`).
+    /// actually reserved doesn't call this; see the call sites in `ServerSlot`).
     fn release(&self) {
         self.current.fetch_sub(1, Ordering::SeqCst);
     }
@@ -422,6 +469,21 @@ impl ServerSlot {
             bytes_received: self.stats.bytes_received(),
         }
     }
+
+    /// Force this (idle, connected) slot's tunnel down to free its connection-cap reservation
+    /// for another server — called only by `ConnectionLimiter::evict_least_recently_used`,
+    /// which has already confirmed `open_connections == 0`, so this never interrupts active
+    /// traffic. Bumps `idle_generation` so the idle-teardown task `release` already scheduled
+    /// for this slot (if any) sees a stale generation on wake and skips its own teardown —
+    /// without that, both this eviction and that later timer would call `limiter.release()`,
+    /// double-releasing the same reservation.
+    fn evict(&self) {
+        *self.tunnel.lock().unwrap() = None;
+        *self.connected_at.lock().unwrap() = None;
+        *self.idle_deadline.lock().unwrap() = None;
+        self.idle_generation.fetch_add(1, Ordering::SeqCst);
+        self.limiter.release();
+    }
 }
 
 #[async_trait]
@@ -460,9 +522,16 @@ impl TunnelSource for ServerSlot {
                 // reaches here, since it doesn't open a new session with Proton.
                 if !self.limiter.try_acquire() {
                     self.open_connections.fetch_sub(1, Ordering::SeqCst);
+                    let hint = if self.limiter.evict_lru {
+                        "every connected server is actively in use — disconnect one, or start \
+                         gratis with --unlimited-connections"
+                    } else {
+                        "disconnect another server first, start gratis with \
+                         --unlimited-connections, or --evict-lru to free up the \
+                         least-recently-used idle one automatically"
+                    };
                     return Err(Box::new(ProtonError::Config(format!(
-                        "max simultaneous tunnels reached ({}) — disconnect another server \
-                         first, or start gratis with --unlimited-connections",
+                        "max simultaneous tunnels reached ({}) — {hint}",
                         self.limiter.max.unwrap_or(0)
                     ))));
                 }
@@ -581,16 +650,21 @@ pub struct TunnelManager {
     /// Bypasses the account's `MaxConnect` cap entirely — see [`ConnectionLimiter`]. Set once
     /// at construction from `gratis up --unlimited-connections`; a deliberate, opt-in choice.
     unlimited: bool,
+    /// Opt-in (`gratis up --evict-lru`): evict the least-recently-used idle connected server
+    /// instead of rejecting a new connection once `MaxConnect` is reached. See
+    /// `ConnectionLimiter::evict_least_recently_used`.
+    evict_lru: bool,
     account: Mutex<Option<AccountSummary>>,
 }
 
 impl TunnelManager {
     /// Build a manager using the real tunnel/SOCKS5 driver.
-    pub fn new(port_range_start: u16, unlimited_connections: bool) -> Self {
+    pub fn new(port_range_start: u16, unlimited_connections: bool, evict_lru: bool) -> Self {
         Self::with_driver(
             port_range_start,
             Arc::new(RealDriver),
             unlimited_connections,
+            evict_lru,
         )
     }
 
@@ -600,6 +674,7 @@ impl TunnelManager {
         port_range_start: u16,
         driver: Arc<dyn TunnelDriver>,
         unlimited_connections: bool,
+        evict_lru: bool,
     ) -> Self {
         Self {
             client: AsyncMutex::new(None),
@@ -608,6 +683,7 @@ impl TunnelManager {
             account: Mutex::new(None),
             slots: Mutex::new(Vec::new()),
             unlimited: unlimited_connections,
+            evict_lru,
         }
     }
 
@@ -663,11 +739,14 @@ impl TunnelManager {
             .as_ref()
             .map_or(1, |a| a.vpn.max_connect.max(0) as u32);
 
-        let limiter = Arc::new(ConnectionLimiter::new(if self.unlimited {
-            None
-        } else {
-            Some(max_connect)
-        }));
+        let limiter = Arc::new(ConnectionLimiter::new(
+            if self.unlimited {
+                None
+            } else {
+                Some(max_connect)
+            },
+            self.evict_lru,
+        ));
 
         *self.account.lock().unwrap() = account.map(|a| AccountSummary {
             email: client.username.clone(),
@@ -699,6 +778,7 @@ impl TunnelManager {
                 port,
                 limiter.clone(),
             );
+            limiter.register(&slot);
             // Fire-and-forget: this listener is meant to run for the rest of the process's
             // life, so there's nothing useful to do with the JoinHandle (dropping it detaches
             // the task rather than aborting it).
@@ -948,15 +1028,21 @@ mod tests {
         port: u16,
         driver: Arc<dyn TunnelDriver>,
     ) -> (Arc<TunnelManager>, Arc<ServerSlot>) {
-        let manager = Arc::new(TunnelManager::with_driver(port, driver.clone(), false));
-        let limiter = Arc::new(ConnectionLimiter::new(None));
+        let manager = Arc::new(TunnelManager::with_driver(
+            port,
+            driver.clone(),
+            false,
+            false,
+        ));
+        let limiter = Arc::new(ConnectionLimiter::new(None, false));
         let slot = ServerSlot::new(
             test_server("srv-1", "US"),
             test_creds(),
             driver,
             port,
-            limiter,
+            limiter.clone(),
         );
+        limiter.register(&slot);
         manager.slots.lock().unwrap().push(slot.clone());
         (manager, slot)
     }
@@ -1099,9 +1185,12 @@ mod tests {
 
     /// Two slots (different servers) sharing one `ConnectionLimiter`, standing in for two
     /// `ServerSlot`s built from the same login — see `finish_login`.
-    fn two_slots_with_limiter(max: Option<u32>) -> (Arc<ServerSlot>, Arc<ServerSlot>) {
+    fn two_slots_with_limiter(
+        max: Option<u32>,
+        evict_lru: bool,
+    ) -> (Arc<ServerSlot>, Arc<ServerSlot>) {
         let driver: Arc<dyn TunnelDriver> = Arc::new(FakeDriver::default());
-        let limiter = Arc::new(ConnectionLimiter::new(max));
+        let limiter = Arc::new(ConnectionLimiter::new(max, evict_lru));
         let a = ServerSlot::new(
             test_server("srv-a", "US"),
             test_creds(),
@@ -1114,14 +1203,16 @@ mod tests {
             test_creds(),
             driver,
             20801,
-            limiter,
+            limiter.clone(),
         );
+        limiter.register(&a);
+        limiter.register(&b);
         (a, b)
     }
 
     #[tokio::test]
     async fn acquire_is_rejected_once_the_connection_cap_is_reached() {
-        let (a, b) = two_slots_with_limiter(Some(1));
+        let (a, b) = two_slots_with_limiter(Some(1), false);
 
         assert!(a.acquire().await.is_ok(), "first tunnel is within the cap");
         let result = b.acquire().await;
@@ -1140,7 +1231,7 @@ mod tests {
 
     #[tokio::test]
     async fn acquire_succeeds_again_after_a_capped_slot_releases() {
-        let (a, b) = two_slots_with_limiter(Some(1));
+        let (a, b) = two_slots_with_limiter(Some(1), false);
 
         a.acquire().await.unwrap();
         assert!(b.acquire().await.is_err());
@@ -1158,7 +1249,7 @@ mod tests {
 
     #[tokio::test]
     async fn acquire_ignores_the_cap_when_unlimited() {
-        let (a, b) = two_slots_with_limiter(None);
+        let (a, b) = two_slots_with_limiter(None, false);
 
         assert!(a.acquire().await.is_ok());
         assert!(
@@ -1169,11 +1260,93 @@ mod tests {
 
     #[tokio::test]
     async fn acquire_reusing_an_already_connected_tunnel_does_not_recount_against_the_cap() {
-        let (a, _b) = two_slots_with_limiter(Some(1));
+        let (a, _b) = two_slots_with_limiter(Some(1), false);
 
         a.acquire().await.unwrap();
         // A second caller reusing the same already-connected tunnel must not need (or
         // consume) a second reservation — only a genuinely new tunnel does.
         assert!(a.acquire().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn evict_lru_disconnects_an_idle_slot_to_make_room_for_a_new_one() {
+        let (a, b) = two_slots_with_limiter(Some(1), true);
+
+        a.acquire().await.unwrap();
+        a.release(); // a is now connected but idle (zero open connections).
+
+        assert!(
+            b.acquire().await.is_ok(),
+            "b must succeed by evicting the idle a, not be rejected"
+        );
+        assert!(
+            !a.status().connected,
+            "evicting a must have torn its tunnel down"
+        );
+        assert!(b.status().connected);
+    }
+
+    #[tokio::test]
+    async fn evict_lru_never_evicts_a_slot_with_active_connections() {
+        let (a, b) = two_slots_with_limiter(Some(1), true);
+
+        // a stays "acquired" — open_connections is 1, standing in for an active transfer.
+        a.acquire().await.unwrap();
+
+        let result = b.acquire().await;
+        assert!(
+            result.is_err(),
+            "with no idle slot to evict (a has active traffic), b must be rejected — eviction \
+             must never interrupt an in-progress connection"
+        );
+        assert!(a.status().connected, "a must be untouched");
+    }
+
+    #[tokio::test]
+    async fn evict_lru_picks_the_longest_idle_slot_when_several_are_idle() {
+        let driver: Arc<dyn TunnelDriver> = Arc::new(FakeDriver::default());
+        let limiter = Arc::new(ConnectionLimiter::new(Some(2), true));
+        let oldest = ServerSlot::new(
+            test_server("srv-old", "US"),
+            test_creds(),
+            driver.clone(),
+            20900,
+            limiter.clone(),
+        );
+        let newest = ServerSlot::new(
+            test_server("srv-new", "FR"),
+            test_creds(),
+            driver.clone(),
+            20901,
+            limiter.clone(),
+        );
+        let incoming = ServerSlot::new(
+            test_server("srv-in", "DE"),
+            test_creds(),
+            driver,
+            20902,
+            limiter.clone(),
+        );
+        limiter.register(&oldest);
+        limiter.register(&newest);
+        limiter.register(&incoming);
+
+        // `oldest` goes idle first, so its idle_deadline is earlier — it must be the one
+        // evicted, not `newest`, even though both are idle candidates.
+        oldest.acquire().await.unwrap();
+        oldest.release();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        newest.acquire().await.unwrap();
+        newest.release();
+
+        assert!(incoming.acquire().await.is_ok());
+        assert!(
+            !oldest.status().connected,
+            "the longer-idle slot must be evicted"
+        );
+        assert!(
+            newest.status().connected,
+            "the more-recently-idle slot must survive"
+        );
     }
 }

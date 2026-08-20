@@ -30,16 +30,19 @@ fn unit_contents(
     control_port: u16,
     port_range_start: u16,
     unlimited_connections: bool,
+    evict_lru: bool,
 ) -> Result<String> {
     let bin = binary_path()?;
     let bin = bin
         .to_str()
         .ok_or_else(|| ProtonError::Config("gratis binary path is not valid UTF-8".into()))?;
-    let unlimited_flag = if unlimited_connections {
-        " --unlimited-connections"
-    } else {
-        ""
-    };
+    let mut flags = String::new();
+    if unlimited_connections {
+        flags.push_str(" --unlimited-connections");
+    }
+    if evict_lru {
+        flags.push_str(" --evict-lru");
+    }
     Ok(format!(
         "[Unit]\n\
          Description=gratis - SOCKS5 proxy over your Proton VPN account\n\
@@ -49,7 +52,7 @@ fn unit_contents(
          [Service]\n\
          Type=simple\n\
          ExecStart={bin} run --control-port {control_port} --port-range-start \
-         {port_range_start}{unlimited_flag}\n\
+         {port_range_start}{flags}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          \n\
@@ -64,12 +67,18 @@ pub fn install(
     control_port: u16,
     port_range_start: u16,
     unlimited_connections: bool,
+    evict_lru: bool,
 ) -> Result<()> {
     let dir = unit_dir()?;
     std::fs::create_dir_all(&dir)?;
     std::fs::write(
         unit_path()?,
-        unit_contents(control_port, port_range_start, unlimited_connections)?,
+        unit_contents(
+            control_port,
+            port_range_start,
+            unlimited_connections,
+            evict_lru,
+        )?,
     )?;
     daemon_reload()
 }
@@ -153,18 +162,20 @@ mod tests {
 
     #[test]
     fn unit_contents_bakes_the_given_flags_into_exec_start() {
-        let unit = unit_contents(9500, 21000, false).expect("binary_path must resolve in tests");
+        let unit =
+            unit_contents(9500, 21000, false, false).expect("binary_path must resolve in tests");
         let exec_start = unit
             .lines()
             .find(|l| l.starts_with("ExecStart="))
             .expect("unit must have an ExecStart line");
         assert!(exec_start.ends_with("run --control-port 9500 --port-range-start 21000"));
         assert!(!exec_start.contains("--unlimited-connections"));
+        assert!(!exec_start.contains("--evict-lru"));
     }
 
     #[test]
     fn unit_contents_includes_the_unlimited_flag_when_requested() {
-        let unit = unit_contents(9500, 21000, true).unwrap();
+        let unit = unit_contents(9500, 21000, true, false).unwrap();
         let exec_start = unit.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
         assert!(
             exec_start.ends_with(
@@ -174,10 +185,28 @@ mod tests {
     }
 
     #[test]
+    fn unit_contents_includes_the_evict_lru_flag_when_requested() {
+        let unit = unit_contents(9500, 21000, false, true).unwrap();
+        let exec_start = unit.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
+        assert!(
+            exec_start.ends_with("run --control-port 9500 --port-range-start 21000 --evict-lru")
+        );
+    }
+
+    #[test]
+    fn unit_contents_includes_both_flags_when_both_requested() {
+        let unit = unit_contents(9500, 21000, true, true).unwrap();
+        let exec_start = unit.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
+        assert!(exec_start.ends_with(
+            "run --control-port 9500 --port-range-start 21000 --unlimited-connections --evict-lru"
+        ));
+    }
+
+    #[test]
     fn unit_contents_is_a_valid_systemd_unit_shape() {
         // Not a full systemd parser — just the section headers a real unit file needs, so a
         // typo in the format string (e.g. a missing newline collapsing two sections) is caught.
-        let unit = unit_contents(9000, 20000, false).unwrap();
+        let unit = unit_contents(9000, 20000, false, false).unwrap();
         assert!(unit.contains("[Unit]\n"));
         assert!(unit.contains("[Service]\n"));
         assert!(unit.contains("[Install]\n"));

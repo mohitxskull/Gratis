@@ -87,6 +87,7 @@ mod tests {
             9500,
             Arc::new(RealDriver),
             false,
+            false,
         ))
     }
 

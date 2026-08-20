@@ -86,7 +86,8 @@ the control API and every server's SOCKS5 port are bound to `127.0.0.1` only.
 By default, gratis caps how many servers can have a live tunnel **at the same time** at
 your account's real Proton `MaxConnect` limit (free tier: 2, at last check) — fetched at
 startup, not hardcoded. A server beyond that cap simply refuses new SOCKS5 connections
-until another one idles out; nothing already connected gets dropped to make room.
+until another one idles out; nothing already connected gets dropped to make room, unless
+you opt into `--evict-lru` (below).
 
 `gratis up --unlimited-connections` bypasses this cap entirely. **Running more concurrent
 tunnels than your account's plan allows is likely a violation of Proton's Terms of
@@ -97,13 +98,19 @@ flag exists for people who understand and accept that risk — the web UI shows 
 warning banner whenever it's active, and the default (capped) behavior is what most people
 should run.
 
+`gratis up --evict-lru` is the middle ground: stay within the cap, but instead of
+rejecting a new connection once it's reached, disconnect the least-recently-used **idle**
+server to make room. It never touches a server with active traffic — if every connected
+server is actually busy, the new connection is still rejected, same as the default. Useful
+if you'd rather gratis manage which servers stay connected than see connection errors.
+
 ### All commands
 
 | Command | Does |
 | --- | --- |
 | `gratis login` | Authenticate and store the session in the OS keychain |
 | `gratis logout` | Stop the service and forget the stored session |
-| `gratis up [--control-port] [--port-range-start] [--unlimited-connections]` | Start the background service |
+| `gratis up [--control-port] [--port-range-start] [--unlimited-connections] [--evict-lru]` | Start the background service |
 | `gratis down` | Stop it |
 | `gratis status` | Show login/running/persist state, and server count if running |
 | `gratis persist` / `gratis persist --off` | Start (or stop starting) automatically on login |
