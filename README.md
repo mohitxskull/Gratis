@@ -288,4 +288,9 @@ git cliff --unreleased --strip header
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+GPL-3.0-or-later — see [LICENSE](LICENSE) and [COPYING.md](COPYING.md).
+
+gratis's auth/session and API-shape logic was worked out against
+[`proton-vpn-cli`](https://github.com/ProtonVPN/proton-vpn-cli) (GPLv3) and Proton's
+system-installed Python packages — see `src/client.rs`, `src/models.rs`, `src/srp.rs`. Given
+that lineage, GPL is the licensing that fits, not the MIT this project started under.
