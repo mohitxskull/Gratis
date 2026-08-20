@@ -568,7 +568,7 @@ impl TunnelSource for ServerSlot {
                          --unlimited-connections, or --evict-lru to free up the \
                          least-recently-used idle one automatically"
                     };
-                    return Err(Box::new(ProtonError::Config(format!(
+                    return Err(Box::new(ProtonError::AtCapacity(format!(
                         "max simultaneous tunnels reached ({}) — {hint}",
                         self.limiter.max.unwrap_or(0)
                     ))));
@@ -961,6 +961,13 @@ impl TunnelManager {
     /// ToS-risk banner.
     pub fn unlimited(&self) -> bool {
         self.unlimited
+    }
+
+    /// Whether this daemon evicts idle connections to make room at the cap instead of
+    /// rejecting new ones (`gratis up --evict-lru`) — surfaced to the web UI so it's visible
+    /// without needing to check `gratis status` or the unit file.
+    pub fn evict_lru(&self) -> bool {
+        self.evict_lru
     }
 
     /// The logged-in account's email/plan/tier/connection-limit, or `None` before the first
@@ -1366,10 +1373,19 @@ mod tests {
 
         assert!(a.acquire().await.is_ok(), "first tunnel is within the cap");
         let result = b.acquire().await;
+        let Err(err) = result else {
+            panic!(
+                "a second simultaneous tunnel must be rejected once the account's MaxConnect \
+                 cap (here: 1) is already in use by a different server"
+            );
+        };
         assert!(
-            result.is_err(),
-            "a second simultaneous tunnel must be rejected once the account's MaxConnect cap \
-             (here: 1) is already in use by a different server"
+            matches!(
+                err.downcast_ref::<ProtonError>(),
+                Some(ProtonError::AtCapacity(_))
+            ),
+            "must be the AtCapacity variant specifically — socks5.rs relies on it to reply \
+             with a distinct SOCKS5 code (see socks5.rs's reply_code_for)"
         );
 
         // Rejection must not have counted against `open_connections` (see the fetch_sub next

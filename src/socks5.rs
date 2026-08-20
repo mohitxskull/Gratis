@@ -44,13 +44,29 @@ const ATYP_IPV6: u8 = 0x04;
 
 const REP_SUCCEEDED: u8 = 0x00;
 const REP_GENERAL_FAILURE: u8 = 0x01;
+/// Used specifically for [`crate::errors::ProtonError::AtCapacity`] — see `reply_code_for`.
+const REP_CONNECTION_REFUSED: u8 = 0x05;
 const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 
-/// Opaque error from [`TunnelSource::acquire`] — `socks5.rs` only ever maps an `Err` to a
-/// generic SOCKS5 failure reply, but this is boxed rather than `()` so callers (tests, logs)
-/// can still inspect what went wrong.
+/// Opaque error from [`TunnelSource::acquire`] — boxed rather than `()` so callers (tests,
+/// logs, and `reply_code_for` below) can still inspect what went wrong, even though most of
+/// them map to the same generic SOCKS5 failure reply.
 pub type SourceError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Which SOCKS5 reply code to send for an `acquire` failure. Almost everything gets the
+/// generic `GENERAL FAILURE` (0x01) — a client has no way to act differently on a more precise
+/// code for most of these anyway. The one deliberate exception is
+/// [`crate::errors::ProtonError::AtCapacity`]: it gets `CONNECTION REFUSED` (0x05) instead, so
+/// a client that cares (e.g. `zen-relay`, which otherwise can't tell "gratis is at its
+/// MaxConnect cap right now" apart from "this exit is broken" and was mistakenly banning
+/// perfectly healthy exits for hours over it) can treat the two differently.
+fn reply_code_for(err: &SourceError) -> u8 {
+    match err.downcast_ref::<crate::errors::ProtonError>() {
+        Some(crate::errors::ProtonError::AtCapacity(_)) => REP_CONNECTION_REFUSED,
+        _ => REP_GENERAL_FAILURE,
+    }
+}
 
 /// Where a SOCKS5 listener gets the tunnel to relay a connection through, decoupling
 /// `run_socks5`'s accept loop from how — or whether — that tunnel is already up.
@@ -154,8 +170,8 @@ async fn handle_client(
 
     let tunnel = match source.acquire().await {
         Ok(t) => t,
-        Err(_) => {
-            send_reply(&mut client, REP_GENERAL_FAILURE, local_v4_zero()).await?;
+        Err(err) => {
+            send_reply(&mut client, reply_code_for(&err), local_v4_zero()).await?;
             return Ok(());
         }
     };
@@ -333,4 +349,28 @@ async fn relay(
 
     let _ = tokio::join!(to_tunnel, to_client);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::errors::ProtonError;
+
+    #[test]
+    fn at_capacity_gets_connection_refused_not_general_failure() {
+        let err: SourceError = Box::new(ProtonError::AtCapacity("max reached".into()));
+        assert_eq!(reply_code_for(&err), REP_CONNECTION_REFUSED);
+    }
+
+    #[test]
+    fn every_other_error_gets_the_generic_general_failure() {
+        let err: SourceError = Box::new(ProtonError::Config("tunnel connect failed".into()));
+        assert_eq!(reply_code_for(&err), REP_GENERAL_FAILURE);
+    }
+
+    #[test]
+    fn an_error_that_isnt_a_protonerror_at_all_also_gets_general_failure() {
+        let err: SourceError = Box::new(io::Error::other("boom"));
+        assert_eq!(reply_code_for(&err), REP_GENERAL_FAILURE);
+    }
 }

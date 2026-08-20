@@ -39,6 +39,18 @@ pub enum ProtonError {
     /// readiness-probe wait rather than failing the connection outright.
     #[error("local agent error: {0}")]
     LocalAgent(String),
+
+    /// `ServerSlot::acquire` rejected a connection because the account's `MaxConnect` cap is
+    /// already fully used by *active* tunnels (nothing idle to evict, or `--evict-lru` isn't
+    /// on) — not a sign that this particular server/exit is broken. `socks5.rs` checks for
+    /// this specific variant to reply with SOCKS5 `CONNECTION REFUSED` (0x05) instead of
+    /// `GENERAL FAILURE` (0x01), so a SOCKS5 client (e.g. `zen-relay`) can tell "gratis is at
+    /// capacity right now" apart from "this exit doesn't work" instead of treating both
+    /// identically — verified live: without this distinction, a capacity-cap rejection (which
+    /// clears the moment another connection frees up) was indistinguishable from a genuinely
+    /// dead exit, and got a client-side multi-hour ban it didn't deserve.
+    #[error("at capacity: {0}")]
+    AtCapacity(String),
 }
 
 pub type Result<T> = std::result::Result<T, ProtonError>;
