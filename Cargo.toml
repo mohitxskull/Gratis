@@ -53,6 +53,15 @@ rustls-pemfile = "2"
 keyring = { version = "4.1.6", default-features = false, features = ["v1", "zbus-secret-service-keyring-store"] }
 console = "0.16.4"
 notify-rust = { version = "4.18.0", default-features = false, features = ["zbus", "serde", "async"] }
+# WHY async-io (not ksni's default "tokio" feature): zbus is a shared dependency (keyring,
+# notify-rust) already on its async-io backend. Cargo unifies feature flags across a single
+# crate version, so ksni's "tokio" feature would flip that SAME zbus onto its tokio backend
+# for every user of it — which broke keyring's blocking Secret Service calls: zbus's
+# tokio-backed `block_on` tries to spin up its own nested Tokio runtime, and panics
+# ("Cannot start a runtime from within a runtime") the moment it's called from inside our
+# own `#[tokio::main]`. Verified live: `gratis login`/`logout` reproduced this immediately
+# after adding ksni with defaults, and it disappeared switching ksni to async-io.
+ksni = { version = "0.3.6", default-features = false, features = ["async-io"] }
 
 [dev-dependencies]
 base64 = "0.22"

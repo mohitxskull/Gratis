@@ -10,6 +10,7 @@ pub mod service;
 pub mod session;
 pub mod socks5;
 pub mod srp;
+pub mod tray;
 pub mod update;
 pub mod webui;
 pub mod wireguard;
