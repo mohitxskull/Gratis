@@ -607,6 +607,37 @@ async fn cmd_run(
         }
     });
 
+    // Separate task from the login/server-refresh one above: an update check hitting GitHub
+    // shouldn't share fate with, or wait behind, Proton API calls. Check-only — see
+    // `update::check_for_update`'s doc comment for why this never downloads or applies
+    // anything on its own, just notifies.
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(gratis::update::UPDATE_CHECK_INTERVAL);
+        interval.tick().await; // skip the immediate first tick: a fresh `gratis up` is already running the version the user just installed/updated to.
+        let mut last_notified: Option<String> = None;
+        loop {
+            interval.tick().await;
+            match gratis::update::check_for_update().await {
+                Ok(Some(latest)) if last_notified.as_deref() != Some(latest.as_str()) => {
+                    gratis::notify::notify_clickable(
+                        "gratis: update available",
+                        &format!(
+                            "v{latest} is out — run `gratis update` to install it, or click for release notes."
+                        ),
+                        "https://github.com/mohitxskull/Gratis/releases/latest",
+                    );
+                    last_notified = Some(latest);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    eprintln!(
+                        "gratis: periodic update check failed ({err}); will retry next interval"
+                    );
+                }
+            }
+        }
+    });
+
     tokio::select! {
         result = axum::serve(listener, router) => {
             if let Err(err) = result {

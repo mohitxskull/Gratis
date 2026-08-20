@@ -9,6 +9,11 @@ use std::process::Command;
 
 const REPO: &str = "mohitxskull/Gratis";
 
+/// How often `gratis run` checks GitHub for a newer release and, if one exists, fires a
+/// desktop notification. Deliberately never downloads or applies anything on its own — see
+/// `check_for_update`'s doc comment for why auto-*applying* is out of scope.
+pub const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
 #[derive(Deserialize)]
 struct Release {
     tag_name: String,
@@ -51,6 +56,43 @@ fn print_progress(line: &str) {
     let _ = std::io::stdout().flush();
 }
 
+/// Fetch the latest GitHub release's metadata. Shared by `run` (which needs the asset list to
+/// download) and `check_for_update` (which only needs the version).
+async fn fetch_latest_release() -> Result<Release> {
+    let client = reqwest::Client::builder()
+        .user_agent("gratis-updater")
+        .build()?;
+    let release: Release = client
+        .get(format!(
+            "https://api.github.com/repos/{REPO}/releases/latest"
+        ))
+        .send()
+        .await?
+        .json()
+        .await?;
+    Ok(release)
+}
+
+/// Check whether a newer release exists, without downloading or installing anything. Returns
+/// the newer version string (without the leading `v`), or `None` if already current.
+///
+/// Deliberately check-only: `gratis run` polls this periodically and, on `Some`, fires a
+/// desktop notification pointing at `gratis update` — it never applies the update itself.
+/// Auto-*applying* would mean silently replacing the binary and restarting the service (the
+/// proxy) out from under whatever's actively using it, with no warning, on a tool that holds
+/// your VPN credentials. That's a materially different (and worse) trust/disruption trade-off
+/// than a notification, so it stays a manual, deliberate `gratis update` run.
+pub async fn check_for_update() -> Result<Option<String>> {
+    let current = env!("CARGO_PKG_VERSION");
+    let release = fetch_latest_release().await?;
+    let latest = release.tag_name.trim_start_matches('v').to_string();
+    if latest == current {
+        Ok(None)
+    } else {
+        Ok(Some(latest))
+    }
+}
+
 pub async fn run() -> Result<UpdateOutcome> {
     let current = env!("CARGO_PKG_VERSION").to_string();
 
@@ -64,14 +106,7 @@ pub async fn run() -> Result<UpdateOutcome> {
     let client = reqwest::Client::builder()
         .user_agent("gratis-updater")
         .build()?;
-    let release: Release = client
-        .get(format!(
-            "https://api.github.com/repos/{REPO}/releases/latest"
-        ))
-        .send()
-        .await?
-        .json()
-        .await?;
+    let release = fetch_latest_release().await?;
     let latest = release.tag_name.trim_start_matches('v').to_string();
 
     if latest == current {
