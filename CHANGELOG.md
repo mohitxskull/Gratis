@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] — 2026-08-20
+
+### Changed
+
+- **license**: Relicense under GPL-3.0-or-later (was MIT) — the auth/session/API-shape logic
+  was worked out against `proton-vpn-cli` (GPLv3) and Proton's GPL-licensed Python packages,
+  not developed independently
+
 ## [0.5.0] — 2026-08-20
 
 ### Added
