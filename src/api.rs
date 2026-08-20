@@ -19,6 +19,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::get,
 };
+use serde::Serialize;
 use std::sync::Arc;
 
 /// Render an Askama template to an HTML response, mapping a render failure (should never
@@ -40,6 +41,7 @@ pub fn router(manager: Arc<TunnelManager>) -> Router {
         .route("/", get(index))
         .route("/ui/servers", get(ui_servers))
         .route("/api/servers", get(list_servers))
+        .route("/api/update", get(update_status))
         .with_state(manager)
 }
 
@@ -69,6 +71,23 @@ async fn list_servers(
     axum::extract::State(manager): axum::extract::State<Arc<TunnelManager>>,
 ) -> Json<Vec<ServerStatus>> {
     Json(manager.servers())
+}
+
+#[derive(Serialize)]
+struct UpdateStatus {
+    /// The newest available version, if the daemon's periodic check has found one; `None`
+    /// means either not yet checked or already current. See `update::check_for_update`.
+    available: Option<String>,
+}
+
+/// Exists so `gratis tray` can show "update available" without making its own GitHub API
+/// call — it just reads whatever `gratis run`'s periodic check last found.
+async fn update_status(
+    axum::extract::State(manager): axum::extract::State<Arc<TunnelManager>>,
+) -> Json<UpdateStatus> {
+    Json(UpdateStatus {
+        available: manager.update_available(),
+    })
 }
 
 #[cfg(test)]

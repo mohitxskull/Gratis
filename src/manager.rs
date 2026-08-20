@@ -715,6 +715,11 @@ pub struct TunnelManager {
     /// assigned to a server ID is never reused for a different one, even if that server
     /// disappears and a different one appears later. See `apply_refreshed_servers`.
     next_port: Mutex<u16>,
+    /// Set by `main.rs`'s periodic update-check task, read by the control API (and from there,
+    /// the tray) — the newest available version string once one is found, so the tray can show
+    /// it without making its own GitHub API call. `None` means either not yet checked or
+    /// already on the latest release.
+    update_available: Mutex<Option<String>>,
 }
 
 impl TunnelManager {
@@ -748,7 +753,19 @@ impl TunnelManager {
             creds: Mutex::new(None),
             limiter: Mutex::new(None),
             next_port: Mutex::new(port_range_start),
+            update_available: Mutex::new(None),
         }
+    }
+
+    /// Record the newest available version found by the periodic update check (or clear it
+    /// back to `None` if the check finds we're already current).
+    pub fn set_update_available(&self, version: Option<String>) {
+        *self.update_available.lock().unwrap() = version;
+    }
+
+    /// The newest available version, if the periodic update check has found one.
+    pub fn update_available(&self) -> Option<String> {
+        self.update_available.lock().unwrap().clone()
     }
 
     /// Authenticate via SRP, fetch the server list, and bind one port + one always-on SOCKS5

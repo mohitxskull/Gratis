@@ -188,7 +188,11 @@ with a `!` suffix or a `BREAKING CHANGE:` footer is flagged as breaking.
 - **`src/manager.rs`** — one `ServerSlot` per server the account's real tier (fetched via
   `GET /vpn/v2`, not assumed) can reach: a fixed port, an always-on SOCKS5 listener, and a
   WireGuard tunnel that connects lazily on first use and tears down after being idle (zero
-  open connections) for 5 minutes. Also enforces the connection limit described above.
+  open connections) for 5 minutes. Also enforces the connection limit described above. The
+  server list itself is re-fetched every 30 minutes (not just once at login), so load numbers
+  stay current, newly-added servers show up, and servers Proton removes get flagged
+  ("no longer available") — a port, once assigned to a server, is never reused for a
+  different one, so removal never silently repurposes a client's existing connection.
 - **`src/wireguard.rs`** — an in-process userspace WireGuard session (via
   `wireguard-netstack`), not a real kernel interface.
 - **`src/socks5.rs`** — a minimal SOCKS5 (CONNECT-only) proxy that relays traffic through
@@ -206,7 +210,10 @@ with a `!` suffix or a `BREAKING CHANGE:` footer is flagged as breaking.
 - **`src/service.rs`** — writes/starts/stops/enables both `systemd --user` units (the daemon
   and the tray) that `up`/`down`/`persist` control together.
 - **`src/update.rs`** — `gratis update`'s self-replace: downloads the matching release
-  tarball and swaps the running binary in place.
+  tarball and swaps the running binary in place. `gratis run` also polls GitHub every 6
+  hours and fires a desktop notification when a newer release exists (shown in the tray
+  menu too) — check-only, it never downloads or applies anything on its own; updating stays
+  a manual `gratis update`.
 - **`src/tray.rs`** — the system tray icon (`gratis tray`): polls the control API and
   `systemctl` for status, no capabilities beyond what the CLI already has.
 - **`src/notify.rs`** — desktop notifications for the daemon's silent-failure cases

@@ -24,6 +24,9 @@ struct GratisTray {
     control_port: u16,
     status: String,
     service_active: bool,
+    /// Newest available version, if the daemon's periodic update check has found one — see
+    /// `api::update_status`. `None` shows no update-related menu item at all.
+    update_available: Option<String>,
 }
 
 impl ksni::Tray for GratisTray {
@@ -50,14 +53,31 @@ impl ksni::Tray for GratisTray {
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let control_port = self.control_port;
         let service_active = self.service_active;
-        vec![
+        let mut items = vec![
             StandardItem {
                 label: self.status.clone(),
                 enabled: false,
                 ..Default::default()
             }
             .into(),
-            MenuItem::Separator,
+        ];
+        if let Some(version) = &self.update_available {
+            items.push(
+                StandardItem {
+                    label: format!("Update available: v{version}"),
+                    icon_name: "software-update-available".into(),
+                    activate: Box::new(|_: &mut Self| {
+                        let _ = std::process::Command::new("xdg-open")
+                            .arg("https://github.com/mohitxskull/Gratis/releases/latest")
+                            .spawn();
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        items.push(MenuItem::Separator);
+        items.extend([
             StandardItem {
                 label: "Open Dashboard".into(),
                 icon_name: "network-vpn".into(),
@@ -105,7 +125,8 @@ impl ksni::Tray for GratisTray {
                 ..Default::default()
             }
             .into(),
-        ]
+        ]);
+        items
     }
 }
 
@@ -120,6 +141,24 @@ async fn server_count(control_port: u16) -> Option<usize> {
             .await
             .ok()?;
     Some(servers.len())
+}
+
+#[derive(serde::Deserialize)]
+struct UpdateStatus {
+    available: Option<String>,
+}
+
+/// Ask the control API whether a newer release is available, per its periodic check — see
+/// `api::update_status`. `None` if the API can't be reached; treated the same as "no update
+/// known" rather than an error worth failing the tray over.
+async fn update_available(control_port: u16) -> Option<String> {
+    let status: UpdateStatus = reqwest::get(format!("http://127.0.0.1:{control_port}/api/update"))
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    status.available
 }
 
 fn status_line(service_active: bool, servers: Option<usize>) -> String {
@@ -138,6 +177,7 @@ pub async fn run(control_port: u16) -> Result<()> {
         control_port,
         status: "checking status...".to_string(),
         service_active: false,
+        update_available: None,
     };
     let handle = tray
         .spawn()
@@ -151,12 +191,18 @@ pub async fn run(control_port: u16) -> Result<()> {
         } else {
             None
         };
+        let update = if active {
+            update_available(control_port).await
+        } else {
+            None
+        };
         let status = status_line(active, servers);
 
         handle
             .update(|tray: &mut GratisTray| {
                 tray.status = status;
                 tray.service_active = active;
+                tray.update_available = update;
             })
             .await;
 
