@@ -19,7 +19,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "gratis", version, about = "Proton VPN (free tier) client")]
+#[command(name = "gratis", version, about = "Proton VPN client")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -36,7 +36,7 @@ enum Command {
         /// Port the localhost control API + web UI listen on.
         #[arg(long, default_value = "9000")]
         control_port: u16,
-        /// First port handed out to the free-tier server list.
+        /// First port handed out to the server list.
         #[arg(long, default_value = "20000")]
         port_range_start: u16,
         /// Don't cap simultaneous server tunnels at the account's Proton MaxConnect limit.

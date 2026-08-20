@@ -4,15 +4,17 @@
 //!
 //! ## Port-per-server, lazily-connected, self-idling
 //!
-//! Right after login, `TunnelManager` assigns every free-tier server a fixed port (sequential
-//! from `port_range_start`) and immediately spawns an always-on SOCKS5 listener for it — no
-//! separate "connect" call is needed to make a server reachable. What *is* lazy is the
-//! WireGuard tunnel behind that listener: the first client connection to a server's port brings
-//! the tunnel up (see `ServerSlot::acquire`), and it's torn back down automatically once the
-//! last client connection to it closes and `IDLE_TIMEOUT` passes with no new one arriving (see
-//! `ServerSlot::release`) — the listener itself keeps running the whole time, ready to
-//! reconnect on the next hit. Any number of servers can have a live tunnel at once; each slot
-//! is entirely independent.
+//! Right after login, `TunnelManager` assigns every server the account's real tier can reach
+//! (see `finish_login`) a fixed port (sequential from `port_range_start`) and immediately
+//! spawns an always-on SOCKS5 listener for it — no separate "connect" call is needed to make a
+//! server reachable. What *is* lazy is the WireGuard tunnel behind that listener: the first
+//! client connection to a server's port brings the tunnel up (see `ServerSlot::acquire`), and
+//! it's torn back down automatically once the last client connection to it closes and
+//! `IDLE_TIMEOUT` passes with no new one arriving (see `ServerSlot::release`) — the listener
+//! itself keeps running the whole time, ready to reconnect on the next hit. How many servers
+//! can have a *live tunnel* at once is capped at the account's real `MaxConnect` by default
+//! (see `ConnectionLimiter`, private to this module); each slot is otherwise entirely
+//! independent.
 //!
 //! ## No-root architecture
 //!
@@ -218,7 +220,7 @@ impl TunnelDriver for RealDriver {
     }
 }
 
-/// One free-tier server: a fixed port with an always-on SOCKS5 listener, whose WireGuard tunnel
+/// One server the account can reach: a fixed port with an always-on SOCKS5 listener, whose WireGuard tunnel
 /// is connected lazily on first use and torn down after `IDLE_TIMEOUT` idle (see the module
 /// doc comment). Implements [`TunnelSource`] so `run_socks5`'s accept loop can drive it
 /// directly.
@@ -572,7 +574,7 @@ pub struct AccountSummary {
 pub struct TunnelManager {
     client: AsyncMutex<Option<ProtonVPNClient>>,
     driver: Arc<dyn TunnelDriver>,
-    /// First port handed out; each free-tier server gets one more than the last, in a stable
+    /// First port handed out; each reachable server gets one more than the last, in a stable
     /// (server-id-sorted) order.
     port_range_start: u16,
     slots: Mutex<Vec<Arc<ServerSlot>>>,
@@ -610,7 +612,7 @@ impl TunnelManager {
     }
 
     /// Authenticate via SRP, fetch the server list, and bind one port + one always-on SOCKS5
-    /// listener per free-tier server (see the module doc comment). Replaces any slots from a
+    /// listener per reachable server (see the module doc comment). Replaces any slots from a
     /// previous login.
     pub async fn login(&self, email: &str, password: &str) -> Result<()> {
         let mut client = ProtonVPNClient::new(email);
@@ -648,7 +650,7 @@ impl TunnelManager {
     }
 
     /// Shared tail of `login`/`login_with_session`: bind one port + one always-on SOCKS5
-    /// listener per free-tier server, replacing any slots from a previous login.
+    /// listener per reachable server, replacing any slots from a previous login.
     async fn finish_login(&self, client: ProtonVPNClient, creds: VPNCredentials) -> Result<()> {
         // The account's real tier/connection-limit — see `client::fetch_account_info` and
         // `FALLBACK_TIER`'s doc comment for why this can't just be assumed. If the fetch
@@ -687,7 +689,7 @@ impl TunnelManager {
             let offset = u16::try_from(i)
                 .map_err(|_| ProtonError::Config("too many servers for the port range".into()))?;
             let port = self.port_range_start.checked_add(offset).ok_or_else(|| {
-                ProtonError::Config("ran out of ports for the free-tier server list".into())
+                ProtonError::Config("ran out of ports for the server list".into())
             })?;
 
             let slot = ServerSlot::new(
@@ -713,7 +715,7 @@ impl TunnelManager {
         Ok(())
     }
 
-    /// Every free-tier server this account can reach, each with its assigned port and current
+    /// Every server this account can reach, each with its assigned port and current
     /// connection status. The sole read API — see the module doc comment.
     pub fn servers(&self) -> Vec<ServerStatus> {
         self.slots

@@ -42,7 +42,7 @@ fn unit_contents(
     };
     Ok(format!(
         "[Unit]\n\
-         Description=gratis - Proton VPN (free tier) client\n\
+         Description=gratis - Proton VPN client\n\
          After=network-online.target\n\
          Wants=network-online.target\n\
          \n\

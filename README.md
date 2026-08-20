@@ -3,9 +3,10 @@
 [![CI](https://github.com/mohitxskull/Gratis/actions/workflows/ci.yml/badge.svg)](https://github.com/mohitxskull/Gratis/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/mohitxskull/Gratis)](https://github.com/mohitxskull/Gratis/releases/latest)
 
-A no-root Proton VPN (free tier) client. It logs in once, then exposes every free-tier
-server as its own local SOCKS5 proxy port — connect to a server's port and its WireGuard
-tunnel comes up on its own; leave it idle for 5 minutes and it tears itself back down.
+A no-root Proton VPN client. It logs in once, then exposes every server your account can
+reach — free or paid tier, gratis reads your account's real limits — as its own local
+SOCKS5 proxy port. Connect to a server's port and its WireGuard tunnel comes up on its
+own; leave it idle for 5 minutes and it tears itself back down.
 
 ## Why
 
