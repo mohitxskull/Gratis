@@ -379,8 +379,20 @@ async fn cmd_status() -> anyhow::Result<()> {
         if enabled { "on" } else { "off" }
     );
     println!(
-        "flags: {}",
-        flags_from_unit().unwrap_or_else(|| "(could not read unit file)".to_string())
+        "unlimited connections: {}",
+        if unit_has_flag("--unlimited-connections") {
+            "on (ToS risk — see README)"
+        } else {
+            "off"
+        }
+    );
+    println!(
+        "evict least-recently-used: {}",
+        if unit_has_flag("--evict-lru") {
+            "on"
+        } else {
+            "off"
+        }
     );
 
     if active {
@@ -398,14 +410,18 @@ async fn cmd_status() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reads everything after `run` on the installed unit file's `ExecStart` line — i.e. exactly
-/// the flags `gratis up` was given, since that's the one place a running service's settings
-/// live (see `service.rs`). Lets `gratis status` show this without the user needing to grep
-/// the unit file by hand.
-fn flags_from_unit() -> Option<String> {
-    let unit = std::fs::read_to_string(service::unit_path().ok()?).ok()?;
-    let exec_start = unit.lines().find(|l| l.starts_with("ExecStart="))?;
-    Some(exec_start.split_once(" run ")?.1.trim().to_string())
+/// Whether the installed unit file's `ExecStart` line includes `flag` — since that's the one
+/// place a running service's settings live (see `service.rs`), this is how `gratis status`
+/// shows what a service was actually started with, without the user needing to grep the unit
+/// file by hand. `false` (not an error) if the unit can't be read at all.
+fn unit_has_flag(flag: &str) -> bool {
+    service::unit_path()
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|unit| {
+            unit.lines()
+                .any(|l| l.starts_with("ExecStart=") && l.contains(flag))
+        })
 }
 
 /// Reads the control port out of the installed unit file's `ExecStart` line rather than

@@ -19,13 +19,8 @@
     {% else %}
     <p class="text-xs text-ink/40 mt-3">Not logged in.</p>
     {% endif %}
-    {% if unlimited || evict_lru %}
-    <p class="text-xs text-ink/40 mt-1 font-mono">
-      flags:
-      {% if unlimited %}<span class="text-amber-700">--unlimited-connections</span>{% endif %}
-      {% if unlimited && evict_lru %}·{% endif %}
-      {% if evict_lru %}--evict-lru{% endif %}
-    </p>
+    {% if evict_lru %}
+    <p class="text-xs text-ink/40 mt-1">Automatically evicts the least-recently-used idle server when at capacity.</p>
     {% endif %}
   </header>
 
