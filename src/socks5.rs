@@ -99,7 +99,7 @@ pub async fn run_socks5(
             Err(err) => {
                 // Transient accept errors (EMFILE/ENFILE/ECONNABORTED, etc.) must not take
                 // down the whole listener.
-                eprintln!("socks5: accept() failed, continuing to listen: {err}");
+                log::warn!("socks5: accept() failed, continuing to listen: {err}");
                 continue;
             }
         };

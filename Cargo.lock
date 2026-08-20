@@ -1690,6 +1690,7 @@ dependencies = [
  "env_logger",
  "keyring",
  "ksni",
+ "log",
  "notify-rust",
  "proton-srp",
  "rand_core 0.6.4",

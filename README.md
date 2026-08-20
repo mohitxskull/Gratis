@@ -129,6 +129,7 @@ it natively.
 | `gratis up [--control-port] [--port-range-start] [--unlimited-connections] [--evict-lru]` | Start the background service and tray |
 | `gratis down` | Stop them |
 | `gratis status` | Show login/running/persist/tray state, and server count if running |
+| `gratis logs [--watch]` | Show the service's (and tray's) systemd journal — `--watch` to follow |
 | `gratis persist` / `gratis persist --off` | Start (or stop starting) both automatically on login |
 | `gratis update` | Download and install the latest release, restarting the service (and tray) if running |
 | `gratis uninstall` | Remove the service, tray, stored session, and this binary |

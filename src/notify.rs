@@ -9,7 +9,7 @@ use notify_rust::Notification;
 /// Show a notification with no click action.
 pub fn notify(summary: &str, body: &str) {
     if let Err(err) = Notification::new().summary(summary).body(body).show() {
-        eprintln!("gratis: desktop notification failed ({err}); continuing without it");
+        log::warn!("desktop notification failed ({err}); continuing without it");
     }
 }
 
@@ -31,7 +31,7 @@ pub fn notify_clickable(summary: &str, body: &str, url: &str) {
         {
             Ok(n) => n,
             Err(err) => {
-                eprintln!("gratis: desktop notification failed ({err}); continuing without it");
+                log::warn!("desktop notification failed ({err}); continuing without it");
                 return;
             }
         };

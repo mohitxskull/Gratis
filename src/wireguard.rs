@@ -320,8 +320,8 @@ impl Tunnel {
             tokio::time::sleep(PROBE_INTERVAL).await;
         }
 
-        eprintln!(
-            "gratis: tunnel to {server_name} did not pass its readiness probe after {attempts} \
+        log::warn!(
+            "tunnel to {server_name} did not pass its readiness probe after {attempts} \
              attempt(s) in {:?}; serving it anyway",
             started.elapsed()
         );

@@ -269,7 +269,7 @@ impl TunnelDriver for RealDriver {
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             if let Err(err) = socks5::run_socks5(&listen_addr, source, stats).await {
-                eprintln!("socks5 listener on {listen_addr} exited: {err}");
+                log::warn!("socks5 listener on {listen_addr} exited: {err}");
             }
         })
     }
@@ -443,13 +443,12 @@ impl ServerSlot {
                 // re-verified every `READINESS_TTL`) — that would just be the same message
                 // repeated forever alongside the ~5s fallback wait it already costs.
                 if !self.agent_failure_logged.swap(true, Ordering::SeqCst) {
-                    eprintln!(
-                        "gratis: local-agent handshake for {} failed ({err}); falling back to \
-                         the readiness probe, so connections still work but the first one to \
-                         each server is ~5s slower (further repeats of this failure will be \
-                         silent until it clears).\n\
-                         gratis: if this persists, Proton has most likely changed the agent \
-                         protocol or rotated its pinned CAs — please report it with this \
+                    log::warn!(
+                        "local-agent handshake for {} failed ({err}); falling back to the \
+                         readiness probe, so connections still work but the first one to each \
+                         server is ~5s slower (further repeats of this failure will be silent \
+                         until it clears). If this persists, Proton has most likely changed the \
+                         agent protocol or rotated its pinned CAs — please report it with this \
                          message at https://github.com/mohitxskull/Gratis/issues so it can be \
                          updated.",
                         server.name

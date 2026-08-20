@@ -10,6 +10,7 @@
 //! for Proton session tokens (`uid`, `access_token`, `refresh_token`) and stores those in the OS
 //! keychain (`session.rs`), which is also what makes every later `up`/`run` fast (no SRP, no
 //! password prompt).
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use gratis::api;
 use gratis::client::ProtonVPNClient;
@@ -62,6 +63,13 @@ enum Command {
     Down,
     /// Show whether gratis is logged in, running, and set to start on login.
     Status,
+    /// Show the service's (and its tray's) systemd journal logs.
+    Logs {
+        /// Keep following new log lines instead of exiting after showing recent history —
+        /// same idea as `journalctl -f`.
+        #[arg(long)]
+        watch: bool,
+    },
     /// Start the service automatically on login.
     Persist {
         /// Stop starting automatically on login.
@@ -106,7 +114,22 @@ enum Command {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    env_logger::init();
+    // `gratis=info` by default — plain `env_logger::init()` defaults to `error`-only, which
+    // would silently swallow every `log::info!`/`log::warn!` line below unless the user already
+    // knew to set `RUST_LOG`. Scoped to this crate specifically (not a blanket `info`) so a
+    // dependency's own verbose logging (e.g. `zbus`, used by the tray/keychain/notifications)
+    // doesn't flood `journalctl --user -u gratis` by default. `RUST_LOG` still overrides this
+    // entirely, e.g. `RUST_LOG=debug` for more detail or `RUST_LOG=warn` for less.
+    //
+    // Log level policy: `info!` for daemon lifecycle events (listening address, session
+    // resumed/logged in, service starting) — visible by default. `warn!` for something a human
+    // should notice but that the daemon already recovered from (a periodic refresh/update-check
+    // that failed and will retry, a local-agent handshake falling back to the slower readiness
+    // probe, a desktop notification that couldn't be shown). CLI-subcommand output (`gratis
+    // status`, `gratis login`, etc.) is unaffected — those print directly to the terminal as a
+    // command's own response, not as log output.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("gratis=info"))
+        .init();
     let cli = Cli::parse();
 
     let result = match cli.command {
@@ -125,6 +148,7 @@ async fn main() {
         ),
         Command::Down => cmd_down(),
         Command::Status => cmd_status().await,
+        Command::Logs { watch } => cmd_logs(watch),
         Command::Persist { off } => cmd_persist(off),
         Command::Update => cmd_update().await,
         Command::Uninstall => cmd_uninstall(),
@@ -405,6 +429,30 @@ fn mask_email(email: &str) -> String {
     }
 }
 
+/// Shows the daemon's (and its tray's) systemd journal — exactly what `journalctl --user -u
+/// gratis -u gratis-tray` would, since that's what this runs. Not a re-implementation of log
+/// viewing: journald already does retention, filtering, and (with `--watch`) following, so this
+/// is just a shorter, memorable way to reach it without knowing the unit names.
+fn cmd_logs(watch: bool) -> anyhow::Result<()> {
+    let mut cmd = std::process::Command::new("journalctl");
+    cmd.args(["--user", "-u", "gratis", "-u", "gratis-tray"]);
+    if watch {
+        cmd.arg("-f");
+    } else {
+        // Bounded by default (unlike a bare `journalctl -u ...`, which prints the unit's
+        // entire retained history) — recent context is almost always what you actually want;
+        // `--watch` or a raw `journalctl` invocation are both still there for everything else.
+        cmd.args(["-n", "200"]);
+    }
+    let status = cmd
+        .status()
+        .context("failed to run journalctl (is systemd/journald installed?)")?;
+    if !status.success() {
+        anyhow::bail!("journalctl exited with {status}");
+    }
+    Ok(())
+}
+
 fn cmd_persist(off: bool) -> anyhow::Result<()> {
     if !service::is_installed()? {
         anyhow::bail!("service not installed — run `gratis up` first");
@@ -504,19 +552,14 @@ async fn resume_or_login(manager: Arc<TunnelManager>, control_port: u16) {
                     // The stored access token had expired and got refreshed — persist the new
                     // one so the next `run` doesn't have to refresh again immediately.
                     if let Err(err) = session::store(&updated) {
-                        eprintln!("gratis: failed to persist refreshed session: {err}");
+                        log::warn!("failed to persist refreshed session: {err}");
                     }
                 }
                 let count = manager.servers().len();
-                println!(
-                    "gratis: resumed session ({}), {count} servers ready",
-                    session.email
-                );
+                log::info!("resumed session ({}), {count} servers ready", session.email);
             }
             Err(err) => {
-                eprintln!(
-                    "gratis: stored session is no longer valid ({err}) — run `gratis login` again"
-                );
+                log::warn!("stored session is no longer valid ({err}) — run `gratis login` again");
                 gratis::notify::notify_clickable(
                     "gratis: session expired",
                     "Run `gratis login` again to reconnect. Click to open the dashboard.",
@@ -535,17 +578,17 @@ async fn resume_or_login(manager: Arc<TunnelManager>, control_port: u16) {
                 (Some(email), Some(password)) => match manager.login(&email, &password).await {
                     Ok(()) => {
                         let count = manager.servers().len();
-                        println!("gratis: logged in from .env ({email}), {count} servers ready");
+                        log::info!("logged in from .env ({email}), {count} servers ready");
                     }
-                    Err(err) => eprintln!("gratis: login from .env failed: {err}"),
+                    Err(err) => log::warn!("login from .env failed: {err}"),
                 },
-                _ => eprintln!(
-                    "gratis: no stored session and no .env (EMAIL + PASSWORD) — run `gratis login`"
+                _ => log::warn!(
+                    "no stored session and no .env (EMAIL + PASSWORD) — run `gratis login`"
                 ),
             }
         }
         Err(err) => {
-            eprintln!("gratis: failed to read stored session ({err}), starting with no servers")
+            log::warn!("failed to read stored session ({err}), starting with no servers")
         }
     }
 }
@@ -571,7 +614,7 @@ async fn cmd_run(
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(err) => {
-            eprintln!("gratis: failed to bind {addr}: {err}");
+            log::warn!("failed to bind {addr}: {err}");
             gratis::notify::notify(
                 "gratis: failed to start",
                 &format!("Could not bind {addr}: {err}"),
@@ -580,7 +623,7 @@ async fn cmd_run(
         }
     };
 
-    println!("gratis: control API + web UI listening on http://{addr}");
+    log::info!("control API + web UI listening on http://{addr}");
 
     // One task: the initial login/session-resume, then (whether or not it succeeded — a
     // stored session can still be fixed later by a fresh `gratis login` elsewhere) periodic
@@ -598,9 +641,9 @@ async fn cmd_run(
             loop {
                 interval.tick().await;
                 if let Err(err) = manager.refresh_servers().await {
-                    eprintln!(
-                        "gratis: periodic server-list refresh failed ({err}); keeping the \
-                         existing list until the next attempt"
+                    log::warn!(
+                        "periodic server-list refresh failed ({err}); keeping the existing \
+                         list until the next attempt"
                     );
                 }
             }
@@ -636,8 +679,8 @@ async fn cmd_run(
                         last_notified = latest;
                     }
                     Err(err) => {
-                        eprintln!(
-                            "gratis: periodic update check failed ({err}); will retry next interval"
+                        log::warn!(
+                            "periodic update check failed ({err}); will retry next interval"
                         );
                     }
                 }
@@ -648,16 +691,16 @@ async fn cmd_run(
     tokio::select! {
         result = axum::serve(listener, router) => {
             if let Err(err) = result {
-                eprintln!("gratis: server error: {err}");
+                log::error!("server error: {err}");
                 std::process::exit(1);
             }
         }
         signal_result = tokio::signal::ctrl_c() => {
             if let Err(err) = signal_result {
-                eprintln!("gratis: failed to install Ctrl-C handler: {err}");
+                log::warn!("failed to install Ctrl-C handler: {err}");
                 return Ok(());
             }
-            eprintln!("gratis: received shutdown signal, exiting");
+            log::info!("received shutdown signal, exiting");
         }
     }
     Ok(())

@@ -38,6 +38,7 @@ wireguard-netstack = "0.3"
 async-trait = "0.1"
 askama = "0.16"
 env_logger = "0.11.11"
+log = "0.4"
 # WHY: implements Proton's "local agent" handshake (see `agent.rs`) — client-cert TLS to
 # 10.2.0.1:65432 through the userspace tunnel, which is what actually lifts Proton's
 # restricted-session block instead of waiting it out. Pinned to the same rustls major `reqwest`

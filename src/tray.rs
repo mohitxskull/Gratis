@@ -108,7 +108,7 @@ impl ksni::Tray for GratisTray {
                         service::start()
                     };
                     if let Err(err) = result {
-                        eprintln!("gratis: tray action failed: {err}");
+                        log::warn!("tray action failed: {err}");
                     }
                 }),
                 ..Default::default()
