@@ -389,13 +389,15 @@ fn read_dotenv_var(path: &std::path::Path, key: &str) -> Option<String> {
         .find_map(|line| line.strip_prefix(&format!("{key}=")).map(|v| v.to_string()))
 }
 
-async fn cmd_run(
-    control_port: u16,
-    port_range_start: u16,
-    unlimited_connections: bool,
-) -> anyhow::Result<()> {
-    let manager = Arc::new(TunnelManager::new(port_range_start, unlimited_connections));
-
+/// Resume the stored session (or fall back to a `.env`) and populate `manager`'s server list.
+/// Split out of `cmd_run` so it can run *concurrently* with the control API instead of
+/// blocking the listener bind — this is a real ~15-20s network round trip (session-resume:
+/// fetch_servers + certificate minting) against Proton's live API, during which `gratis
+/// status`'s HTTP probe would otherwise see "connection refused" even though the service is
+/// genuinely starting up correctly (confirmed live: `systemctl` marks a `Type=simple` unit
+/// active the instant the process starts, with no readiness signal, so there's no way to
+/// distinguish "still starting" from "broken" without the port already being open).
+async fn resume_or_login(manager: Arc<TunnelManager>, control_port: u16) {
     match session::load() {
         Ok(Some(session)) => match manager.login_with_session(&session).await {
             Ok(updated) => {
@@ -447,7 +449,18 @@ async fn cmd_run(
             eprintln!("gratis: failed to read stored session ({err}), starting with no servers")
         }
     }
+}
 
+async fn cmd_run(
+    control_port: u16,
+    port_range_start: u16,
+    unlimited_connections: bool,
+) -> anyhow::Result<()> {
+    let manager = Arc::new(TunnelManager::new(port_range_start, unlimited_connections));
+
+    // Bind and start serving *before* logging in — see `resume_or_login`'s doc comment for
+    // why. `manager` starts with an empty server list, which the web UI and `/api/servers`
+    // already render as a normal (not error) empty state.
     let router = api::router(manager.clone());
 
     let addr = format!("127.0.0.1:{control_port}");
@@ -464,6 +477,8 @@ async fn cmd_run(
     };
 
     println!("gratis: control API + web UI listening on http://{addr}");
+
+    tokio::spawn(resume_or_login(manager.clone(), control_port));
 
     tokio::select! {
         result = axum::serve(listener, router) => {
