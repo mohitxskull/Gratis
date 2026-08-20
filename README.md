@@ -16,24 +16,31 @@ servers at once as you want, simply by connecting to different ports.
 
 ## Installation
 
-Grab the tarball for your platform from the
-[latest release](https://github.com/mohitxskull/Gratis/releases/latest) and extract it —
-no build tools, no Rust toolchain needed. Pick one of `x86_64-unknown-linux-gnu`,
-`aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, or `aarch64-apple-darwin`:
+gratis is Linux-only, and installs as a background `systemd --user` service — no terminal
+window to keep open.
 
 ```sh
-# with the GitHub CLI (always fetches the current latest release):
-gh release download --repo mohitxskull/Gratis --pattern "*x86_64-unknown-linux-gnu*"
-
-# or with curl, filling in the exact filename from the releases page:
-curl -LO https://github.com/mohitxskull/Gratis/releases/latest/download/<filename>.tar.gz
-
-tar xzf gratis-*.tar.gz && cd gratis-*/
-./gratis --help
+curl -fsSL https://raw.githubusercontent.com/mohitxskull/Gratis/main/install.sh | sh
 ```
 
-Move the extracted `gratis` binary onto your `PATH` (e.g. `~/.local/bin` or `/usr/local/bin`)
-if you want to run it as just `gratis` from anywhere.
+This downloads the latest release for your architecture (`x86_64` or `aarch64`) and places
+the `gratis` binary at `~/.local/bin/gratis` — no build tools, no Rust toolchain needed. It
+does not log in or start anything; that's `gratis login` and `gratis up` below.
+
+<details>
+<summary>Installing manually instead</summary>
+
+Grab the tarball for your architecture from the
+[latest release](https://github.com/mohitxskull/Gratis/releases/latest), extract it, and
+move the `gratis` binary onto your `PATH` yourself:
+
+```sh
+curl -LO https://github.com/mohitxskull/Gratis/releases/latest/download/<filename>.tar.gz
+tar xzf gratis-*.tar.gz
+mv gratis-*/gratis ~/.local/bin/gratis
+```
+
+</details>
 
 <details>
 <summary>Building from source instead</summary>
@@ -46,39 +53,65 @@ cargo install --git https://github.com/mohitxskull/Gratis
 
 ## Usage
 
-Create a `.env` file next to the `gratis` binary with your Proton account credentials:
-
+```sh
+gratis login       # authenticate once — email/password prompt, or EMAIL/PASSWORD env vars
+gratis up          # start the background service
+gratis status       # logged in? running? starting on login?
+gratis down          # stop it
 ```
-EMAIL=you@example.com
-PASSWORD=your-password
-```
 
-Then run it:
+`login` exchanges your password for a Proton session (stored in the OS keychain, via the
+Secret Service — GNOME Keyring, KWallet, etc.) and never stores the password itself. Every
+later `up`/service restart reuses that stored session instead of logging in again, which is
+also what makes startup fast.
+
+Once `up`, point any SOCKS5 client at `127.0.0.1:<port>` for the server you want (see the
+web UI or `status` for the list); the first connection brings that server's tunnel up, and
+it stays up for as long as there's at least one open connection, plus 5 idle minutes after
+the last one closes.
+
+A read-only web UI is served at `http://127.0.0.1:9000` (configurable via `gratis up
+--control-port`), showing the logged-in account, every server, its port, load, and live
+connection status. The same server data is available as JSON at `GET /api/servers`. Both
+the control API and every server's SOCKS5 port are bound to `127.0.0.1` only.
+
+### Connection limit
+
+By default, gratis caps how many servers can have a live tunnel **at the same time** at
+your account's real Proton `MaxConnect` limit (free tier: 2, at last check) — fetched at
+startup, not hardcoded. A server beyond that cap simply refuses new SOCKS5 connections
+until another one idles out; nothing already connected gets dropped to make room.
+
+`gratis up --unlimited-connections` bypasses this cap entirely. **Running more concurrent
+tunnels than your account's plan allows is likely a violation of Proton's Terms of
+Service** (§2.10 permits automation that's "indistinguishable from the standard client,"
+but explicitly reserves the right to act on usage that "deviates significantly from normal
+usage patterns") **and risks account action, up to termination on the free tier.** This
+flag exists for people who understand and accept that risk — the web UI shows a persistent
+warning banner whenever it's active, and the default (capped) behavior is what most people
+should run.
+
+### All commands
+
+| Command | Does |
+| --- | --- |
+| `gratis login` | Authenticate and store the session in the OS keychain |
+| `gratis logout` | Stop the service and forget the stored session |
+| `gratis up [--control-port] [--port-range-start] [--unlimited-connections]` | Start the background service |
+| `gratis down` | Stop it |
+| `gratis status` | Show login/running/persist state, and server count if running |
+| `gratis persist` / `gratis persist --off` | Start (or stop starting) automatically on login |
+| `gratis update` | Download and install the latest release, restarting the service if it was running |
+| `gratis uninstall` | Remove the service, stored session, and this binary |
+
+### Running in the foreground instead
+
+If you'd rather not install the service (e.g. for local development), `EMAIL`/`PASSWORD`
+env vars or a `.env` file still work directly with `cargo run`:
 
 ```sh
-./gratis
+EMAIL=you@example.com PASSWORD=your-password cargo run --release -- run
 ```
-
-(If you built from source instead of downloading a release: `cargo run --release`.)
-
-On startup it logs in, fetches the free-tier server list, and assigns each server a fixed
-port starting from `20000` (configurable — see below). Point any SOCKS5 client at
-`127.0.0.1:<port>` for the server you want; the first connection brings that server's
-tunnel up, and it stays up for as long as there's at least one open connection, plus 5
-idle minutes after the last one closes.
-
-A read-only web UI is served at `http://127.0.0.1:9000` (also configurable), showing every
-server, its port, load, and live connection status. The same data is available as JSON at
-`GET /api/servers`.
-
-### CLI options
-
-| Flag | Default | Meaning |
-| --- | --- | --- |
-| `--control-port` | `9000` | Port the web UI + `/api/servers` listen on |
-| `--port-range-start` | `20000` | First port assigned to the server list (one port per server, sequential) |
-
-Both the control API and every server's SOCKS5 port are bound to `127.0.0.1` only.
 
 ## Development
 
@@ -122,9 +155,10 @@ with a `!` suffix or a `BREAKING CHANGE:` footer is flagged as breaking.
 
 ## How it works
 
-- **`src/manager.rs`** — one `ServerSlot` per free-tier server: a fixed port, an always-on
-  SOCKS5 listener, and a WireGuard tunnel that connects lazily on first use and tears down
-  after being idle (zero open connections) for 5 minutes.
+- **`src/manager.rs`** — one `ServerSlot` per server the account's real tier (fetched via
+  `GET /vpn/v2`, not assumed) can reach: a fixed port, an always-on SOCKS5 listener, and a
+  WireGuard tunnel that connects lazily on first use and tears down after being idle (zero
+  open connections) for 5 minutes. Also enforces the connection limit described above.
 - **`src/wireguard.rs`** — an in-process userspace WireGuard session (via
   `wireguard-netstack`), not a real kernel interface.
 - **`src/socks5.rs`** — a minimal SOCKS5 (CONNECT-only) proxy that relays traffic through
@@ -136,9 +170,17 @@ with a `!` suffix or a `BREAKING CHANGE:` footer is flagged as breaking.
   authenticating to the agent (client-certificate TLS to `10.2.0.1:65432`, verified against
   Proton's pinned CAs in `assets/certs/`) lifts that immediately, which is what makes the
   first connection to a server fast.
+- **`src/session.rs`** — the stored Proton session (`uid`/`access_token`/`refresh_token`,
+  never the password) in the OS keychain, and what `gratis run` resumes on startup instead
+  of a full SRP login.
+- **`src/service.rs`** — writes/starts/stops/enables the `systemd --user` unit that `up`/
+  `down`/`persist` control.
+- **`src/update.rs`** — `gratis update`'s self-replace: downloads the matching release
+  tarball and swaps the running binary in place.
 
-Nothing is persisted to disk: every run is a fresh login, and no tunnel or server-list
-state survives a restart.
+No tunnel or server-list *state* survives a restart — those are always rebuilt fresh on
+`gratis run` startup. The Proton *session* does persist (in the keychain), which is what
+lets a restart skip the SRP login.
 
 ## If gratis gets slow — please report it
 
@@ -194,8 +236,8 @@ cargo install git-cliff          # once
 The tag is the only trigger. Pushing it runs `.github/workflows/release.yml`, which
 verifies the tag matches `Cargo.toml` and that `CHANGELOG.md` has a section for the
 version, runs tests and clippy, builds a binary for each of
-`x86_64`/`aarch64-unknown-linux-gnu` and `x86_64`/`aarch64-apple-darwin`, and publishes a
-GitHub Release with all four tarballs attached and notes generated by git-cliff.
+`x86_64`/`aarch64-unknown-linux-gnu`, and publishes a
+GitHub Release with both tarballs attached and notes generated by git-cliff.
 
 Preview the notes for an unreleased set of commits at any time:
 
