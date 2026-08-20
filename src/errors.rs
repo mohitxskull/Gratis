@@ -9,6 +9,12 @@ pub enum ProtonError {
     #[error("authentication failed")]
     Auth,
 
+    /// The account has two-factor authentication enabled and `/auth` succeeded but returned
+    /// the `"twofactor"` scope — the caller must collect a TOTP code and call
+    /// `ProtonVPNClient::submit_2fa` before anything else will work.
+    #[error("two-factor authentication required")]
+    TwoFactorRequired,
+
     #[error("SRP error: {0}")]
     Srp(#[from] proton_srp::SRPError),
 

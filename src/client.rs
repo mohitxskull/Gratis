@@ -20,6 +20,9 @@ pub struct ProtonVPNClient {
     /// bearer token gets a bare 401 (this was silently broken until fetch_certificate's live
     /// 401 surfaced it; `/vpn/v1/certificate` was the first call to require session auth).
     pub uid: Option<String>,
+    /// Set after `login`/`refresh` — used by `session.rs`/`gratis login` to persist a
+    /// resumable session. Never sent as a request header; only the bearer/UID pair is.
+    pub refresh_token: Option<String>,
     pub vpn_credentials: Option<VPNCredentials>,
     pub server_list: Vec<VPNServer>,
 }
@@ -47,6 +50,7 @@ impl ProtonVPNClient {
             client,
             auth_token: None,
             uid: None,
+            refresh_token: None,
             vpn_credentials: None,
             server_list: Vec::new(),
         }
@@ -170,15 +174,87 @@ impl ProtonVPNClient {
 
         self.auth_token = auth.access_token.clone();
         self.uid = auth.uid.clone();
+        self.refresh_token = auth.refresh_token.clone();
 
-        // 6. Generate a client WireGuard/certificate identity and ask Proton to sign it.
-        //    Verified against proton-vpn-api-core: the server never hands back a private
-        //    key (`GET /vpn/v2/account`, this flow's old source of `VPNCredentials`, doesn't
-        //    exist for this purpose at all) — the client generates its own ed25519/X25519
-        //    keypair and requests a certificate for the public half. A fresh identity is
-        //    minted on every login rather than restored from a prior one; restoring a saved
-        //    identity across logins is not implemented (matches the daemon's existing,
-        //    already-documented "no unattended restore" limitation).
+        // 6. If the account has 2FA enabled, `/auth` succeeds (password was correct) but
+        //    scopes the session down until a TOTP/FIDO2 code is also submitted — see
+        //    `needs_twofa` in the reference cited on `TwoFactorResponse`. `self.auth_token`/
+        //    `self.uid` are already set at this point, so the caller can go straight to
+        //    `submit_2fa` without repeating SRP.
+        if auth.scopes.iter().any(|s| s == "twofactor") {
+            return Err(ProtonError::TwoFactorRequired);
+        }
+
+        self.issue_credentials(email).await
+    }
+
+    /// Complete a login that returned [`ProtonError::TwoFactorRequired`]: submit the
+    /// account's TOTP code and, on success, finish the same way a non-2FA `login` would
+    /// (mint a client identity + certificate). Must be called on the same `ProtonVPNClient`
+    /// that returned `TwoFactorRequired` — it relies on `self.auth_token`/`self.uid` already
+    /// being set from that call.
+    pub async fn submit_2fa(&mut self, code: &str) -> Result<VPNCredentials> {
+        let email = self.username.clone();
+        let resp: TwoFactorResponse = self
+            .post("/auth/2fa", &serde_json::json!({ "TwoFactorCode": code }))
+            .await?;
+        if resp.response_code != Some(1000) {
+            return Err(ProtonError::Auth);
+        }
+        self.issue_credentials(&email).await
+    }
+
+    /// Resume a previously stored session (see `session.rs`) instead of running SRP again —
+    /// this is what makes `gratis up`/`gratis run` fast: it skips the password-derived SRP
+    /// math entirely and goes straight to minting a fresh certificate off the stored
+    /// `access_token`. Call `fetch_servers` first with these credentials set to confirm the
+    /// token is still valid (a `401` there means it needs `refresh`, not this).
+    pub async fn authenticate_with_session(
+        &mut self,
+        uid: &str,
+        access_token: &str,
+    ) -> Result<VPNCredentials> {
+        self.auth_token = Some(access_token.to_string());
+        self.uid = Some(uid.to_string());
+        let email = self.username.clone();
+        self.issue_credentials(&email).await
+    }
+
+    /// Exchange a `refresh_token` for a new `access_token`/`refresh_token` pair, without
+    /// re-running SRP. Endpoint/body shape verified against
+    /// `proton.session.api.Session.async_refresh` (`/usr/lib/python3/dist-packages/proton/
+    /// session/api.py`): the body carries `ResponseType`/`GrantType`/`RefreshToken`/
+    /// `RedirectURI` only — **no `UID` field** — the account is identified purely by the
+    /// `x-pm-uid` header (see `authed`), which is why `self.uid` must already be set before
+    /// calling this.
+    pub async fn refresh(&mut self, uid: &str, refresh_token: &str) -> Result<AuthResponse> {
+        self.uid = Some(uid.to_string());
+        let body = serde_json::json!({
+            "ResponseType": "token",
+            "GrantType": "refresh_token",
+            "RefreshToken": refresh_token,
+            "RedirectURI": "http://protonmail.ch",
+        });
+        let auth: AuthResponse = self.post("/auth/refresh", &body).await?;
+        if auth.response_code != Some(1000) {
+            return Err(ProtonError::Auth);
+        }
+        self.auth_token = auth.access_token.clone();
+        self.uid = auth.uid.clone().or_else(|| Some(uid.to_string()));
+        self.refresh_token = auth.refresh_token.clone();
+        Ok(auth)
+    }
+
+    /// Generate a client WireGuard/certificate identity and ask Proton to sign it. Verified
+    /// against proton-vpn-api-core: the server never hands back a private key (`GET
+    /// /vpn/v2/account`, this flow's old source of `VPNCredentials`, doesn't exist for this
+    /// purpose at all) — the client generates its own ed25519/X25519 keypair and requests a
+    /// certificate for the public half. A fresh identity is minted every time this runs
+    /// (fresh SRP login or session resume alike) rather than restored from a prior one;
+    /// restoring a saved identity is not implemented (matches the daemon's existing,
+    /// already-documented "no unattended restore" limitation) — `self.auth_token`/`self.uid`
+    /// must already be set (by `login` or `authenticate_with_session`) before calling this.
+    async fn issue_credentials(&mut self, email: &str) -> Result<VPNCredentials> {
         let identity = ClientIdentity::generate();
         let cert: CertificateResponse = self
             .post(
@@ -217,6 +293,14 @@ impl ProtonVPNClient {
             .map(map_logical)
             .collect();
         Ok(())
+    }
+
+    /// Fetch this account's plan/tier/connection-limit info. Verified live (see
+    /// `VPNSettings`'s doc comment) — used by `manager.rs` to filter the server list by the
+    /// account's real tier instead of assuming free, and to enforce `MaxConnect` as the
+    /// default simultaneous-tunnel cap.
+    pub async fn fetch_account_info(&self) -> Result<VPNSettings> {
+        self.get("/vpn/v2").await
     }
 
     /// Find servers matching criteria, lowest load first. Pure (operates on `server_list`).

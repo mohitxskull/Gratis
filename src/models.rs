@@ -121,6 +121,47 @@ pub struct AuthResponse {
     pub error: Option<String>,
     #[serde(rename = "ServerProof", default)]
     pub server_proof: Option<String>,
+    /// Present on every successful `/auth` (and `/auth/refresh`) response. Verified against
+    /// `proton.session.api.Session.needs_twofa`: 2FA is required exactly when this list
+    /// contains `"twofactor"` — there is no separate boolean flag for it.
+    #[serde(rename = "Scopes", default)]
+    pub scopes: Vec<String>,
+}
+
+/// `POST /auth/2fa` response. Verified against
+/// `proton.session.api.Session._async_validate_2fa`: success is `Code == 1000`; the response
+/// also carries an updated `Scopes` list (now without `"twofactor"`), which this client
+/// doesn't need to inspect since a non-1000 code already means the code was rejected.
+#[derive(Debug, Deserialize)]
+pub struct TwoFactorResponse {
+    #[serde(rename = "Code")]
+    pub response_code: Option<i32>,
+}
+
+/// `GET /vpn/v2` response. Verified live against a real free-tier account (`MaxTier: 0,
+/// MaxConnect: 2, PlanName: "free", Groups: ["vpn-free"]`) and against the field shape in
+/// `proton.vpn.session.dataclasses.settings.VPNSettings`/`VPNInfo`
+/// (`/usr/lib/python3/dist-packages/proton/vpn/session/dataclasses/settings.py`).
+#[derive(Debug, Deserialize)]
+pub struct VPNSettings {
+    #[serde(rename = "VPN")]
+    pub vpn: VPNAccountInfo,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VPNAccountInfo {
+    #[serde(rename = "PlanName")]
+    pub plan_name: String,
+    /// The highest server tier this account can connect to (`0` = free). This is what
+    /// `manager.rs` filters the server list by — never a hardcoded assumption.
+    #[serde(rename = "MaxTier")]
+    pub max_tier: i32,
+    /// Proton's cap on simultaneous VPN sessions for this account. `manager.rs` enforces this
+    /// as the default cap on how many servers can have a live tunnel at once (bypassable via
+    /// `--unlimited-connections`) — gratis's "any number of servers at once" design otherwise
+    /// has no relationship to what the account is actually allowed.
+    #[serde(rename = "MaxConnect")]
+    pub max_connect: i32,
 }
 
 /// Map a `LogicalServerDto.features` bitmask into strings. Verified against
