@@ -22,15 +22,17 @@
 //! "leaked interface" failure mode, no privileged `is_up` check, and no boot reconciliation of
 //! stale kernel state to get wrong.
 //!
-//! ## No persistence
+//! ## No slot-state persistence
 //!
-//! Nothing here is written to disk. Login is always a fresh `.env`-driven login at daemon
-//! startup (see `main.rs`); there is no saved-session restore, and no record of which slots
-//! were connected survives a restart — there wouldn't be anything meaningful to restore, since
-//! a tunnel cannot outlive the process that holds it anyway.
+//! Nothing about *slots* is written to disk: no record of which slots were connected survives
+//! a restart — there wouldn't be anything meaningful to restore, since a tunnel cannot outlive
+//! the process that holds it anyway. The Proton *session* (tokens, not slot state) can be
+//! persisted separately by the caller (see `session.rs`) and handed back in via
+//! `login_with_session` to skip a full SRP login on the next start.
 use crate::client::ProtonVPNClient;
 use crate::errors::*;
 use crate::models::{VPNCredentials, VPNServer};
+use crate::session::Session;
 use crate::socks5::{self, SourceError, TunnelSource};
 use crate::wireguard::{SharedTunnel, Tunnel, TunnelStats};
 use async_trait::async_trait;
@@ -99,18 +101,67 @@ const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(25);
 /// without charging the probe to back-to-back connections, which are the common case.
 const READINESS_TTL: Duration = Duration::from_secs(30);
 
-/// Account tier used to filter the server list to what's actually reachable.
-///
-/// `client.rs`/`models.rs` don't currently surface the account's actual tier anywhere the
-/// manager can read it. This was previously `i32::MAX` (disabling the filter entirely) — **
-/// confirmed live to be a real bug, not just a theoretical gap**: with the filter disabled,
-/// server selection picked servers regardless of tier, which for a free-tier test account
-/// selected a tier-2 (paid) server. The WireGuard handshake succeeded (it authenticates by
-/// keypair, not by tier), but Proton silently dropped all subsequent data traffic — the symptom
-/// was indistinguishable from a relay bug until traced back to server selection. Defaulting to
-/// `0` (free tier) is the safe, conservative choice: it never selects a server above what every
-/// account is entitled to.
-const PERMISSIVE_TIER: i32 = 0;
+/// Fallback account tier used to filter the server list, only if `GET /vpn/v2` (see
+/// `client::fetch_account_info`) can't be reached — the manager otherwise always uses the
+/// account's real `MaxTier` from that call. This was previously the *only* tier value used at
+/// all (hardcoded, `i32::MAX` before that) — **confirmed live to be a real bug, not just a
+/// theoretical gap**: with the filter disabled, server selection picked servers regardless of
+/// tier, which for a free-tier test account selected a tier-2 (paid) server. The WireGuard
+/// handshake succeeded (it authenticates by keypair, not by tier), but Proton silently dropped
+/// all subsequent data traffic — the symptom was indistinguishable from a relay bug until traced
+/// back to server selection. `0` (free tier) is the safe, conservative fallback: it never
+/// selects a server above what every account is entitled to.
+const FALLBACK_TIER: i32 = 0;
+
+/// Caps how many servers can have a live WireGuard tunnel at the same time, matching Proton's
+/// per-account `MaxConnect` limit. Without this, gratis's "any number of servers at once"
+/// design has no relationship to what the account is actually allowed to run simultaneously —
+/// on a free-tier account (`MaxConnect: 1` in Proton's ToS, `2` observed live) that's a clean
+/// simultaneous-connections violation, not just a theoretical one. `None` bypasses the cap
+/// entirely (`gratis up --unlimited-connections`) — a deliberate, opt-in choice the user makes
+/// knowingly, not the default.
+struct ConnectionLimiter {
+    max: Option<u32>,
+    current: AtomicU32,
+}
+
+impl ConnectionLimiter {
+    fn new(max: Option<u32>) -> Self {
+        Self {
+            max,
+            current: AtomicU32::new(0),
+        }
+    }
+
+    /// Reserve one connection slot. Returns `false` (reserving nothing) if already at `max`;
+    /// always succeeds if `max` is `None`.
+    fn try_acquire(&self) -> bool {
+        let Some(max) = self.max else {
+            self.current.fetch_add(1, Ordering::SeqCst);
+            return true;
+        };
+        loop {
+            let cur = self.current.load(Ordering::SeqCst);
+            if cur >= max {
+                return false;
+            }
+            if self
+                .current
+                .compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    /// Release a slot reserved by a successful `try_acquire` — call exactly once per tunnel
+    /// that goes from connected back to disconnected (a failed connect attempt that never
+    /// actually reserved doesn't call this; see the two call sites in `ServerSlot`).
+    fn release(&self) {
+        self.current.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// Seam for testing `TunnelManager` without root/live WireGuard/network access.
 ///
@@ -204,6 +255,8 @@ struct ServerSlot {
     /// Lets `release` spawn a self-referencing idle-teardown task without `ServerSlot` needing
     /// to already know its own `Arc` at construction time (see `ServerSlot::new`).
     self_ref: Weak<ServerSlot>,
+    /// Shared across every slot from the same login — see [`ConnectionLimiter`].
+    limiter: Arc<ConnectionLimiter>,
 }
 
 impl ServerSlot {
@@ -212,6 +265,7 @@ impl ServerSlot {
         creds: VPNCredentials,
         driver: Arc<dyn TunnelDriver>,
         port: u16,
+        limiter: Arc<ConnectionLimiter>,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak| Self {
             server,
@@ -228,6 +282,7 @@ impl ServerSlot {
             agent_failure_logged: AtomicBool::new(false),
             connect_lock: AsyncMutex::new(()),
             self_ref: weak.clone(),
+            limiter,
         })
     }
 
@@ -386,21 +441,38 @@ impl TunnelSource for ServerSlot {
         let already_connected = self.tunnel.lock().unwrap().clone();
         let tunnel = match already_connected {
             Some(tunnel) => tunnel,
-            None => match self.connect_with_retry().await {
-                Ok(tunnel) => {
-                    *self.tunnel.lock().unwrap() = Some(tunnel.clone());
-                    *self.connected_at.lock().unwrap() = Some(Instant::now());
-                    // A newly connected tunnel is restricted by Proton until it proves otherwise.
-                    *self.verified_at.lock().unwrap() = None;
-                    tunnel
-                }
-                Err(err) => {
-                    // Undo the increment above: this connection never got a tunnel, so it must
-                    // not be counted as "open" for idle-teardown purposes.
+            None => {
+                // A fresh tunnel counts against the account's simultaneous-connection cap —
+                // reserve a slot before connecting, not after, so two servers can't race past
+                // the limit. Reusing an already-connected tunnel (the `Some` arm above) never
+                // reaches here, since it doesn't open a new session with Proton.
+                if !self.limiter.try_acquire() {
                     self.open_connections.fetch_sub(1, Ordering::SeqCst);
-                    return Err(Box::new(err));
+                    return Err(Box::new(ProtonError::Config(format!(
+                        "max simultaneous tunnels reached ({}) — disconnect another server \
+                         first, or start gratis with --unlimited-connections",
+                        self.limiter.max.unwrap_or(0)
+                    ))));
                 }
-            },
+                match self.connect_with_retry().await {
+                    Ok(tunnel) => {
+                        *self.tunnel.lock().unwrap() = Some(tunnel.clone());
+                        *self.connected_at.lock().unwrap() = Some(Instant::now());
+                        // A newly connected tunnel is restricted by Proton until it proves
+                        // otherwise.
+                        *self.verified_at.lock().unwrap() = None;
+                        tunnel
+                    }
+                    Err(err) => {
+                        // Undo both reservations: this connection never got a tunnel, so it
+                        // must not be counted as "open" for idle-teardown purposes, nor as a
+                        // live session against the connection cap.
+                        self.limiter.release();
+                        self.open_connections.fetch_sub(1, Ordering::SeqCst);
+                        return Err(Box::new(err));
+                    }
+                }
+            }
         };
 
         // Re-check under the lock: a concurrent caller may have just verified this tunnel.
@@ -442,6 +514,9 @@ impl TunnelSource for ServerSlot {
                 *slot.tunnel.lock().unwrap() = None;
                 *slot.connected_at.lock().unwrap() = None;
                 *slot.idle_deadline.lock().unwrap() = None;
+                // The connection-cap reservation this tunnel held (see `acquire`) is now free
+                // for another server to use.
+                slot.limiter.release();
             }
         });
     }
@@ -473,6 +548,17 @@ pub struct ServerStatus {
     pub bytes_received: u64,
 }
 
+/// Which Proton account is logged in and what it's entitled to — surfaced on the web UI so
+/// it's obvious at a glance which account gratis is running as. Set once per login (see
+/// `finish_login`); `None` only if `GET /vpn/v2` couldn't be reached at login time.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountSummary {
+    pub email: String,
+    pub plan_name: String,
+    pub max_tier: i32,
+    pub max_connect: i32,
+}
+
 pub struct TunnelManager {
     client: AsyncMutex<Option<ProtonVPNClient>>,
     driver: Arc<dyn TunnelDriver>,
@@ -480,22 +566,36 @@ pub struct TunnelManager {
     /// (server-id-sorted) order.
     port_range_start: u16,
     slots: Mutex<Vec<Arc<ServerSlot>>>,
+    /// Bypasses the account's `MaxConnect` cap entirely — see [`ConnectionLimiter`]. Set once
+    /// at construction from `gratis up --unlimited-connections`; a deliberate, opt-in choice.
+    unlimited: bool,
+    account: Mutex<Option<AccountSummary>>,
 }
 
 impl TunnelManager {
     /// Build a manager using the real tunnel/SOCKS5 driver.
-    pub fn new(port_range_start: u16) -> Self {
-        Self::with_driver(port_range_start, Arc::new(RealDriver))
+    pub fn new(port_range_start: u16, unlimited_connections: bool) -> Self {
+        Self::with_driver(
+            port_range_start,
+            Arc::new(RealDriver),
+            unlimited_connections,
+        )
     }
 
     /// Build a manager with an injected driver (used by tests to avoid touching real
     /// WireGuard/network state).
-    pub fn with_driver(port_range_start: u16, driver: Arc<dyn TunnelDriver>) -> Self {
+    pub fn with_driver(
+        port_range_start: u16,
+        driver: Arc<dyn TunnelDriver>,
+        unlimited_connections: bool,
+    ) -> Self {
         Self {
             client: AsyncMutex::new(None),
             driver,
             port_range_start,
+            account: Mutex::new(None),
             slots: Mutex::new(Vec::new()),
+            unlimited: unlimited_connections,
         }
     }
 
@@ -506,11 +606,68 @@ impl TunnelManager {
         let mut client = ProtonVPNClient::new(email);
         let creds = client.login(email, password).await?;
         client.fetch_servers().await?;
+        self.finish_login(client, creds).await
+    }
+
+    /// Resume a stored session (see `session.rs`) instead of running SRP again. Tries the
+    /// stored `access_token` first; on a `401` (expired token), exchanges the stored
+    /// `refresh_token` for a new one and retries once. Returns the session to persist back
+    /// (unchanged if no refresh was needed, updated tokens if it was) — the caller is
+    /// responsible for writing it back to the keychain via `session::store`.
+    pub async fn login_with_session(&self, session: &Session) -> Result<Session> {
+        let mut client = ProtonVPNClient::new(&session.email);
+        client.auth_token = Some(session.access_token.clone());
+        client.uid = Some(session.uid.clone());
+
+        let mut updated = session.clone();
+        if matches!(client.fetch_servers().await, Err(ProtonError::Auth)) {
+            let auth = client.refresh(&session.uid, &session.refresh_token).await?;
+            updated.access_token = auth.access_token.ok_or(ProtonError::Auth)?;
+            updated.refresh_token = auth
+                .refresh_token
+                .unwrap_or_else(|| session.refresh_token.clone());
+            updated.uid = auth.uid.unwrap_or_else(|| session.uid.clone());
+            client.fetch_servers().await?;
+        }
+
+        let creds = client
+            .authenticate_with_session(&updated.uid, &updated.access_token)
+            .await?;
+        self.finish_login(client, creds).await?;
+        Ok(updated)
+    }
+
+    /// Shared tail of `login`/`login_with_session`: bind one port + one always-on SOCKS5
+    /// listener per free-tier server, replacing any slots from a previous login.
+    async fn finish_login(&self, client: ProtonVPNClient, creds: VPNCredentials) -> Result<()> {
+        // The account's real tier/connection-limit — see `client::fetch_account_info` and
+        // `FALLBACK_TIER`'s doc comment for why this can't just be assumed. If the fetch
+        // itself fails, fall back to the *most conservative* free-tier assumptions (tier 0,
+        // 1 simultaneous connection) rather than silently defaulting to "unlimited" — an
+        // account-info outage should never be the thing that disables the connection cap.
+        let account = client.fetch_account_info().await.ok();
+        let max_tier = account.as_ref().map_or(FALLBACK_TIER, |a| a.vpn.max_tier);
+        let max_connect = account
+            .as_ref()
+            .map_or(1, |a| a.vpn.max_connect.max(0) as u32);
+
+        let limiter = Arc::new(ConnectionLimiter::new(if self.unlimited {
+            None
+        } else {
+            Some(max_connect)
+        }));
+
+        *self.account.lock().unwrap() = account.map(|a| AccountSummary {
+            email: client.username.clone(),
+            plan_name: a.vpn.plan_name,
+            max_tier: a.vpn.max_tier,
+            max_connect: a.vpn.max_connect,
+        });
 
         let mut servers: Vec<VPNServer> = client
             .server_list
             .iter()
-            .filter(|s| s.tier <= PERMISSIVE_TIER)
+            .filter(|s| s.tier <= max_tier)
             .cloned()
             .collect();
         servers.sort_by(|a, b| a.id.cmp(&b.id));
@@ -523,7 +680,13 @@ impl TunnelManager {
                 ProtonError::Config("ran out of ports for the free-tier server list".into())
             })?;
 
-            let slot = ServerSlot::new(server, creds.clone(), self.driver.clone(), port);
+            let slot = ServerSlot::new(
+                server,
+                creds.clone(),
+                self.driver.clone(),
+                port,
+                limiter.clone(),
+            );
             // Fire-and-forget: this listener is meant to run for the rest of the process's
             // life, so there's nothing useful to do with the JoinHandle (dropping it detaches
             // the task rather than aborting it).
@@ -549,6 +712,19 @@ impl TunnelManager {
             .iter()
             .map(|s| s.status())
             .collect()
+    }
+
+    /// Whether this daemon bypasses the account's simultaneous-connection cap
+    /// (`gratis up --unlimited-connections`) — surfaced to the web UI as a persistent
+    /// ToS-risk banner.
+    pub fn unlimited(&self) -> bool {
+        self.unlimited
+    }
+
+    /// The logged-in account's email/plan/tier/connection-limit, or `None` before the first
+    /// successful login of the process. Surfaced on the web UI.
+    pub fn account(&self) -> Option<AccountSummary> {
+        self.account.lock().unwrap().clone()
     }
 }
 
@@ -760,8 +936,15 @@ mod tests {
         port: u16,
         driver: Arc<dyn TunnelDriver>,
     ) -> (Arc<TunnelManager>, Arc<ServerSlot>) {
-        let manager = Arc::new(TunnelManager::with_driver(port, driver.clone()));
-        let slot = ServerSlot::new(test_server("srv-1", "US"), test_creds(), driver, port);
+        let manager = Arc::new(TunnelManager::with_driver(port, driver.clone(), false));
+        let limiter = Arc::new(ConnectionLimiter::new(None));
+        let slot = ServerSlot::new(
+            test_server("srv-1", "US"),
+            test_creds(),
+            driver,
+            port,
+            limiter,
+        );
         manager.slots.lock().unwrap().push(slot.clone());
         (manager, slot)
     }
@@ -900,5 +1083,85 @@ mod tests {
             "must give up close to the retry budget even when every individual attempt hangs \
              indefinitely (elapsed: {elapsed:?})"
         );
+    }
+
+    /// Two slots (different servers) sharing one `ConnectionLimiter`, standing in for two
+    /// `ServerSlot`s built from the same login — see `finish_login`.
+    fn two_slots_with_limiter(max: Option<u32>) -> (Arc<ServerSlot>, Arc<ServerSlot>) {
+        let driver: Arc<dyn TunnelDriver> = Arc::new(FakeDriver::default());
+        let limiter = Arc::new(ConnectionLimiter::new(max));
+        let a = ServerSlot::new(
+            test_server("srv-a", "US"),
+            test_creds(),
+            driver.clone(),
+            20800,
+            limiter.clone(),
+        );
+        let b = ServerSlot::new(
+            test_server("srv-b", "FR"),
+            test_creds(),
+            driver,
+            20801,
+            limiter,
+        );
+        (a, b)
+    }
+
+    #[tokio::test]
+    async fn acquire_is_rejected_once_the_connection_cap_is_reached() {
+        let (a, b) = two_slots_with_limiter(Some(1));
+
+        assert!(a.acquire().await.is_ok(), "first tunnel is within the cap");
+        let result = b.acquire().await;
+        assert!(
+            result.is_err(),
+            "a second simultaneous tunnel must be rejected once the account's MaxConnect cap \
+             (here: 1) is already in use by a different server"
+        );
+
+        // Rejection must not have counted against `open_connections` (see the fetch_sub next
+        // to the rejection in `acquire`) — otherwise a rejected caller would still show as
+        // "connected" in `servers()`.
+        assert_eq!(b.status().open_connections, 0);
+        assert!(!b.status().connected);
+    }
+
+    #[tokio::test]
+    async fn acquire_succeeds_again_after_a_capped_slot_releases() {
+        let (a, b) = two_slots_with_limiter(Some(1));
+
+        a.acquire().await.unwrap();
+        assert!(b.acquire().await.is_err());
+
+        // Releasing every connection on `a` and letting its idle-teardown run frees the
+        // reservation for `b`.
+        a.release();
+        tokio::time::sleep(IDLE_TIMEOUT + std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            b.acquire().await.is_ok(),
+            "the connection cap must free up once the slot holding it tears down"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_ignores_the_cap_when_unlimited() {
+        let (a, b) = two_slots_with_limiter(None);
+
+        assert!(a.acquire().await.is_ok());
+        assert!(
+            b.acquire().await.is_ok(),
+            "a `None` limiter (--unlimited-connections) must never reject a connect"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_reusing_an_already_connected_tunnel_does_not_recount_against_the_cap() {
+        let (a, _b) = two_slots_with_limiter(Some(1));
+
+        a.acquire().await.unwrap();
+        // A second caller reusing the same already-connected tunnel must not need (or
+        // consume) a second reservation — only a genuinely new tunnel does.
+        assert!(a.acquire().await.is_ok());
     }
 }

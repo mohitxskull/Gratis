@@ -50,7 +50,11 @@ pub fn router(manager: Arc<TunnelManager>) -> Router {
 async fn index(
     axum::extract::State(manager): axum::extract::State<Arc<TunnelManager>>,
 ) -> Response {
-    render(IndexTemplate::new(manager.servers()))
+    render(IndexTemplate::new(
+        manager.servers(),
+        manager.unlimited(),
+        manager.account(),
+    ))
 }
 
 /// The server table fragment, polled by the page every few seconds so status (connected,
@@ -79,7 +83,11 @@ mod tests {
         // `RealDriver` only stands in for the WireGuard/SOCKS5 side of `TunnelManager` (see
         // `manager.rs`) — it does not touch `ProtonVPNClient`/the network. That's fine here:
         // no login is performed, so `servers()` simply returns an empty list.
-        Arc::new(TunnelManager::with_driver(9500, Arc::new(RealDriver)))
+        Arc::new(TunnelManager::with_driver(
+            9500,
+            Arc::new(RealDriver),
+            false,
+        ))
     }
 
     #[tokio::test]

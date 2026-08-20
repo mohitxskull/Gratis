@@ -12,7 +12,7 @@
 //! To regenerate the CSS after changing template classes: run the standalone `tailwindcss`
 //! binary (<https://github.com/tailwindlabs/tailwindcss/releases>) —
 //! `tailwindcss -i assets/input.css -o assets/tailwind.css --minify` — then rebuild.
-use crate::manager::ServerStatus;
+use crate::manager::{AccountSummary, ServerStatus};
 use askama::Template;
 
 const TAILWIND_CSS: &str = include_str!("../assets/tailwind.css");
@@ -111,10 +111,20 @@ pub struct IndexTemplate {
     pub htmx_js: &'static str,
     pub servers: Vec<ServerRow>,
     pub connected_count: usize,
+    /// Whether this daemon was started with `--unlimited-connections` — shown as a persistent
+    /// ToS-risk banner, not just a one-time login warning, since the risk is ongoing for as
+    /// long as the daemon runs this way.
+    pub unlimited: bool,
+    /// The logged-in account, or `None` before the first successful login.
+    pub account: Option<AccountSummary>,
 }
 
 impl IndexTemplate {
-    pub fn new(servers: Vec<ServerStatus>) -> Self {
+    pub fn new(
+        servers: Vec<ServerStatus>,
+        unlimited: bool,
+        account: Option<AccountSummary>,
+    ) -> Self {
         let servers = server_rows(servers);
         let connected_count = connected_count(&servers);
         Self {
@@ -122,6 +132,8 @@ impl IndexTemplate {
             htmx_js: HTMX_JS,
             servers,
             connected_count,
+            unlimited,
+            account,
         }
     }
 }

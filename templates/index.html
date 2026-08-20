@@ -12,7 +12,21 @@
   <header class="mb-12 border-b border-ink/10 pb-6">
     <h1 class="text-3xl font-semibold tracking-tight">Gratis</h1>
     <p class="text-sm text-ink/50 mt-1">Each server below has its own fixed SOCKS5 port — connect to it and the tunnel comes up on its own.</p>
+    {% if let Some(account) = account %}
+    <p class="text-xs text-ink/40 mt-3 font-mono">
+      {{ account.email }} · {{ account.plan_name }} plan · tier {{ account.max_tier }} · max {{ account.max_connect }} simultaneous connection{% if account.max_connect != 1 %}s{% endif %}
+    </p>
+    {% else %}
+    <p class="text-xs text-ink/40 mt-3">Not logged in.</p>
+    {% endif %}
   </header>
+
+  {% if unlimited %}
+  <div class="mb-8 rounded border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+    <p class="font-semibold">Unlimited connections enabled</p>
+    <p class="mt-1 text-amber-900/80">This daemon was started with <code class="font-mono">--unlimited-connections</code>, bypassing Proton's per-account simultaneous-session limit. Running more concurrent tunnels than your plan allows may violate Proton's Terms of Service and risk account action. This is at your own risk — stop the service and restart with <code class="font-mono">gratis up</code> (no flag) to stay within your account's limit.</p>
+  </div>
+  {% endif %}
 
   <section>
     <div class="flex items-baseline justify-between mb-4">
