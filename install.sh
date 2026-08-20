@@ -43,8 +43,21 @@ curl -fsSL "$URL" -o "$WORK_DIR/$ASSET"
 tar xzf "$WORK_DIR/$ASSET" -C "$WORK_DIR"
 
 mkdir -p "$INSTALL_DIR"
-find "$WORK_DIR" -maxdepth 2 -type f -name gratis -exec cp {} "$INSTALL_DIR/gratis" \;
-chmod +x "$INSTALL_DIR/gratis"
+# Copy to a temp file in the same directory, then rename over the target — a plain `cp` onto
+# the live path fails with "Text file busy" if the currently-installed gratis is running (its
+# own service holds the file open for execution); rename doesn't have that problem since it
+# never opens the destination for writing. Same trick `gratis update` already uses on itself
+# (see src/update.rs's replace_running_binary), applied here too since this script hit the
+# exact same failure live while gratis.service was active.
+NEW_BIN=$(find "$WORK_DIR" -maxdepth 2 -type f -name gratis | head -n1)
+if [ -z "$NEW_BIN" ]; then
+    echo "Could not find a gratis binary in the downloaded release." >&2
+    exit 1
+fi
+STAGED="$INSTALL_DIR/gratis.new"
+cp "$NEW_BIN" "$STAGED"
+chmod +x "$STAGED"
+mv -f "$STAGED" "$INSTALL_DIR/gratis"
 
 echo "Installed gratis $LATEST_TAG to $INSTALL_DIR/gratis"
 
