@@ -4,6 +4,37 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-08-20
+
+### Added
+
+- Add OS-keychain session storage, systemd unit management, and self-update
+- **client**: Support session-resume login, token refresh, and 2FA
+- **manager**: Filter by real account tier, enforce MaxConnect, show account on web UI
+- **cli**: Replace the single daemon entrypoint with login/up/down/status/etc **(breaking)**
+- Add desktop notifications for silent background failures
+- **manager**: Add opt-in LRU eviction for the connection cap
+- Add a system tray icon (gratis tray)
+- **cli**: Manage the tray alongside the main service in up/down/persist/uninstall
+
+### Build
+
+- **deps**: Add keyring and console; shrink dev build debug info
+
+### Documentation
+
+- Document the new CLI/install workflow; drop macOS from the release matrix
+- Drop "free tier" from gratis's identity — it works for any account tier
+- Reframe gratis as a SOCKS5 proxy, not a VPN client
+
+### Fixed
+
+- **cli**: Bind the control port before logging in, not after
+
+### Testing
+
+- Cover the 2FA/session-resume, unit-templating, and self-update logic
+
 ## [0.3.0] — 2026-08-19
 
 ### Added
