@@ -1,7 +1,9 @@
 //! `gratis` CLI entry point. `login`/`logout`/`up`/`down`/`status`/`persist`/`update`/
-//! `uninstall` manage gratis as an installed systemd `--user` service; `run` is the actual
-//! foreground daemon (today's control API + web UI), invoked by the unit's `ExecStart`, not
-//! meant to be run directly by a user.
+//! `uninstall` manage gratis as an installed pair of systemd `--user` services (the daemon and
+//! its tray icon); `run` is the actual foreground daemon (today's control API + web UI) and
+//! `tray` the foreground tray process (see `tray.rs`) — both invoked by their respective
+//! unit's `ExecStart`, not meant to be run directly by a user (though `tray` is also fine to
+//! run manually for debugging).
 //!
 //! Credentials are only ever asked for once, by `gratis login` — never as CLI arguments (they'd
 //! leak into `ps`/shell history) — and the password itself is never stored: `login` exchanges it
@@ -70,6 +72,15 @@ enum Command {
     Update,
     /// Stop and remove the service, the stored session, and this binary.
     Uninstall,
+    /// Show a system tray icon (dashboard shortcut, start/stop, live status). A separate
+    /// foreground process, not part of the background service — run it manually or add it to
+    /// your desktop environment's autostart. Requires a tray/StatusNotifierItem host; plain
+    /// GNOME Shell needs the "AppIndicator and KStatusNotifierItem Support" extension.
+    Tray {
+        /// Control-port to poll for status. Defaults to whatever `gratis up` was last given.
+        #[arg(long)]
+        control_port: Option<u16>,
+    },
     /// Run the foreground daemon. Invoked by the systemd unit's `ExecStart` — not meant to be
     /// run directly.
     #[command(hide = true)]
@@ -109,6 +120,7 @@ async fn main() {
         Command::Persist { off } => cmd_persist(off),
         Command::Update => cmd_update().await,
         Command::Uninstall => cmd_uninstall(),
+        Command::Tray { control_port } => cmd_tray(control_port).await,
         Command::Run {
             control_port,
             port_range_start,
@@ -265,6 +277,9 @@ fn cmd_logout() -> anyhow::Result<()> {
     if service::is_installed()? && service::is_active().unwrap_or(false) {
         service::stop()?;
     }
+    if service::tray_is_installed().unwrap_or(false) && service::tray_is_active().unwrap_or(false) {
+        let _ = service::tray_stop();
+    }
     session::delete()?;
     println!("gratis: logged out");
     Ok(())
@@ -286,6 +301,15 @@ fn cmd_up(
         evict_lru,
     )?;
     service::start()?;
+
+    // The tray is a convenience, not core functionality — a failure to install/start it
+    // (e.g. no systemd user session quirk) shouldn't fail `up` itself.
+    if let Err(err) = service::install_tray(control_port) {
+        eprintln!("gratis: tray failed to install ({err}); continuing without it");
+    } else if let Err(err) = service::tray_start() {
+        eprintln!("gratis: tray failed to start ({err}); continuing without it");
+    }
+
     println!("gratis: service starting — see `gratis status`");
     Ok(())
 }
@@ -295,6 +319,9 @@ fn cmd_down() -> anyhow::Result<()> {
         anyhow::bail!("service not installed — run `gratis up` first");
     }
     service::stop()?;
+    if service::tray_is_installed().unwrap_or(false) {
+        let _ = service::tray_stop();
+    }
     println!("gratis: service stopped");
     Ok(())
 }
@@ -326,19 +353,33 @@ async fn cmd_status() -> anyhow::Result<()> {
             Err(err) => println!("servers: could not reach control API ({err})"),
         }
     }
+
+    if service::tray_is_installed().unwrap_or(false) {
+        let tray_active = service::tray_is_active().unwrap_or(false);
+        println!("tray: {}", if tray_active { "running" } else { "stopped" });
+    }
+
     Ok(())
 }
 
 /// Reads the control port out of the installed unit file's `ExecStart` line rather than
-/// hardcoding the default — `up` can be given a non-default `--control-port`.
+/// hardcoding the default — `up` can be given a non-default `--control-port`. Falls back to
+/// 9000 (the default) if the unit isn't installed or the line can't be parsed.
+fn control_port_from_unit() -> u16 {
+    service::unit_path()
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|unit| {
+            unit.lines()
+                .find_map(|l| l.split("--control-port").nth(1))
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|p| p.parse().ok())
+        })
+        .unwrap_or(9000)
+}
+
 async fn server_count() -> anyhow::Result<(usize, String)> {
-    let unit = std::fs::read_to_string(service::unit_path()?)?;
-    let port: u16 = unit
-        .lines()
-        .find_map(|l| l.split("--control-port").nth(1))
-        .and_then(|rest| rest.split_whitespace().next())
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(9000);
+    let port = control_port_from_unit();
     let url = format!("http://127.0.0.1:{port}");
     let servers: Vec<serde_json::Value> = reqwest::get(format!("{url}/api/servers"))
         .await?
@@ -362,9 +403,15 @@ fn cmd_persist(off: bool) -> anyhow::Result<()> {
     }
     if off {
         service::disable()?;
+        if service::tray_is_installed().unwrap_or(false) {
+            let _ = service::tray_disable();
+        }
         println!("gratis: will not start automatically on login");
     } else {
         service::enable()?;
+        if service::tray_is_installed().unwrap_or(false) {
+            let _ = service::tray_enable();
+        }
         println!("gratis: will start automatically on login");
     }
     Ok(())
@@ -381,13 +428,20 @@ async fn cmd_update() -> anyhow::Result<()> {
                 service::restart()?;
                 println!("gratis: service restarted");
             }
+            if service::tray_is_installed().unwrap_or(false)
+                && service::tray_is_active().unwrap_or(false)
+            {
+                let _ = service::tray_restart();
+            }
         }
     }
     Ok(())
 }
 
 fn cmd_uninstall() -> anyhow::Result<()> {
-    print!("This removes the gratis service, stored login, and this binary. Continue? [y/N] ");
+    print!(
+        "This removes the gratis service, tray, stored login, and this binary. Continue? [y/N] "
+    );
     std::io::stdout().flush()?;
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
@@ -397,6 +451,7 @@ fn cmd_uninstall() -> anyhow::Result<()> {
     }
 
     service::uninstall()?;
+    service::uninstall_tray()?;
     session::delete()?;
 
     let exe = std::env::current_exe()?;
@@ -404,6 +459,13 @@ fn cmd_uninstall() -> anyhow::Result<()> {
     std::fs::remove_file(&exe)?;
 
     println!("gratis: uninstalled");
+    Ok(())
+}
+
+async fn cmd_tray(control_port: Option<u16>) -> anyhow::Result<()> {
+    let control_port = control_port.unwrap_or_else(control_port_from_unit);
+    println!("gratis: tray running (control port {control_port}) — Ctrl-C to quit");
+    gratis::tray::run(control_port).await?;
     Ok(())
 }
 

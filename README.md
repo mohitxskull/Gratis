@@ -104,18 +104,35 @@ server to make room. It never touches a server with active traffic — if every 
 server is actually busy, the new connection is still rejected, same as the default. Useful
 if you'd rather gratis manage which servers stay connected than see connection errors.
 
+### System tray
+
+`gratis up` also installs and starts a small tray icon — a menu with the connected server
+count, "Open Dashboard", and "Start/Stop Service". It's a separate `systemd --user` unit
+(`gratis-tray.service`), not part of the daemon itself, so `gratis run` stays a pure
+headless service with no GUI dependency — the tray unit just polls the already-running
+daemon's control API and `systemctl`, the same way the CLI does. `gratis down`/`persist`/
+`uninstall` all manage it together with the main service, so there's nothing separate to
+remember.
+
+Requires a tray/`StatusNotifierItem` host. Plain GNOME Shell has had no built-in tray
+support since 3.26 — the icon only appears there with an extension installed (e.g.
+"AppIndicator and KStatusNotifierItem Support"). That's a Linux desktop ecosystem gap, not
+something gratis can work around; most other desktop environments (KDE, XFCE, etc.) support
+it natively.
+
 ### All commands
 
 | Command | Does |
 | --- | --- |
 | `gratis login` | Authenticate and store the session in the OS keychain |
-| `gratis logout` | Stop the service and forget the stored session |
-| `gratis up [--control-port] [--port-range-start] [--unlimited-connections] [--evict-lru]` | Start the background service |
-| `gratis down` | Stop it |
-| `gratis status` | Show login/running/persist state, and server count if running |
-| `gratis persist` / `gratis persist --off` | Start (or stop starting) automatically on login |
-| `gratis update` | Download and install the latest release, restarting the service if it was running |
-| `gratis uninstall` | Remove the service, stored session, and this binary |
+| `gratis logout` | Stop the service (and tray) and forget the stored session |
+| `gratis up [--control-port] [--port-range-start] [--unlimited-connections] [--evict-lru]` | Start the background service and tray |
+| `gratis down` | Stop them |
+| `gratis status` | Show login/running/persist/tray state, and server count if running |
+| `gratis persist` / `gratis persist --off` | Start (or stop starting) both automatically on login |
+| `gratis update` | Download and install the latest release, restarting the service (and tray) if running |
+| `gratis uninstall` | Remove the service, tray, stored session, and this binary |
+| `gratis tray [--control-port]` | Run the tray icon directly in the foreground (mainly for debugging — normally managed by `up`/`down`) |
 
 ### Running in the foreground instead
 
@@ -186,10 +203,14 @@ with a `!` suffix or a `BREAKING CHANGE:` footer is flagged as breaking.
 - **`src/session.rs`** — the stored Proton session (`uid`/`access_token`/`refresh_token`,
   never the password) in the OS keychain, and what `gratis run` resumes on startup instead
   of a full SRP login.
-- **`src/service.rs`** — writes/starts/stops/enables the `systemd --user` unit that `up`/
-  `down`/`persist` control.
+- **`src/service.rs`** — writes/starts/stops/enables both `systemd --user` units (the daemon
+  and the tray) that `up`/`down`/`persist` control together.
 - **`src/update.rs`** — `gratis update`'s self-replace: downloads the matching release
   tarball and swaps the running binary in place.
+- **`src/tray.rs`** — the system tray icon (`gratis tray`): polls the control API and
+  `systemctl` for status, no capabilities beyond what the CLI already has.
+- **`src/notify.rs`** — desktop notifications for the daemon's silent-failure cases
+  (session expired, local-agent fallback, control-port bind failure).
 
 No tunnel or server-list *state* survives a restart — those are always rebuilt fresh on
 `gratis run` startup. The Proton *session* does persist (in the keychain), which is what

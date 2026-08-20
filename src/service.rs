@@ -1,12 +1,17 @@
-//! systemd `--user` unit management for the background daemon. `gratis up` writes/starts a
-//! unit that runs `gratis run` (the actual foreground daemon, see `main.rs`) with the flags it
-//! was given baked into `ExecStart` — that's the one place daemon settings live, there is no
-//! separate config file.
+//! systemd `--user` unit management for the background daemon and its tray icon. `gratis up`
+//! writes/starts a unit that runs `gratis run` (the actual foreground daemon, see `main.rs`)
+//! with the flags it was given baked into `ExecStart` — that's the one place daemon settings
+//! live, there is no separate config file. `gratis up` also writes/starts a second, independent
+//! unit that runs `gratis tray` — kept as a separate unit (not merged into the same process) so
+//! `gratis run` itself stays a pure headless service with no GUI/D-Bus-tray dependency; the tray
+//! unit degrades harmlessly (see `tray.rs`) on a machine with no desktop session to show it in.
+//! `up`/`down`/`persist`/`uninstall` manage both units together so they always move as a pair.
 use crate::errors::*;
 use std::path::PathBuf;
 use std::process::Command;
 
 const UNIT_NAME: &str = "gratis.service";
+const TRAY_UNIT_NAME: &str = "gratis-tray.service";
 
 fn unit_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").map_err(|_| ProtonError::Config("HOME is not set".into()))?;
@@ -17,8 +22,16 @@ pub fn unit_path() -> Result<PathBuf> {
     Ok(unit_dir()?.join(UNIT_NAME))
 }
 
+pub fn tray_unit_path() -> Result<PathBuf> {
+    Ok(unit_dir()?.join(TRAY_UNIT_NAME))
+}
+
 pub fn is_installed() -> Result<bool> {
     Ok(unit_path()?.is_file())
+}
+
+pub fn tray_is_installed() -> Result<bool> {
+    Ok(tray_unit_path()?.is_file())
 }
 
 /// Absolute path to the currently-running `gratis` binary — what `ExecStart` points at.
@@ -95,6 +108,46 @@ pub fn uninstall() -> Result<()> {
     daemon_reload()
 }
 
+fn tray_unit_contents(control_port: u16) -> Result<String> {
+    let bin = binary_path()?;
+    let bin = bin
+        .to_str()
+        .ok_or_else(|| ProtonError::Config("gratis binary path is not valid UTF-8".into()))?;
+    Ok(format!(
+        "[Unit]\n\
+         Description=gratis - tray icon\n\
+         After=gratis.service\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={bin} tray --control-port {control_port}\n\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n"
+    ))
+}
+
+/// Same shape as `install`, for the tray unit.
+pub fn install_tray(control_port: u16) -> Result<()> {
+    let dir = unit_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(tray_unit_path()?, tray_unit_contents(control_port)?)?;
+    daemon_reload()
+}
+
+/// Same shape as `uninstall`, for the tray unit.
+pub fn uninstall_tray() -> Result<()> {
+    if !tray_is_installed()? {
+        return Ok(());
+    }
+    let _ = tray_stop();
+    let _ = tray_disable();
+    std::fs::remove_file(tray_unit_path()?)?;
+    daemon_reload()
+}
+
 fn systemctl(args: &[&str]) -> Result<std::process::Output> {
     Command::new("systemctl")
         .arg("--user")
@@ -156,6 +209,33 @@ pub fn is_enabled() -> Result<bool> {
         .success())
 }
 
+pub fn tray_start() -> Result<()> {
+    run_ok(&["start", TRAY_UNIT_NAME])
+}
+
+pub fn tray_stop() -> Result<()> {
+    run_ok(&["stop", TRAY_UNIT_NAME])
+}
+
+pub fn tray_restart() -> Result<()> {
+    run_ok(&["restart", TRAY_UNIT_NAME])
+}
+
+pub fn tray_enable() -> Result<()> {
+    run_ok(&["enable", TRAY_UNIT_NAME])
+}
+
+pub fn tray_disable() -> Result<()> {
+    run_ok(&["disable", TRAY_UNIT_NAME])
+}
+
+/// Same reasoning as `is_active`.
+pub fn tray_is_active() -> Result<bool> {
+    Ok(systemctl(&["is-active", "--quiet", TRAY_UNIT_NAME])?
+        .status
+        .success())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +292,16 @@ mod tests {
         assert!(unit.contains("[Install]\n"));
         assert!(unit.contains("Type=simple\n"));
         assert!(unit.contains("WantedBy=default.target\n"));
+    }
+
+    #[test]
+    fn tray_unit_contents_runs_the_tray_subcommand_with_the_given_port() {
+        let unit = tray_unit_contents(9500).expect("binary_path must resolve in tests");
+        let exec_start = unit
+            .lines()
+            .find(|l| l.starts_with("ExecStart="))
+            .expect("unit must have an ExecStart line");
+        assert!(exec_start.ends_with("tray --control-port 9500"));
+        assert!(unit.contains("After=gratis.service\n"));
     }
 }
