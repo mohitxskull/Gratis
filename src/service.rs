@@ -146,3 +146,42 @@ pub fn is_enabled() -> Result<bool> {
         .status
         .success())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unit_contents_bakes_the_given_flags_into_exec_start() {
+        let unit = unit_contents(9500, 21000, false).expect("binary_path must resolve in tests");
+        let exec_start = unit
+            .lines()
+            .find(|l| l.starts_with("ExecStart="))
+            .expect("unit must have an ExecStart line");
+        assert!(exec_start.ends_with("run --control-port 9500 --port-range-start 21000"));
+        assert!(!exec_start.contains("--unlimited-connections"));
+    }
+
+    #[test]
+    fn unit_contents_includes_the_unlimited_flag_when_requested() {
+        let unit = unit_contents(9500, 21000, true).unwrap();
+        let exec_start = unit.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
+        assert!(
+            exec_start.ends_with(
+                "run --control-port 9500 --port-range-start 21000 --unlimited-connections"
+            )
+        );
+    }
+
+    #[test]
+    fn unit_contents_is_a_valid_systemd_unit_shape() {
+        // Not a full systemd parser — just the section headers a real unit file needs, so a
+        // typo in the format string (e.g. a missing newline collapsing two sections) is caught.
+        let unit = unit_contents(9000, 20000, false).unwrap();
+        assert!(unit.contains("[Unit]\n"));
+        assert!(unit.contains("[Service]\n"));
+        assert!(unit.contains("[Install]\n"));
+        assert!(unit.contains("Type=simple\n"));
+        assert!(unit.contains("WantedBy=default.target\n"));
+    }
+}

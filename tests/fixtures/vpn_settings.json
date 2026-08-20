@@ -1,0 +1,29 @@
+{
+    "Code": 1000,
+    "VPN": {
+        "ExpirationTime": 1,
+        "Name": "fixture-name",
+        "Password": "fixture-password",
+        "GroupID": "fixture-group",
+        "IsBusiness": false,
+        "Status": 1,
+        "BasePlan": null,
+        "PlanName": "free",
+        "PlanTitle": null,
+        "MaxTier": 0,
+        "MaxConnect": 2,
+        "Groups": ["vpn-free"],
+        "NeedConnectionAllocation": false,
+        "BusinessEvents": false,
+        "NetShield": { "Malware": false, "AdsAndTrackers": false, "AdultContent": false },
+        "BrowserExtension": true,
+        "BrowserExtensionPlan": null
+    },
+    "Warnings": [],
+    "Services": 5,
+    "Subscribed": 0,
+    "Delinquent": 0,
+    "HasPaymentMethod": 1,
+    "Credit": 0,
+    "Currency": "EUR"
+}

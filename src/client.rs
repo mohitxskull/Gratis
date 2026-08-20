@@ -181,7 +181,7 @@ impl ProtonVPNClient {
         //    `needs_twofa` in the reference cited on `TwoFactorResponse`. `self.auth_token`/
         //    `self.uid` are already set at this point, so the caller can go straight to
         //    `submit_2fa` without repeating SRP.
-        if auth.scopes.iter().any(|s| s == "twofactor") {
+        if needs_twofa(&auth.scopes) {
             return Err(ProtonError::TwoFactorRequired);
         }
 
@@ -353,6 +353,13 @@ impl ProtonVPNClient {
     }
 }
 
+/// Whether an `/auth` (or `/auth/refresh`) response's `Scopes` list means 2FA still needs to
+/// be completed. Verified against `proton.session.api.Session.needs_twofa`: the *only* signal
+/// is `"twofactor"` being present in `Scopes` — there is no separate boolean flag.
+fn needs_twofa(scopes: &[String]) -> bool {
+    scopes.iter().any(|s| s == "twofactor")
+}
+
 /// Map a raw `LogicalServerDto` (only `Status == 1` logicals reach here) into a `VPNServer`,
 /// keeping each physical server's entry IP paired with ITS OWN WireGuard public key — never
 /// mixing IP and key across two different physical servers (flagged gap #2's root cause).
@@ -377,5 +384,35 @@ fn map_logical(dto: LogicalServerDto) -> VPNServer {
                 enabled: p.status == 1,
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn needs_twofa_true_only_when_twofactor_scope_present() {
+        assert!(needs_twofa(&["twofactor".to_string()]));
+        assert!(needs_twofa(&["full".to_string(), "twofactor".to_string()]));
+        assert!(!needs_twofa(&["full".to_string()]));
+        assert!(!needs_twofa(&[]));
+    }
+
+    #[test]
+    fn refresh_response_without_uid_falls_back_to_the_requested_uid() {
+        // Verified live: /auth/refresh's response omits UID entirely (see `refresh`'s doc
+        // comment) — the account is identified by the x-pm-uid header, not the body. Confirm
+        // AuthResponse tolerates a missing UID rather than failing to parse.
+        let json = r#"{
+            "AccessToken": "new-access",
+            "RefreshToken": "new-refresh",
+            "Code": 1000,
+            "Scopes": ["full"]
+        }"#;
+        let auth: AuthResponse = serde_json::from_str(json).expect("must parse without UID");
+        assert_eq!(auth.uid, None);
+        assert_eq!(auth.access_token.as_deref(), Some("new-access"));
+        assert!(!needs_twofa(&auth.scopes));
     }
 }

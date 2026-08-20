@@ -29,7 +29,13 @@ pub enum UpdateOutcome {
 /// Current platform's release-tarball target triple. Only the two triples the release
 /// workflow actually builds (see `.github/workflows/release.yml`) are supported.
 fn target_triple() -> Result<&'static str> {
-    match std::env::consts::ARCH {
+    triple_for_arch(std::env::consts::ARCH)
+}
+
+/// `target_triple`'s logic, parameterized on the arch string so it's testable without
+/// depending on the architecture the test suite happens to run on.
+fn triple_for_arch(arch: &str) -> Result<&'static str> {
+    match arch {
         "x86_64" => Ok("x86_64-unknown-linux-gnu"),
         "aarch64" => Ok("aarch64-unknown-linux-gnu"),
         other => Err(ProtonError::Config(format!(
@@ -155,4 +161,54 @@ fn replace_running_binary(new_binary: &Path) -> Result<()> {
     std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
     std::fs::rename(&staged, &current)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn triple_for_arch_covers_the_two_release_targets() {
+        assert_eq!(
+            triple_for_arch("x86_64").unwrap(),
+            "x86_64-unknown-linux-gnu"
+        );
+        assert_eq!(
+            triple_for_arch("aarch64").unwrap(),
+            "aarch64-unknown-linux-gnu"
+        );
+    }
+
+    #[test]
+    fn triple_for_arch_rejects_an_unsupported_architecture() {
+        let err = triple_for_arch("riscv64").unwrap_err();
+        assert!(err.to_string().contains("riscv64"));
+    }
+
+    #[test]
+    fn find_binary_locates_gratis_inside_the_extracted_directory() {
+        let work_dir = tempfile::tempdir().unwrap();
+        let extracted = work_dir
+            .path()
+            .join("gratis-v9.9.9-x86_64-unknown-linux-gnu");
+        std::fs::create_dir_all(&extracted).unwrap();
+        std::fs::write(extracted.join("gratis"), b"fake binary").unwrap();
+        // A same-named sibling file (e.g. README.md) must not be mistaken for a directory.
+        std::fs::write(work_dir.path().join("gratis"), b"not the real one").unwrap();
+
+        let found = find_binary(work_dir.path()).unwrap();
+        assert_eq!(found, extracted.join("gratis"));
+    }
+
+    #[test]
+    fn find_binary_errors_when_the_tarball_has_no_gratis_binary() {
+        let work_dir = tempfile::tempdir().unwrap();
+        let extracted = work_dir
+            .path()
+            .join("gratis-v9.9.9-x86_64-unknown-linux-gnu");
+        std::fs::create_dir_all(&extracted).unwrap();
+        std::fs::write(extracted.join("README.md"), b"no binary here").unwrap();
+
+        assert!(find_binary(work_dir.path()).is_err());
+    }
 }
