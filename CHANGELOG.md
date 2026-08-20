@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-08-20
+
+### Added
+
+- **manager**: Periodically refresh the server list instead of fetching once at login
+- **update**: Periodically check for new releases and notify
+- **tray**: Surface update availability in the tray menu
+
 ## [0.4.0] — 2026-08-20
 
 ### Added
