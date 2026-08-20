@@ -19,7 +19,11 @@ use std::io::Write;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "gratis", version, about = "Proton VPN client")]
+#[command(
+    name = "gratis",
+    version,
+    about = "Local SOCKS5 proxy over your Proton VPN account's servers"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

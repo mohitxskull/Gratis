@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94.0"
 license = "MIT"
 repository = "https://github.com/mohitxskull/Gratis"
-description = "No-root Proton VPN client — every server your account can reach exposed as its own lazily-connecting, self-idling local SOCKS5 proxy."
+description = "A local SOCKS5 proxy over your Proton VPN account's servers — no root required, every reachable server its own lazily-connecting, self-idling proxy port."
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
