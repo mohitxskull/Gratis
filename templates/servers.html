@@ -65,8 +65,12 @@
           title="Copy"
         >copy</button>
       </div>
-      <span class="flex items-center text-xs text-ink/40 shrink-0">
+      <span class="flex items-center text-xs {% if s.removed %}text-amber-700{% else %}text-ink/40{% endif %} shrink-0">
+        {% if s.removed %}
+        <span class="inline-block w-1.5 h-1.5 rounded-full border border-amber-300 mr-1.5"></span>no longer available
+        {% else %}
         <span class="inline-block w-1.5 h-1.5 rounded-full border border-ink/40 mr-1.5"></span>idle
+        {% endif %}
       </span>
     </div>
     {% endif %}

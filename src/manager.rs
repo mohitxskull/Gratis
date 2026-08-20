@@ -103,6 +103,14 @@ const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(25);
 /// without charging the probe to back-to-back connections, which are the common case.
 const READINESS_TTL: Duration = Duration::from_secs(30);
 
+/// How often `main.rs`'s background loop calls `TunnelManager::refresh_servers`. Without this,
+/// a long-running daemon's server list (load numbers, newly-added servers, removed servers)
+/// only ever reflects what Proton returned at the moment it logged in — confirmed a real gap,
+/// not theoretical: no periodic re-fetch existed anywhere before this constant. 30 minutes
+/// balances staleness against not hammering the API for something that doesn't change
+/// minute-to-minute.
+pub const SERVER_LIST_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
 /// Fallback account tier used to filter the server list, only if `GET /vpn/v2` (see
 /// `client::fetch_account_info`) can't be reached — the manager otherwise always uses the
 /// account's real `MaxTier` from that call. This was previously the *only* tier value used at
@@ -272,7 +280,18 @@ impl TunnelDriver for RealDriver {
 /// doc comment). Implements [`TunnelSource`] so `run_socks5`'s accept loop can drive it
 /// directly.
 struct ServerSlot {
-    server: VPNServer,
+    /// Immutable identity — never changes for this slot's lifetime, unlike the rest of
+    /// `server`'s fields (load, physical entries, ...), which `apply_refreshed_servers`
+    /// updates in place. Kept as a plain field so identity checks don't need to lock.
+    id: String,
+    server: Mutex<VPNServer>,
+    /// Set by `apply_refreshed_servers` when this server no longer appears in a fresh fetch
+    /// — Proton removed it, or it dropped out of the account's tier. `acquire` refuses new
+    /// connections once this is true (see there for why), and it's cleared automatically if
+    /// the server reappears in a later refresh. The port itself is never reused for a
+    /// different server, so a client's SOCKS5 config pointing here gets a clear, stable
+    /// error instead of silently starting to mean a different server later.
+    removed: AtomicBool,
     creds: VPNCredentials,
     driver: Arc<dyn TunnelDriver>,
     port: u16,
@@ -316,8 +335,11 @@ impl ServerSlot {
         port: u16,
         limiter: Arc<ConnectionLimiter>,
     ) -> Arc<Self> {
+        let id = server.id.clone();
         Arc::new_cyclic(|weak| Self {
-            server,
+            id,
+            server: Mutex::new(server),
+            removed: AtomicBool::new(false),
             creds,
             driver,
             port,
@@ -362,9 +384,11 @@ impl ServerSlot {
             // `CONNECT_ATTEMPT_TIMEOUT`'s doc comment for why the underlying crate's own
             // timeout can't be trusted to bound this on its own.
             let attempt_timeout = remaining.min(CONNECT_ATTEMPT_TIMEOUT);
+            // Clone out of the lock rather than holding a guard across the `.await` below.
+            let server = self.server.lock().unwrap().clone();
             match tokio::time::timeout(
                 attempt_timeout,
-                self.driver.connect_tunnel(&self.server, &self.creds),
+                self.driver.connect_tunnel(&server, &self.creds),
             )
             .await
             {
@@ -395,13 +419,14 @@ impl ServerSlot {
     /// broken local-agent path degrades gratis back to its previous behaviour rather than
     /// breaking connections.
     async fn unlock_tunnel(&self, tunnel: &Tunnel) {
-        let sni = self.server.pick_physical().map(|p| p.domain.as_str());
+        let server = self.server.lock().unwrap().clone();
+        let sni = server.pick_physical().map(|p| p.domain.clone());
 
-        let agent_result = match sni {
+        let agent_result = match &sni {
             Some(sni) => crate::agent::unlock(tunnel, sni, &self.creds).await,
             None => Err(ProtonError::Config(format!(
                 "server {} has no physical servers to derive a local-agent SNI from",
-                self.server.name
+                server.name
             ))),
         };
 
@@ -427,7 +452,7 @@ impl ServerSlot {
                          protocol or rotated its pinned CAs — please report it with this \
                          message at https://github.com/mohitxskull/Gratis/issues so it can be \
                          updated.",
-                        self.server.name
+                        server.name
                     );
                     crate::notify::notify_clickable(
                         "gratis: local-agent handshake failed",
@@ -435,27 +460,28 @@ impl ServerSlot {
                             "Falling back to the slower readiness probe for {} — connections \
                              still work, just slower. Click to report it (Proton may have \
                              changed the agent protocol or rotated its pinned CAs).",
-                            self.server.name
+                            server.name
                         ),
                         "https://github.com/mohitxskull/Gratis/issues/new",
                     );
                 }
-                tunnel.wait_until_data_path_ready(&self.server.name).await;
+                tunnel.wait_until_data_path_ready(&server.name).await;
             }
         }
     }
 
     fn status(&self) -> ServerStatus {
+        let server = self.server.lock().unwrap();
         let tunnel = self.tunnel.lock().unwrap().clone();
         let connected_at = *self.connected_at.lock().unwrap();
         let idle_deadline = *self.idle_deadline.lock().unwrap();
         ServerStatus {
-            name: self.server.name.clone(),
-            country: self.server.country.clone(),
-            country_code: self.server.country_code.clone(),
-            city: self.server.city.clone(),
+            name: server.name.clone(),
+            country: server.country.clone(),
+            country_code: server.country_code.clone(),
+            city: server.city.clone(),
             port: self.port,
-            load: self.server.load,
+            load: server.load,
             connected: tunnel.is_some(),
             open_connections: self.open_connections.load(Ordering::SeqCst),
             uptime_secs: connected_at.map(|t| t.elapsed().as_secs()),
@@ -467,6 +493,7 @@ impl ServerSlot {
                 .map(|d| d.saturating_duration_since(Instant::now()).as_secs()),
             bytes_sent: self.stats.bytes_sent(),
             bytes_received: self.stats.bytes_received(),
+            removed: self.removed.load(Ordering::SeqCst),
         }
     }
 
@@ -489,6 +516,18 @@ impl ServerSlot {
 #[async_trait]
 impl TunnelSource for ServerSlot {
     async fn acquire(&self) -> std::result::Result<SharedTunnel, SourceError> {
+        // Rejected unconditionally, before anything else — see the `removed` field's doc
+        // comment. A stale/reused tunnel object for a server Proton no longer serves isn't
+        // something worth trying to route through.
+        if self.removed.load(Ordering::SeqCst) {
+            return Err(Box::new(ProtonError::Config(format!(
+                "{} is no longer available on your account — Proton removed it, or it's no \
+                 longer within your account's tier; this port will keep failing until the \
+                 server list changes again",
+                self.id
+            ))));
+        }
+
         self.open_connections.fetch_add(1, Ordering::SeqCst);
         // Invalidates any idle-teardown timer spawned by a previous `release` — see that
         // method's doc comment. There's now at least one open connection, so no teardown is
@@ -627,6 +666,11 @@ pub struct ServerStatus {
     pub idle_countdown_secs: Option<u64>,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    /// True once this server no longer appears in a fresh fetch (Proton removed it, or it
+    /// dropped out of the account's tier) — see `ServerSlot`'s `removed` field. The port
+    /// keeps existing but refuses new connections rather than being reassigned to a
+    /// different server later.
+    pub removed: bool,
 }
 
 /// Which Proton account is logged in and what it's entitled to — surfaced on the web UI so
@@ -643,8 +687,8 @@ pub struct AccountSummary {
 pub struct TunnelManager {
     client: AsyncMutex<Option<ProtonVPNClient>>,
     driver: Arc<dyn TunnelDriver>,
-    /// First port handed out; each reachable server gets one more than the last, in a stable
-    /// (server-id-sorted) order.
+    /// First port ever handed out. Existing servers keep whatever port they were first
+    /// assigned — see `next_port` — this is only the starting point.
     port_range_start: u16,
     slots: Mutex<Vec<Arc<ServerSlot>>>,
     /// Bypasses the account's `MaxConnect` cap entirely — see [`ConnectionLimiter`]. Set once
@@ -655,6 +699,22 @@ pub struct TunnelManager {
     /// `ConnectionLimiter::evict_least_recently_used`.
     evict_lru: bool,
     account: Mutex<Option<AccountSummary>>,
+    /// Set by `finish_login`, read by `refresh_servers` — the account's real tier, so a
+    /// periodic refresh doesn't need to re-fetch account info (which rarely changes) on
+    /// every cycle, just the server list itself (which does).
+    max_tier: Mutex<i32>,
+    /// The account's client identity + WireGuard certificate — the same for every server
+    /// this account can reach. Stored so `apply_refreshed_servers` can build slots for
+    /// newly-appeared servers without a fresh login. `None` before the first login.
+    creds: Mutex<Option<VPNCredentials>>,
+    /// Shared by every slot from the current login. Stored so `apply_refreshed_servers` can
+    /// register newly-appeared servers against the same cap/eviction state. `None` before
+    /// the first login.
+    limiter: Mutex<Option<Arc<ConnectionLimiter>>>,
+    /// Next port to hand out to a genuinely new server. Only ever increases — a port once
+    /// assigned to a server ID is never reused for a different one, even if that server
+    /// disappears and a different one appears later. See `apply_refreshed_servers`.
+    next_port: Mutex<u16>,
 }
 
 impl TunnelManager {
@@ -684,6 +744,10 @@ impl TunnelManager {
             slots: Mutex::new(Vec::new()),
             unlimited: unlimited_connections,
             evict_lru,
+            max_tier: Mutex::new(FALLBACK_TIER),
+            creds: Mutex::new(None),
+            limiter: Mutex::new(None),
+            next_port: Mutex::new(port_range_start),
         }
     }
 
@@ -754,20 +818,92 @@ impl TunnelManager {
             max_tier: a.vpn.max_tier,
             max_connect: a.vpn.max_connect,
         });
+        *self.max_tier.lock().unwrap() = max_tier;
+        *self.creds.lock().unwrap() = Some(creds);
+        *self.limiter.lock().unwrap() = Some(limiter);
 
-        let mut servers: Vec<VPNServer> = client
-            .server_list
-            .iter()
-            .filter(|s| s.tier <= max_tier)
-            .cloned()
-            .collect();
+        // A fresh login replaces everything from a previous one: discard old slots/port
+        // assignments so `apply_refreshed_servers` (below) treats every fetched server as
+        // brand new, handing out fresh sequential ports from `port_range_start`.
+        self.slots.lock().unwrap().clear();
+        *self.next_port.lock().unwrap() = self.port_range_start;
+
+        let server_list = client.server_list.clone();
+        self.apply_refreshed_servers(server_list)?;
+
+        *self.client.lock().await = Some(client);
+        Ok(())
+    }
+
+    /// Re-fetch the server list from Proton and reconcile it against the live slots — see
+    /// `apply_refreshed_servers` for the reconciliation rules. Call periodically (see
+    /// `main.rs`'s refresh loop) so a long-running daemon's server list, ports, and load
+    /// numbers don't go stale. A failure here (network hiccup) leaves the existing slots
+    /// completely untouched — it never tears anything down on its own.
+    pub async fn refresh_servers(&self) -> Result<()> {
+        let mut client_guard = self.client.lock().await;
+        let Some(client) = client_guard.as_mut() else {
+            return Err(ProtonError::Config(
+                "refresh_servers called before a successful login".into(),
+            ));
+        };
+        client.fetch_servers().await?;
+        let fetched = client.server_list.clone();
+        drop(client_guard);
+
+        self.apply_refreshed_servers(fetched)
+    }
+
+    /// Reconcile `fetched` (an unfiltered server list, as returned by `fetch_servers`)
+    /// against the current slots. Three cases per server:
+    ///
+    /// - **Still present** (same ID as an existing slot): update that slot's live metadata
+    ///   (load, physical entries, ...) in place. Its port never changes, and an active
+    ///   tunnel through it is completely undisturbed.
+    /// - **Genuinely new** (no existing slot has this ID): get the next never-before-used
+    ///   port (see `next_port`) and a fresh listener.
+    /// - **No longer present** (an existing slot's ID isn't in `fetched` at all, including
+    ///   because it dropped out of the account's tier): marked `removed` (see
+    ///   `ServerSlot::acquire`) rather than torn down — a client's SOCKS5 config pointing at
+    ///   that port gets a clear, permanent error instead of the port silently starting to
+    ///   serve a *different* server if it were reassigned later. Automatically un-marked if
+    ///   the same server ID reappears in a later refresh.
+    ///
+    /// Pure reconciliation logic with no network call of its own — call via `refresh_servers`
+    /// in production; tests call this directly with a synthetic list.
+    fn apply_refreshed_servers(&self, fetched: Vec<VPNServer>) -> Result<()> {
+        let max_tier = *self.max_tier.lock().unwrap();
+        let creds = self.creds.lock().unwrap().clone().ok_or_else(|| {
+            ProtonError::Config("apply_refreshed_servers called before a successful login".into())
+        })?;
+        let limiter = self.limiter.lock().unwrap().clone().ok_or_else(|| {
+            ProtonError::Config("apply_refreshed_servers called before a successful login".into())
+        })?;
+
+        let mut servers: Vec<VPNServer> =
+            fetched.into_iter().filter(|s| s.tier <= max_tier).collect();
         servers.sort_by(|a, b| a.id.cmp(&b.id));
+        let fetched_ids: std::collections::HashSet<&str> =
+            servers.iter().map(|s| s.id.as_str()).collect();
 
-        let mut slots = Vec::with_capacity(servers.len());
-        for (i, server) in servers.into_iter().enumerate() {
-            let offset = u16::try_from(i)
-                .map_err(|_| ProtonError::Config("too many servers for the port range".into()))?;
-            let port = self.port_range_start.checked_add(offset).ok_or_else(|| {
+        let mut slots = self.slots.lock().unwrap();
+
+        // Mark servers no longer present as removed; un-mark ones that reappeared.
+        for slot in slots.iter() {
+            slot.removed
+                .store(!fetched_ids.contains(slot.id.as_str()), Ordering::SeqCst);
+        }
+
+        let mut next_port = self.next_port.lock().unwrap();
+        for server in servers {
+            if let Some(slot) = slots.iter().find(|s| s.id == server.id) {
+                *slot.server.lock().unwrap() = server;
+                continue;
+            }
+
+            // Genuinely new server: hand out the next never-before-used port.
+            let port = *next_port;
+            *next_port = next_port.checked_add(1).ok_or_else(|| {
                 ProtonError::Config("ran out of ports for the server list".into())
             })?;
 
@@ -790,8 +926,6 @@ impl TunnelManager {
             slots.push(slot);
         }
 
-        *self.slots.lock().unwrap() = slots;
-        *self.client.lock().await = Some(client);
         Ok(())
     }
 
@@ -1348,5 +1482,193 @@ mod tests {
             newest.status().connected,
             "the more-recently-idle slot must survive"
         );
+    }
+
+    fn test_server_tier(id: &str, location: &str, tier: i32) -> VPNServer {
+        VPNServer {
+            tier,
+            ..test_server(id, location)
+        }
+    }
+
+    /// Builds a `TunnelManager` as if `finish_login` had already run — populates `max_tier`/
+    /// `creds`/`limiter` directly (bypassing the real login/network path) and applies
+    /// `initial_servers` via `apply_refreshed_servers`, exactly like `finish_login` does — so
+    /// tests can exercise `apply_refreshed_servers` (the refresh reconciliation logic) and
+    /// `refresh_servers`'s effects directly and in isolation.
+    fn manager_after_login(
+        port_range_start: u16,
+        initial_servers: Vec<VPNServer>,
+        max_tier: i32,
+        evict_lru: bool,
+    ) -> Arc<TunnelManager> {
+        let manager = Arc::new(TunnelManager::with_driver(
+            port_range_start,
+            Arc::new(FakeDriver::default()),
+            false,
+            evict_lru,
+        ));
+        *manager.max_tier.lock().unwrap() = max_tier;
+        *manager.creds.lock().unwrap() = Some(test_creds());
+        *manager.limiter.lock().unwrap() = Some(Arc::new(ConnectionLimiter::new(None, evict_lru)));
+        manager.apply_refreshed_servers(initial_servers).unwrap();
+        manager
+    }
+
+    fn find_status(manager: &TunnelManager, id: &str) -> ServerStatus {
+        manager
+            .servers()
+            .into_iter()
+            .find(|s| s.name.starts_with(id) || s.name == format!("{id}-FREE#1"))
+            .unwrap_or_else(|| panic!("no server named like {id} in servers()"))
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_the_same_port_and_updates_live_metadata() {
+        let manager = manager_after_login(30000, vec![test_server("A", "US")], 0, false);
+        let original_port = manager.servers()[0].port;
+
+        let mut updated = test_server("A", "US");
+        updated.load = 77.0;
+        manager.apply_refreshed_servers(vec![updated]).unwrap();
+
+        let status = manager.servers();
+        assert_eq!(
+            status.len(),
+            1,
+            "must not create a duplicate slot for the same ID"
+        );
+        assert_eq!(
+            status[0].port, original_port,
+            "port must never change for an existing server"
+        );
+        assert_eq!(
+            status[0].load, 77.0,
+            "load must reflect the refreshed value"
+        );
+        assert!(!status[0].removed);
+    }
+
+    #[tokio::test]
+    async fn refresh_assigns_a_new_port_to_a_genuinely_new_server() {
+        let manager = manager_after_login(30000, vec![test_server("A", "US")], 0, false);
+        let port_a = manager.servers()[0].port;
+
+        manager
+            .apply_refreshed_servers(vec![test_server("A", "US"), test_server("B", "FR")])
+            .unwrap();
+
+        let statuses = manager.servers();
+        assert_eq!(statuses.len(), 2);
+        let a = statuses.iter().find(|s| s.port == port_a).unwrap();
+        let b = statuses.iter().find(|s| s.port != port_a).unwrap();
+        assert_eq!(a.country_code, "US");
+        assert_eq!(b.country_code, "FR");
+        assert_ne!(
+            b.port, port_a,
+            "the new server must get its own, different port"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_marks_a_disappeared_server_removed_but_keeps_its_port_and_slot() {
+        let manager = manager_after_login(
+            30000,
+            vec![test_server("A", "US"), test_server("B", "FR")],
+            0,
+            false,
+        );
+        let before = manager.servers();
+        assert_eq!(before.len(), 2);
+
+        // B no longer comes back from Proton.
+        manager
+            .apply_refreshed_servers(vec![test_server("A", "US")])
+            .unwrap();
+
+        let after = manager.servers();
+        assert_eq!(
+            after.len(),
+            2,
+            "the disappeared server's slot/port must still exist, just marked removed"
+        );
+        let a = after.iter().find(|s| s.country_code == "US").unwrap();
+        let b = after.iter().find(|s| s.country_code == "FR").unwrap();
+        assert!(!a.removed);
+        assert!(b.removed);
+    }
+
+    #[tokio::test]
+    async fn removed_server_rejects_new_connections_even_though_the_driver_would_succeed() {
+        let manager = manager_after_login(30000, vec![test_server("A", "US")], 0, false);
+        let slot = manager.slots.lock().unwrap()[0].clone();
+
+        manager.apply_refreshed_servers(vec![]).unwrap();
+        assert!(find_status(&manager, "US").removed);
+
+        let result = slot.acquire().await;
+        assert!(
+            result.is_err(),
+            "a removed server must reject new connections outright, even with a driver that \
+             would otherwise succeed instantly"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_unmarks_removed_when_a_server_reappears_with_the_same_port() {
+        let manager = manager_after_login(30000, vec![test_server("A", "US")], 0, false);
+        let original_port = manager.servers()[0].port;
+
+        manager.apply_refreshed_servers(vec![]).unwrap();
+        assert!(manager.servers()[0].removed);
+
+        manager
+            .apply_refreshed_servers(vec![test_server("A", "US")])
+            .unwrap();
+
+        let status = manager.servers();
+        assert_eq!(status.len(), 1, "reappearing must not create a second slot");
+        assert!(!status[0].removed);
+        assert_eq!(
+            status[0].port, original_port,
+            "a reappeared server must get back its original port, not a new one"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_applies_the_tier_filter_same_as_initial_login() {
+        // max_tier is 0 (free) — a tier-2 server in the fetched list must be excluded exactly
+        // like at initial login, not just let through because it's a "refresh."
+        let manager = manager_after_login(30000, vec![test_server_tier("A", "US", 0)], 0, false);
+
+        manager
+            .apply_refreshed_servers(vec![
+                test_server_tier("A", "US", 0),
+                test_server_tier("B", "FR", 2),
+            ])
+            .unwrap();
+
+        let statuses = manager.servers();
+        assert_eq!(
+            statuses.len(),
+            1,
+            "a server above the account's tier must never get a slot, refresh or not"
+        );
+        assert_eq!(statuses[0].country_code, "US");
+    }
+
+    #[tokio::test]
+    async fn refresh_does_not_touch_an_existing_slots_open_connection_state() {
+        // Sanity check that apply_refreshed_servers only ever writes `server`/`removed` —
+        // never open_connections/tunnel/idle bookkeeping for a server that's still present.
+        let manager = manager_after_login(30000, vec![test_server("A", "US")], 0, false);
+        let slot = manager.slots.lock().unwrap()[0].clone();
+
+        let mut updated = test_server("A", "US");
+        updated.load = 99.0;
+        manager.apply_refreshed_servers(vec![updated]).unwrap();
+
+        assert_eq!(slot.open_connections.load(Ordering::SeqCst), 0);
+        assert!(slot.tunnel.lock().unwrap().is_none());
     }
 }

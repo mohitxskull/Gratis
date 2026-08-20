@@ -64,6 +64,9 @@ pub struct ServerRow {
     /// Set only while connected with zero open connections — how long until this server's
     /// tunnel tears itself down and it drops back to the idle list.
     pub idle_countdown: Option<String>,
+    /// True once this server no longer appears in a fresh fetch from Proton — see
+    /// `ServerStatus::removed`. The port still exists but permanently refuses connections.
+    pub removed: bool,
 }
 
 /// Convert raw [`ServerStatus`]es into display [`ServerRow`]s, sorted by country then server
@@ -94,6 +97,7 @@ pub fn server_rows(mut servers: Vec<ServerStatus>) -> Vec<ServerRow> {
             sent: format_bytes(s.bytes_sent),
             received: format_bytes(s.bytes_received),
             idle_countdown: s.idle_countdown_secs.map(|secs| format!("{secs}s")),
+            removed: s.removed,
         })
         .collect()
 }
