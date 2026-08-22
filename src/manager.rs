@@ -1083,7 +1083,7 @@ mod tests {
             _listen_addr: String,
             _source: Arc<dyn TunnelSource>,
             _stats: Arc<TunnelStats>,
-        _protocol: ProxyProtocol,
+            _protocol: ProxyProtocol,
         ) -> JoinHandle<()> {
             tokio::spawn(async {
                 // Stand in for `run_socks5`'s infinite accept loop: never returns on its own.
@@ -1122,7 +1122,7 @@ mod tests {
             _listen_addr: String,
             _source: Arc<dyn TunnelSource>,
             _stats: Arc<TunnelStats>,
-        _protocol: ProxyProtocol,
+            _protocol: ProxyProtocol,
         ) -> JoinHandle<()> {
             tokio::spawn(async {
                 std::future::pending::<()>().await;
@@ -1149,7 +1149,7 @@ mod tests {
             _listen_addr: String,
             _source: Arc<dyn TunnelSource>,
             _stats: Arc<TunnelStats>,
-        _protocol: ProxyProtocol,
+            _protocol: ProxyProtocol,
         ) -> JoinHandle<()> {
             tokio::spawn(async {
                 std::future::pending::<()>().await;
@@ -1183,7 +1183,7 @@ mod tests {
             _listen_addr: String,
             _source: Arc<dyn TunnelSource>,
             _stats: Arc<TunnelStats>,
-        _protocol: ProxyProtocol,
+            _protocol: ProxyProtocol,
         ) -> JoinHandle<()> {
             tokio::spawn(async {
                 std::future::pending::<()>().await;
@@ -1212,7 +1212,7 @@ mod tests {
             _listen_addr: String,
             _source: Arc<dyn TunnelSource>,
             _stats: Arc<TunnelStats>,
-        _protocol: ProxyProtocol,
+            _protocol: ProxyProtocol,
         ) -> JoinHandle<()> {
             tokio::spawn(async {
                 std::future::pending::<()>().await;

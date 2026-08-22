@@ -175,9 +175,12 @@ async fn resolve_target(target: &str) -> io::Result<SocketAddr> {
     let (host, port) = target.rsplit_once(':').ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "CONNECT target missing a port")
     })?;
-    let port: u16 = port
-        .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "CONNECT target has a bad port"))?;
+    let port: u16 = port.parse().map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "CONNECT target has a bad port")
+    })?;
+    // RFC 3986 requires bracketing an IPv6 literal when it's paired with a port, e.g.
+    // `[::1]:443` — strip the brackets before resolving, since lookup_host/getaddrinfo reject them.
+    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
     let mut addrs = tokio::net::lookup_host((host, port)).await?;
     addrs
         .next()
@@ -197,6 +200,31 @@ fn status_for(err: &SourceError) -> (u16, &'static str) {
 }
 
 async fn send_status(client: &mut TcpStream, code: u16, reason: &str) -> io::Result<()> {
-    let response = format!("HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\n\r\n");
+    // RFC 9110 §9.3.6: a server MUST NOT send Content-Length (or Transfer-Encoding) on a 2xx
+    // reply to CONNECT — the tunnel's bytes start immediately after and aren't framed as a body.
+    let response = if (200..300).contains(&code) {
+        format!("HTTP/1.1 {code} {reason}\r\n\r\n")
+    } else {
+        format!("HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\n\r\n")
+    };
     client.write_all(response.as_bytes()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn resolve_target_accepts_a_bracketed_ipv6_literal() {
+        resolve_target("[::1]:443")
+            .await
+            .expect("bracketed IPv6 loopback should resolve");
+    }
+
+    #[tokio::test]
+    async fn resolve_target_accepts_a_plain_ipv4_literal() {
+        resolve_target("127.0.0.1:443")
+            .await
+            .expect("IPv4 loopback should resolve");
+    }
 }

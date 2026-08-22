@@ -248,8 +248,8 @@ mod tests {
 
     #[test]
     fn unit_contents_bakes_the_given_flags_into_exec_start() {
-        let unit =
-            unit_contents(9500, 21000, false, false, false).expect("binary_path must resolve in tests");
+        let unit = unit_contents(9500, 21000, false, false, false)
+            .expect("binary_path must resolve in tests");
         let exec_start = unit
             .lines()
             .find(|l| l.starts_with("ExecStart="))

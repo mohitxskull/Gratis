@@ -81,7 +81,9 @@ async fn spawn_proxy() -> u16 {
 
 /// Hand-rolled HTTP CONNECT request, returning the response's status code.
 async fn http_connect(stream: &mut TcpStream, target_port: u16) -> u16 {
-    let req = format!("CONNECT 127.0.0.1:{target_port} HTTP/1.1\r\nHost: 127.0.0.1:{target_port}\r\n\r\n");
+    let req = format!(
+        "CONNECT 127.0.0.1:{target_port} HTTP/1.1\r\nHost: 127.0.0.1:{target_port}\r\n\r\n"
+    );
     stream.write_all(req.as_bytes()).await.unwrap();
 
     // Read up to the blank line ending the response headers, byte by byte so we don't overread

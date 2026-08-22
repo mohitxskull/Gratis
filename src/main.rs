@@ -384,17 +384,22 @@ async fn cmd_status() -> anyhow::Result<()> {
     // disk-only check kept printing "logged in: yes" for a daemon that had already logged
     // "stored session is no longer valid" and was running with zero servers. Only fall back to
     // the disk-only check when there's no running daemon to ask at all.
-    let live_health = if active { health().await.ok() } else { None };
+    let live_health = if active { Some(health().await) } else { None };
 
     match (&live_health, &session) {
-        (Some(h), _) if h.auth_ok => match &session {
+        (Some(Ok(h)), _) if h.auth_ok => match &session {
             Some(s) => println!("logged in: yes ({})", mask_email(&s.email)),
             None => println!("logged in: yes (session file missing, but daemon is authenticated)"),
         },
-        (Some(h), _) => {
+        (Some(Ok(h)), _) => {
             let reason = h.auth_error.as_deref().unwrap_or("unknown reason");
             println!("logged in: NO — {reason}");
         }
+        (Some(Err(_)), Some(s)) => println!(
+            "logged in: yes ({}) [unverified — daemon not responding on control port]",
+            mask_email(&s.email)
+        ),
+        (Some(Err(_)), None) => println!("logged in: no"),
         (None, Some(s)) => println!(
             "logged in: yes ({}) [unverified — service not running, this is just what's on disk]",
             mask_email(&s.email)
@@ -440,12 +445,12 @@ async fn cmd_status() -> anyhow::Result<()> {
 
     if active {
         match &live_health {
-            Some(h) => println!(
+            Some(Ok(h)) => println!(
                 "servers: {} ready, control API at http://127.0.0.1:{}",
                 h.servers_ready,
                 control_port_from_unit()
             ),
-            None => println!("servers: could not reach control API"),
+            Some(Err(_)) | None => println!("servers: could not reach control API"),
         }
     }
 
@@ -500,10 +505,13 @@ struct HealthStatus {
 
 async fn health() -> anyhow::Result<HealthStatus> {
     let port = control_port_from_unit();
-    Ok(reqwest::get(format!("http://127.0.0.1:{port}/api/health"))
-        .await?
-        .json()
-        .await?)
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        reqwest::get(format!("http://127.0.0.1:{port}/api/health")),
+    )
+    .await
+    .context("timed out waiting for the control API to respond")??;
+    Ok(response.json().await?)
 }
 
 fn mask_email(email: &str) -> String {
@@ -767,9 +775,15 @@ async fn cmd_run(
                             "periodic server-list refresh failed ({err}); keeping the existing \
                              list until the next attempt"
                         );
-                        manager.set_auth_error(Some(format!(
-                            "periodic server-list refresh failed: {err}"
-                        )));
+                        // Don't clobber a more specific pre-existing error (e.g. "stored session
+                        // is no longer valid — run `gratis login` again") with this refresh's
+                        // own diagnostic — that's often just "never logged in successfully in
+                        // the first place", which is less actionable than what's already there.
+                        if manager.auth_error().is_none() {
+                            manager.set_auth_error(Some(format!(
+                                "periodic server-list refresh failed: {err}"
+                            )));
+                        }
                     }
                 }
             }
