@@ -9,7 +9,7 @@
 use base64::Engine as _;
 use gratis::models::AuthResponse;
 use gratis::srp::prove;
-use proton_srp::SrpHashVersion;
+use proton_srp::{SRPProofB64, SrpHashVersion};
 
 /// PGP-signed SRP modulus fixture (proton-srp test-suite). Verified by `RPGPVerifier`.
 const TEST_SIGNED_MODULUS: &str = "-----BEGIN PGP SIGNED MESSAGE-----
@@ -60,6 +60,88 @@ fn srp_proof_roundtrip_generates_ephemeral_and_proof() {
         .expect("client_proof is valid base64");
     assert_eq!(a.len(), proton_srp::SRP_LEN_BYTES);
     assert_eq!(m1.len(), proton_srp::SRP_LEN_BYTES);
+}
+
+/// `prove` trusts the modulus only after `RPGPVerifier` checks its PGP signature
+/// (`SRPAuth::with_pgp`, see `srp.rs`'s module doc). If that check were ever skipped or broken,
+/// `prove` would run real SRP math against a modulus an attacker fully controls — a modulus
+/// substitution attack. Flipping a byte in the signature (not the signed message) must be
+/// rejected before any SRP computation happens.
+#[test]
+fn prove_rejects_a_modulus_with_a_tampered_pgp_signature() {
+    // Flip one byte inside the base64 signature body — corrupts the signature without
+    // corrupting the ASCII-armor framing, so this still parses as a PGP message and reaches
+    // signature verification rather than failing earlier on malformed input.
+    let tampered_modulus = TEST_SIGNED_MODULUS.replacen(
+        "wl4EARYIABAFAlwB1j8JEDUFhcTpUY8mAADfEAD8DFdNXn4TsgbfbAZRDa9a",
+        "wl4EARYIABAFAlwB1j8JEDUFhcTpUY8mAADfEAD8DFdNXn4TsgbfbAZRDa9b",
+        1,
+    );
+    assert_ne!(
+        tampered_modulus, TEST_SIGNED_MODULUS,
+        "test setup: the replacement must actually change the fixture"
+    );
+
+    let result = prove(
+        Some("user@example.com"),
+        "hunter2-correct-horse",
+        SrpHashVersion::V4,
+        TEST_SALT_B64,
+        &tampered_modulus,
+        &test_server_ephemeral_b64(),
+    );
+
+    assert!(
+        result.is_err(),
+        "a modulus with an invalid PGP signature must never be trusted for SRP math"
+    );
+}
+
+/// The server-proof (M2) check is the *only* defense against an active MITM during login —
+/// `client.rs::login` calls `.compare_server_proof(sp)` on the API's returned `ServerProof` and
+/// fails the login if it doesn't match. Before this test, nothing asserted that comparison
+/// actually distinguishes a correct proof from a wrong one (the roundtrip test above discards
+/// `expected_server_proof` into `_expected_server_proof`) — if `compare_server_proof` were ever
+/// broken (e.g. always returning `true`), login would silently succeed against a malicious
+/// server and no test would catch it.
+#[test]
+fn server_proof_comparison_accepts_correct_and_rejects_tampered() {
+    let (client_ephemeral, client_proof, expected_server_proof) = prove(
+        Some("user@example.com"),
+        "hunter2-correct-horse",
+        SrpHashVersion::V4,
+        TEST_SALT_B64,
+        TEST_SIGNED_MODULUS,
+        &test_server_ephemeral_b64(),
+    )
+    .expect("prove must succeed against the PGP-verified modulus");
+
+    let proofs = SRPProofB64 {
+        client_ephemeral,
+        client_proof,
+        expected_server_proof: expected_server_proof.clone(),
+    };
+
+    // The only "genuine" server proof available without a live server is the client's own
+    // computed expectation — a real server that knows the password would compute this exact
+    // value and return it as `ServerProof`.
+    assert!(
+        proofs.compare_server_proof(&expected_server_proof),
+        "the correct M2 must be accepted"
+    );
+
+    // An active MITM (or a server that doesn't actually know the password) can't produce this
+    // value — any other string must be rejected, not silently accepted.
+    let mut tampered = expected_server_proof.clone();
+    tampered.push('X');
+    assert!(
+        !proofs.compare_server_proof(&tampered),
+        "a tampered/wrong M2 must be rejected — this is the MITM guard"
+    );
+    assert!(
+        !proofs.compare_server_proof(""),
+        "an empty server proof must be rejected, not treated as a match"
+    );
 }
 
 #[test]
