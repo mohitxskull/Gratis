@@ -45,3 +45,24 @@ pub fn delete() -> Result<()> {
         Err(e) => Err(ProtonError::Config(format!("keychain delete failed: {e}"))),
     }
 }
+
+/// `load` off the async runtime, via `spawn_blocking`. `keyring`'s Secret Service backend does
+/// a **synchronous** D-Bus round trip with no async variant — calling `load` directly from an
+/// async task on `gratis run`'s `current_thread` runtime would freeze every other task (every
+/// in-flight SOCKS5/HTTP relay, the control API, the update checker) for however long that
+/// round trip takes, which can be seconds if the bus is slow or there's no secret-service daemon
+/// running at all. Use this from any task that shares a runtime with other live work; the
+/// synchronous `load` is still fine for one-shot CLI commands that have nothing else running
+/// concurrently to block.
+pub async fn load_async() -> Result<Option<Session>> {
+    tokio::task::spawn_blocking(load)
+        .await
+        .map_err(|e| ProtonError::Config(format!("session load task panicked: {e}")))?
+}
+
+/// `store` off the async runtime — see `load_async`'s doc comment for why.
+pub async fn store_async(session: Session) -> Result<()> {
+    tokio::task::spawn_blocking(move || store(&session))
+        .await
+        .map_err(|e| ProtonError::Config(format!("session store task panicked: {e}")))?
+}

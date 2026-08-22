@@ -645,13 +645,13 @@ fn read_dotenv_var(path: &std::path::Path, key: &str) -> Option<String> {
 /// all): the daemon can still run, but a later token expiry has no automatic recovery for it —
 /// only `gratis login` supplies a re-authenticatable session.
 async fn resume_or_login(manager: Arc<TunnelManager>, control_port: u16) -> Option<Session> {
-    match session::load() {
+    match session::load_async().await {
         Ok(Some(session)) => match manager.login_with_session(&session).await {
             Ok(updated) => {
                 if updated.access_token != session.access_token {
                     // The stored access token had expired and got refreshed — persist the new
                     // one so the next `run` doesn't have to refresh again immediately.
-                    if let Err(err) = session::store(&updated) {
+                    if let Err(err) = session::store_async(updated.clone()).await {
                         log::warn!("failed to persist refreshed session: {err}");
                     }
                 }
@@ -675,12 +675,20 @@ async fn resume_or_login(manager: Arc<TunnelManager>, control_port: u16) -> Opti
         },
         Ok(None) => {
             // No stored session — fall back to a `.env` in the current directory, matching
-            // the daemon's original (pre-CLI) behavior.
-            let dotenv_path = std::path::Path::new(".env");
-            match (
-                read_dotenv_var(dotenv_path, "EMAIL"),
-                read_dotenv_var(dotenv_path, "PASSWORD"),
-            ) {
+            // the daemon's original (pre-CLI) behavior. Off the async runtime for the same
+            // reason as `session::load_async` — `std::fs::read_to_string` blocks the only
+            // worker thread on a `current_thread` runtime, freezing every live relay/the
+            // control API for however long that read takes.
+            let dotenv_creds = tokio::task::spawn_blocking(|| {
+                let path = std::path::Path::new(".env");
+                (
+                    read_dotenv_var(path, "EMAIL"),
+                    read_dotenv_var(path, "PASSWORD"),
+                )
+            })
+            .await
+            .unwrap_or((None, None));
+            match dotenv_creds {
                 (Some(email), Some(password)) => match manager.login(&email, &password).await {
                     Ok(()) => {
                         let count = manager.servers().len();
@@ -777,7 +785,7 @@ async fn cmd_run(
                     match manager.renew_credentials(current).await {
                         Ok(updated) => {
                             if updated.access_token != current.access_token
-                                && let Err(err) = session::store(&updated)
+                                && let Err(err) = session::store_async(updated.clone()).await
                             {
                                 log::warn!("failed to persist renewed session: {err}");
                             }
@@ -805,7 +813,7 @@ async fn cmd_run(
                     match manager.renew_credentials(current).await {
                         Ok(updated) => {
                             if updated.access_token != current.access_token
-                                && let Err(err) = session::store(&updated)
+                                && let Err(err) = session::store_async(updated.clone()).await
                             {
                                 log::warn!("failed to persist renewed session: {err}");
                             }
