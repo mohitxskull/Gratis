@@ -104,6 +104,14 @@ server to make room. It never touches a server with active traffic — if every 
 server is actually busy, the new connection is still rejected, same as the default. Useful
 if you'd rather gratis manage which servers stay connected than see connection errors.
 
+### Proxy protocol
+
+Every server's port speaks SOCKS5 by default. `gratis up --http-proxy` switches every
+port to HTTP CONNECT instead, for clients/frameworks that only support proxying through an
+HTTP CONNECT proxy (e.g. Pingora's `Peer::proxy`) rather than SOCKS5. It's one choice for
+the whole daemon — every port switches together — and otherwise behaves identically
+(lazy tunnel connect on first use, same idle teardown, same connection limit).
+
 ### System tray
 
 `gratis up` also installs and starts a small tray icon — a menu with the connected server
@@ -126,7 +134,7 @@ it natively.
 | --- | --- |
 | `gratis login` | Authenticate and store the session in the OS keychain |
 | `gratis logout` | Stop the service (and tray) and forget the stored session |
-| `gratis up [--control-port] [--port-range-start] [--unlimited-connections] [--evict-lru]` | Start the background service and tray |
+| `gratis up [--control-port] [--port-range-start] [--unlimited-connections] [--evict-lru] [--http-proxy]` | Start the background service and tray |
 | `gratis down` | Stop them |
 | `gratis status` | Show login/running/persist/tray state, and server count if running |
 | `gratis logs [--watch]` | Show the service's (and tray's) systemd journal — `--watch` to follow |
@@ -186,18 +194,25 @@ with a `!` suffix or a `BREAKING CHANGE:` footer is flagged as breaking.
 
 ## How it works
 
-- **`src/manager.rs`** — one `ServerSlot` per server the account's real tier (fetched via
-  `GET /vpn/v2`, not assumed) can reach: a fixed port, an always-on SOCKS5 listener, and a
-  WireGuard tunnel that connects lazily on first use and tears down after being idle (zero
-  open connections) for 5 minutes. Also enforces the connection limit described above. The
-  server list itself is re-fetched every 30 minutes (not just once at login), so load numbers
-  stay current, newly-added servers show up, and servers Proton removes get flagged
-  ("no longer available") — a port, once assigned to a server, is never reused for a
-  different one, so removal never silently repurposes a client's existing connection.
+- **`src/manager/`** — one `ServerSlot` per server the account's real tier (fetched via
+  `GET /vpn/v2`, not assumed) can reach: a fixed port, an always-on listener (SOCKS5 or HTTP
+  CONNECT, see "Proxy protocol" above), and a WireGuard tunnel that connects lazily on first
+  use and tears down after being idle (zero open connections) for 5 minutes. Split by concern
+  across `mod.rs` (the `TunnelManager` facade), `slot.rs` (`ServerSlot`), `limiter.rs` (the
+  `MaxConnect` cap + LRU eviction), and `driver.rs` (the seam that swaps a real tunnel/listener
+  for a test double). Also enforces the connection limit described above. The server list
+  itself is re-fetched every 30 minutes (not just once at login), so load numbers stay
+  current, newly-added servers show up, and servers Proton removes get flagged ("no longer
+  available") — a port, once assigned to a server, is never reused for a different one, so
+  removal never silently repurposes a client's existing connection. The daemon also
+  re-authenticates (refreshing the access token and WireGuard certificate) before either
+  expires, so a long-running process doesn't silently degrade.
 - **`src/wireguard.rs`** — an in-process userspace WireGuard session (via
   `wireguard-netstack`), not a real kernel interface.
 - **`src/socks5.rs`** — a minimal SOCKS5 (CONNECT-only) proxy that relays traffic through
   whichever tunnel a `ServerSlot` currently holds.
+- **`src/http_connect.rs`** — the HTTP CONNECT alternative to `socks5.rs` (`--http-proxy`),
+  sharing the same tunnel/relay machinery — only the front-end handshake differs.
 - **`src/client.rs`** — the Proton API client (SRP login, certificate issuance, server
   list).
 - **`src/agent.rs`** — Proton's "local agent" handshake. Proton admits a new WireGuard
@@ -211,10 +226,11 @@ with a `!` suffix or a `BREAKING CHANGE:` footer is flagged as breaking.
 - **`src/service.rs`** — writes/starts/stops/enables both `systemd --user` units (the daemon
   and the tray) that `up`/`down`/`persist` control together.
 - **`src/update.rs`** — `gratis update`'s self-replace: downloads the matching release
-  tarball and swaps the running binary in place. `gratis run` also polls GitHub every 6
-  hours and fires a desktop notification when a newer release exists (shown in the tray
-  menu too) — check-only, it never downloads or applies anything on its own; updating stays
-  a manual `gratis update`.
+  tarball, verifies its Ed25519 signature against the key embedded in the binary (releases
+  are signed in CI — see `.github/workflows/release.yml`), and swaps the running binary in
+  place. `gratis run` also polls GitHub every 6 hours and fires a desktop notification when a
+  newer release exists (shown in the tray menu too) — check-only, it never downloads or
+  applies anything on its own; updating stays a manual `gratis update`.
 - **`src/tray.rs`** — the system tray icon (`gratis tray`): polls the control API and
   `systemctl` for status, no capabilities beyond what the CLI already has.
 - **`src/notify.rs`** — desktop notifications for the daemon's silent-failure cases
