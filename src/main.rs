@@ -467,28 +467,17 @@ async fn cmd_status() -> anyhow::Result<()> {
 /// shows what a service was actually started with, without the user needing to grep the unit
 /// file by hand. `false` (not an error) if the unit can't be read at all.
 fn unit_has_flag(flag: &str) -> bool {
-    service::unit_path()
-        .ok()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .is_some_and(|unit| {
-            unit.lines()
-                .any(|l| l.starts_with("ExecStart=") && l.contains(flag))
-        })
+    service::exec_start_line().is_some_and(|line| line.contains(flag))
 }
 
 /// Reads the control port out of the installed unit file's `ExecStart` line rather than
 /// hardcoding the default — `up` can be given a non-default `--control-port`. Falls back to
 /// 9000 (the default) if the unit isn't installed or the line can't be parsed.
 fn control_port_from_unit() -> u16 {
-    service::unit_path()
-        .ok()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|unit| {
-            unit.lines()
-                .find_map(|l| l.split("--control-port").nth(1))
-                .and_then(|rest| rest.split_whitespace().next())
-                .and_then(|p| p.parse().ok())
-        })
+    service::exec_start_line()
+        .and_then(|line| line.split("--control-port").nth(1).map(str::to_string))
+        .and_then(|rest| rest.split_whitespace().next().map(str::to_string))
+        .and_then(|p| p.parse().ok())
         .unwrap_or(9000)
 }
 

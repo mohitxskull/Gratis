@@ -34,6 +34,22 @@ pub fn tray_is_installed() -> Result<bool> {
     Ok(tray_unit_path()?.is_file())
 }
 
+/// The installed unit file's `ExecStart=` line, if the unit exists and can be read — the one
+/// place a running service's flags/settings live (see this module's doc comment). Centralizes
+/// the "read the unit file, find the `ExecStart=` line" step that `main.rs`'s `unit_has_flag`
+/// and `control_port_from_unit` used to each do independently, which meant a change to the unit
+/// format had to be kept in sync in two places by hand. `None` (not an error) covers every
+/// "nothing to read" case a caller like `gratis status` treats the same way anyway: not
+/// installed, unreadable, or a unit with no `ExecStart=` line at all.
+pub fn exec_start_line() -> Option<String> {
+    let path = unit_path().ok()?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    contents
+        .lines()
+        .find(|l| l.starts_with("ExecStart="))
+        .map(str::to_string)
+}
+
 /// Absolute path to the currently-running `gratis` binary — what `ExecStart` points at.
 fn binary_path() -> Result<PathBuf> {
     std::env::current_exe().map_err(ProtonError::Io)
