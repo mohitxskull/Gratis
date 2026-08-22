@@ -15,7 +15,7 @@
 use crate::manager::{ServerStatus, TunnelManager};
 use crate::webui::{IndexTemplate, ServersTemplate};
 use askama::Template;
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::{
     Json, Router,
     response::{Html, IntoResponse, Response},
@@ -23,6 +23,32 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+/// Adds `X-Content-Type-Options: nosniff` and a restrictive `Content-Security-Policy` to every
+/// response. Low-impact hardening for a localhost control plane — Askama's auto-escaping
+/// already prevents XSS (see the module review) — but cheap, and it means a future accidental
+/// `|safe` on untrusted data has a second layer to get through. The CSP allows only what this
+/// UI actually needs: inline script/style (the compiled-in htmx JS and Tailwind CSS, not
+/// external assets — see `webui.rs`) and same-origin XHR (htmx's `hx-get` polling).
+async fn add_security_headers(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static(
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+             connect-src 'self'",
+        ),
+    );
+    response
+}
 
 /// Render an Askama template to an HTML response, mapping a render failure (should never
 /// happen for these templates — they don't do anything fallible) to a 500.
@@ -45,6 +71,7 @@ pub fn router(manager: Arc<TunnelManager>) -> Router {
         .route("/api/servers", get(list_servers))
         .route("/api/update", get(update_status))
         .route("/api/health", get(health_status))
+        .layer(axum::middleware::from_fn(add_security_headers))
         .with_state(manager)
 }
 
@@ -188,6 +215,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn every_response_carries_security_headers() {
+        let app = router(stub_manager());
+        let resp = app
+            .oneshot(Request::get("/api/servers").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert!(resp.headers().contains_key("content-security-policy"));
     }
 
     #[tokio::test]

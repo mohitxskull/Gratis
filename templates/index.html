@@ -52,7 +52,7 @@
     <div
       id="servers"
       hx-get="/ui/servers"
-      hx-trigger="every 3s[!(document.activeElement && document.activeElement.closest('#servers'))]"
+      hx-trigger="every 3s"
       hx-swap="innerHTML"
     >
       {% include "servers.html" %}
@@ -69,6 +69,16 @@ let idleServersOpen = false;
 
 document.body.addEventListener('htmx:beforeSwap', (e) => {
   if (e.detail.target.id !== 'servers') return;
+  // Skip the poll's swap entirely while focus is inside #servers (e.g. the idle-servers
+  // <details> toggle, or a focused control within it) — a periodic re-render would otherwise
+  // steal focus/interrupt whatever the user is doing every 3 seconds. Previously expressed as
+  // an htmx hx-trigger event filter (`every 3s[!...]`), which needs `eval`/`new Function` under
+  // the hood — moved here instead so the page's Content-Security-Policy can omit
+  // 'unsafe-eval' entirely.
+  if (document.activeElement && document.activeElement.closest('#servers')) {
+    e.detail.shouldSwap = false;
+    return;
+  }
   const details = document.getElementById('servers-idle-wrap');
   if (details) idleServersOpen = details.open;
 });
