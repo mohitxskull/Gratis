@@ -311,7 +311,16 @@ impl TunnelManager {
         // itself fails, fall back to the *most conservative* free-tier assumptions (tier 0,
         // 1 simultaneous connection) rather than silently defaulting to "unlimited" — an
         // account-info outage should never be the thing that disables the connection cap.
-        let account = client.fetch_account_info().await.ok();
+        let account = match client.fetch_account_info().await {
+            Ok(a) => Some(a),
+            Err(err) => {
+                // The fallback itself is intentional (see above) but was previously silent —
+                // a transient Proton outage at login would quietly cap a paid account at
+                // free-tier limits with nothing in the log explaining why.
+                log::warn!("couldn't fetch account info ({err}); assuming free-tier limits");
+                None
+            }
+        };
         let max_tier = account.as_ref().map_or(FALLBACK_TIER, |a| a.vpn.max_tier);
         let max_connect = account
             .as_ref()

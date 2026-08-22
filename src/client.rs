@@ -102,8 +102,23 @@ impl ProtonVPNClient {
             return Err(ProtonError::Auth);
         }
         if !status.is_success() {
-            let msg = resp.text().await.unwrap_or_default();
-            return Err(ProtonError::Api(msg));
+            // Mirror the decode-error branch below: never embed the raw body in an error that
+            // can end up logged (`main.rs` logs `ProtonError::Api` at `warn!` on several
+            // paths) — some responses on this client can carry key material or tokens. Report
+            // only the status and top-level field names, which is enough to diagnose a shape
+            // mismatch without risking a secret leak. If the body itself can't even be read
+            // (e.g. connection reset mid-body), still preserve the status rather than
+            // collapsing to an empty, contentless error.
+            return Err(match resp.text().await {
+                Ok(body) => {
+                    let keys: Vec<String> = serde_json::from_str::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|v| v.as_object().map(|o| o.keys().cloned().collect()))
+                        .unwrap_or_default();
+                    ProtonError::Api(format!("HTTP {status}; top-level fields: {keys:?}"))
+                }
+                Err(_) => ProtonError::Api(format!("HTTP {status} (body unreadable)")),
+            });
         }
         let text = resp.text().await?;
         serde_json::from_str(&text).map_err(|e| {

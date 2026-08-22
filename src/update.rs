@@ -89,8 +89,13 @@ fn print_progress(line: &str) {
 /// Fetch the latest GitHub release's metadata. Shared by `run` (which needs the asset list to
 /// download) and `check_for_update` (which only needs the version).
 async fn fetch_latest_release() -> Result<Release> {
+    // Without a timeout, a stalled GitHub connection (or a MITM/proxy that never responds)
+    // hangs this call forever. check_for_update runs from the daemon's periodic task
+    // (main.rs) inside a loop with no other timeout of its own — a hang here would silently
+    // stop all future update checks for the rest of the process's life.
     let client = reqwest::Client::builder()
         .user_agent("gratis-updater")
+        .timeout(std::time::Duration::from_secs(15))
         .build()?;
     let release: Release = client
         .get(format!(
@@ -133,8 +138,12 @@ pub async fn run() -> Result<UpdateOutcome> {
     // log file) it's block-buffered, so without this a line could sit unflushed for the whole
     // multi-second step it's describing.
     print_progress("gratis: checking for updates...");
+    // Longer than `fetch_latest_release`'s 15s — this client also downloads the tarball/sig
+    // (multi-hundred-KB), which needs more headroom than a metadata fetch, but still bounded
+    // rather than hanging forever on a stalled connection.
     let client = reqwest::Client::builder()
         .user_agent("gratis-updater")
+        .timeout(std::time::Duration::from_secs(60))
         .build()?;
     let release = fetch_latest_release().await?;
     let latest = release.tag_name.trim_start_matches('v').to_string();
