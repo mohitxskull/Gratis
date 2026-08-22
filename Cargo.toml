@@ -16,6 +16,12 @@ base64 = "0.22"
 thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+# WHY: gratis's whole purpose is custodying VPN credentials (the ed25519 seed, the derived
+# WireGuard private key, the account password) — already an indirect dependency via
+# ed25519-dalek/x25519-dalek, made direct so ClientIdentity/VPNCredentials/the login password
+# are zeroized on drop instead of lingering in process memory (and potentially swap/core dumps)
+# for the rest of the process's life.
+zeroize = { version = "1", features = ["derive"] }
 # WHY pgpinternal: supplies RPGPVerifier to verify the PGP-signed SRP modulus Proton
 # requires before trusting it. Correctness reference for the auth/session flow:
 # https://github.com/ProtonVPN/proton-vpn-cli

@@ -15,6 +15,7 @@ use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use sha2::{Digest, Sha512};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// ASN.1 SubjectPublicKeyInfo prefix for a raw ed25519 public key (matches the constant used
 /// by Proton's own client for PEM-encoding `ClientPublicKey`).
@@ -25,6 +26,12 @@ const ED25519_SPKI_PREFIX: [u8; 12] = [
 /// A freshly generated client WireGuard/certificate identity. `client::issue_credentials`
 /// generates a new one on every login (fresh SRP or session resume alike) — there is no restore
 /// path from a persisted seed, even though `VPNCredentials::ed25519_seed_b64` is itself stored.
+///
+/// Zeroized on drop: the seed is the root of both the ed25519 identity and the derived
+/// WireGuard private key, so it stays in process memory (and potentially swap/core dumps) for
+/// as long as this value lives — clearing it on drop is the difference between "gone when no
+/// longer needed" and "gone whenever the allocator happens to reuse the page."
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct ClientIdentity {
     /// Raw 32-byte ed25519 seed.
     pub ed25519_seed: [u8; 32],
@@ -85,5 +92,24 @@ impl ClientIdentity {
         }
         pem.push_str("-----END PUBLIC KEY-----\n");
         pem
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroize::Zeroize;
+
+    #[test]
+    fn client_identity_zeroize_clears_the_seed() {
+        let mut identity = ClientIdentity::generate();
+        assert_ne!(
+            identity.ed25519_seed, [0u8; 32],
+            "a fresh seed is never all-zero"
+        );
+
+        identity.zeroize();
+
+        assert_eq!(identity.ed25519_seed, [0u8; 32]);
     }
 }

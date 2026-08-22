@@ -264,7 +264,10 @@ fn looks_like_email(s: &str) -> bool {
 /// validated (non-empty, plausible shape) before it's ever sent anywhere — a blank or
 /// malformed address should fail locally and immediately, not after a round trip to Proton's
 /// API returns a confusing error.
-fn read_credentials() -> anyhow::Result<(String, String)> {
+/// The password comes back wrapped in `Zeroizing` — it's cleared from memory the moment it
+/// goes out of scope in the caller, rather than lingering in the allocator's freed memory (and
+/// potentially swap/core dumps) for the rest of the process's life.
+fn read_credentials() -> anyhow::Result<(String, zeroize::Zeroizing<String>)> {
     let email = match std::env::var("EMAIL") {
         Ok(v) if !v.is_empty() => {
             if !looks_like_email(&v) {
@@ -284,7 +287,7 @@ fn read_credentials() -> anyhow::Result<(String, String)> {
         Ok(v) if !v.is_empty() => v,
         _ => prompt_password_masked("Proton password")?,
     };
-    Ok((email, password))
+    Ok((email, zeroize::Zeroizing::new(password)))
 }
 
 async fn cmd_login() -> anyhow::Result<()> {

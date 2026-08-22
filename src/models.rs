@@ -6,6 +6,7 @@
 //! (`proton-core`/`proton-vpn-api-core`, installed system-wide on the dev machine at
 //! `/usr/lib/python3/dist-packages/proton/`), and against a real live login.
 use serde::Deserialize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const PROTON_API_URL: &str = "https://api.protonvpn.ch";
 pub const USER_AGENT: &str = "ProtonVPN-CustomClient/1.0";
@@ -64,12 +65,18 @@ impl VPNServer {
 /// derives the WireGuard (X25519) keypair from it, and asks `/vpn/v1/certificate` to sign the
 /// corresponding ed25519 public key. `wg_private_key`/`wg_public_key` here are that locally
 /// derived keypair, base64-encoded — never anything read off the wire.
-#[derive(Debug, Clone)]
+/// Zeroized on drop (except `username` and `certificate_expires_at`, neither of which is key
+/// material): this struct is cloned into every `ServerSlot` for the lifetime of the daemon (see
+/// `manager.rs`), so without this, the seed and derived WireGuard private key would sit in
+/// process memory — and potentially swap/core dumps — in as many copies as there are servers,
+/// for as long as the process runs.
+#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct VPNCredentials {
+    #[zeroize(skip)]
     pub username: String,
-    /// Raw 32-byte ed25519 seed, base64-encoded, so the same client identity (and therefore
-    /// the same WireGuard keypair) can be restored across restarts instead of minting a new
-    /// device identity on every login.
+    /// Raw 32-byte ed25519 seed, base64-encoded. `client::issue_credentials` always mints a
+    /// fresh identity rather than restoring one from this (see `ClientIdentity`'s doc comment) —
+    /// stored here anyway since it's part of what `/vpn/v1/certificate` was issued for.
     pub ed25519_seed_b64: String,
     pub wg_private_key: String,
     pub wg_public_key: String,
@@ -81,6 +88,7 @@ pub struct VPNCredentials {
     /// and that protocol is not implemented here (no accessible source for its wire format
     /// beyond a compiled Rust extension). Whether a tunnel stays usable without it is unverified.
     pub certificate: String,
+    #[zeroize(skip)]
     pub certificate_expires_at: i64,
 }
 
@@ -243,4 +251,32 @@ pub struct PhysicalServerDto {
     pub status: i32,
     #[serde(rename = "X25519PublicKey", default)]
     pub x25519_public_key: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroize::Zeroize;
+
+    #[test]
+    fn vpn_credentials_zeroize_clears_secrets_but_keeps_username_and_expiry() {
+        let mut creds = VPNCredentials {
+            username: "user@example.com".into(),
+            ed25519_seed_b64: "seed".into(),
+            wg_private_key: "privkey".into(),
+            wg_public_key: "pubkey".into(),
+            certificate: "cert".into(),
+            certificate_expires_at: 1_700_000_000,
+        };
+
+        creds.zeroize();
+
+        assert_eq!(creds.ed25519_seed_b64, "");
+        assert_eq!(creds.wg_private_key, "");
+        assert_eq!(creds.wg_public_key, "");
+        assert_eq!(creds.certificate, "");
+        // Neither is secret material — must survive zeroize untouched.
+        assert_eq!(creds.username, "user@example.com");
+        assert_eq!(creds.certificate_expires_at, 1_700_000_000);
+    }
 }
