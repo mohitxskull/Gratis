@@ -55,6 +55,16 @@ fn binary_path() -> Result<PathBuf> {
     std::env::current_exe().map_err(ProtonError::Io)
 }
 
+/// Quote a path for a systemd unit's `ExecStart=` line, per `systemd.syntax`'s quoting rules
+/// (backslash-escape `\` and `"`, wrap in double quotes). Without this, a binary path containing
+/// a space or a systemd-significant character (`;`, `\`, `"`, ...) would be mis-parsed — split
+/// into multiple tokens, or have a metacharacter interpreted — and the service would fail to
+/// start. `current_exe()`'s path isn't attacker-controlled in the threat model this project
+/// targets, but robust unit-file generation shouldn't depend on that.
+fn systemd_quote(path: &str) -> String {
+    format!("\"{}\"", path.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 fn unit_contents(
     control_port: u16,
     port_range_start: u16,
@@ -66,6 +76,7 @@ fn unit_contents(
     let bin = bin
         .to_str()
         .ok_or_else(|| ProtonError::Config("gratis binary path is not valid UTF-8".into()))?;
+    let bin = systemd_quote(bin);
     let mut flags = String::new();
     if unlimited_connections {
         flags.push_str(" --unlimited-connections");
@@ -135,6 +146,7 @@ fn tray_unit_contents(control_port: u16) -> Result<String> {
     let bin = bin
         .to_str()
         .ok_or_else(|| ProtonError::Config("gratis binary path is not valid UTF-8".into()))?;
+    let bin = systemd_quote(bin);
     Ok(format!(
         "[Unit]\n\
          Description=gratis - tray icon\n\
@@ -261,6 +273,36 @@ pub fn tray_is_active() -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn systemd_quote_wraps_a_plain_path_in_double_quotes() {
+        assert_eq!(systemd_quote("/usr/bin/gratis"), "\"/usr/bin/gratis\"");
+    }
+
+    #[test]
+    fn systemd_quote_escapes_embedded_quotes_and_backslashes() {
+        // A path containing a `"` or `\` must come out escaped, not raw — an unescaped one
+        // would prematurely end the quoted token when systemd parses the unit.
+        assert_eq!(
+            systemd_quote(r#"/opt/weird"path/gratis"#),
+            r#""/opt/weird\"path/gratis""#
+        );
+        assert_eq!(systemd_quote(r"C:\odd\gratis"), r#""C:\\odd\\gratis""#);
+    }
+
+    #[test]
+    fn unit_contents_quotes_the_exec_start_binary_path() {
+        let unit = unit_contents(9500, 21000, false, false, false)
+            .expect("binary_path must resolve in tests");
+        let exec_start = unit
+            .lines()
+            .find(|l| l.starts_with("ExecStart="))
+            .expect("unit must have an ExecStart line");
+        // A space (or systemd-significant char) in the binary path must not split ExecStart
+        // into multiple tokens — the quoted path is exactly one token to systemd's parser.
+        assert!(exec_start.starts_with("ExecStart=\""));
+        assert!(exec_start.contains("\" run --control-port"));
+    }
 
     #[test]
     fn unit_contents_bakes_the_given_flags_into_exec_start() {
