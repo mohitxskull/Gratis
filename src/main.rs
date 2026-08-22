@@ -638,7 +638,13 @@ fn read_dotenv_var(path: &std::path::Path, key: &str) -> Option<String> {
 /// genuinely starting up correctly (confirmed live: `systemctl` marks a `Type=simple` unit
 /// active the instant the process starts, with no readiness signal, so there's no way to
 /// distinguish "still starting" from "broken" without the port already being open).
-async fn resume_or_login(manager: Arc<TunnelManager>, control_port: u16) {
+///
+/// Returns the session actually in use, if any — the periodic refresh loop in `cmd_run` needs
+/// it to re-authenticate later (see `TunnelManager::renew_credentials`). `None` when this
+/// process has no session to fall back on (the `.env`-credentials path, or no credentials at
+/// all): the daemon can still run, but a later token expiry has no automatic recovery for it —
+/// only `gratis login` supplies a re-authenticatable session.
+async fn resume_or_login(manager: Arc<TunnelManager>, control_port: u16) -> Option<Session> {
     match session::load() {
         Ok(Some(session)) => match manager.login_with_session(&session).await {
             Ok(updated) => {
@@ -652,6 +658,7 @@ async fn resume_or_login(manager: Arc<TunnelManager>, control_port: u16) {
                 let count = manager.servers().len();
                 log::info!("resumed session ({}), {count} servers ready", session.email);
                 manager.set_auth_error(None);
+                Some(updated)
             }
             Err(err) => {
                 log::warn!("stored session is no longer valid ({err}) — run `gratis login` again");
@@ -663,6 +670,7 @@ async fn resume_or_login(manager: Arc<TunnelManager>, control_port: u16) {
                     "Run `gratis login` again to reconnect. Click to open the dashboard.",
                     &format!("http://127.0.0.1:{control_port}/"),
                 );
+                None
             }
         },
         Ok(None) => {
@@ -691,10 +699,14 @@ async fn resume_or_login(manager: Arc<TunnelManager>, control_port: u16) {
                     manager.set_auth_error(Some(msg.to_string()));
                 }
             }
+            // The `.env` path never produces a re-authenticatable `Session` (no refresh
+            // token/UID pair is minted for it) — the periodic loop has nothing to renew with.
+            None
         }
         Err(err) => {
             log::warn!("failed to read stored session ({err}), starting with no servers");
             manager.set_auth_error(Some(format!("failed to read stored session: {err}")));
+            None
         }
     }
 }
@@ -748,14 +760,70 @@ async fn cmd_run(
     tokio::spawn({
         let manager = manager.clone();
         async move {
-            resume_or_login(manager.clone(), control_port).await;
+            let mut session = resume_or_login(manager.clone(), control_port).await;
+            let mut last_cred_renewal = std::time::Instant::now();
 
             let mut interval = tokio::time::interval(gratis::manager::SERVER_LIST_REFRESH_INTERVAL);
             interval.tick().await; // first tick fires immediately; the line above just refreshed.
             loop {
                 interval.tick().await;
+
+                // Proactively rotate the WireGuard certificate before its fixed 168-minute
+                // lifetime runs out, rather than waiting to discover it's dead the next time a
+                // slot tries to connect — see `CREDENTIAL_RENEWAL_INTERVAL`'s doc comment.
+                if let Some(current) = &session
+                    && last_cred_renewal.elapsed() >= gratis::manager::CREDENTIAL_RENEWAL_INTERVAL
+                {
+                    match manager.renew_credentials(current).await {
+                        Ok(updated) => {
+                            if updated.access_token != current.access_token
+                                && let Err(err) = session::store(&updated)
+                            {
+                                log::warn!("failed to persist renewed session: {err}");
+                            }
+                            session = Some(updated);
+                            last_cred_renewal = std::time::Instant::now();
+                            log::info!("proactively renewed WireGuard certificate/credentials");
+                        }
+                        Err(err) => {
+                            log::warn!("proactive credential renewal failed ({err})");
+                        }
+                    }
+                }
+
                 let was_broken = manager.auth_error().is_some();
-                match manager.refresh_servers().await {
+                let mut result = manager.refresh_servers().await;
+
+                // The access token (or the WireGuard certificate `finish_login`/
+                // `login_with_session` minted) can lapse on a daemon meant to run for weeks —
+                // without this, a single expiry permanently degrades `gratis run` to "logged in:
+                // NO" until a human re-runs `gratis login` (see error_handling.md F1/F2). Only
+                // possible when this process actually resumed a `Session` (not the `.env`
+                // fallback, which has no refresh token to re-authenticate with).
+                if let (Err(ProtonError::Auth), Some(current)) = (&result, &session) {
+                    log::warn!("periodic refresh hit an expired token; re-authenticating...");
+                    match manager.renew_credentials(current).await {
+                        Ok(updated) => {
+                            if updated.access_token != current.access_token
+                                && let Err(err) = session::store(&updated)
+                            {
+                                log::warn!("failed to persist renewed session: {err}");
+                            }
+                            session = Some(updated);
+                            last_cred_renewal = std::time::Instant::now();
+                            log::info!("re-authenticated successfully; retrying server refresh");
+                            result = manager.refresh_servers().await;
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "re-authentication failed ({err}) — stored session is likely \
+                                 no longer valid; run `gratis login` again"
+                            );
+                        }
+                    }
+                }
+
+                match result {
                     Ok(()) => {
                         if was_broken {
                             // Loud on the way back up, not just the way down — a silent

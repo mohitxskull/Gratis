@@ -111,6 +111,16 @@ const READINESS_TTL: Duration = Duration::from_secs(30);
 /// minute-to-minute.
 pub const SERVER_LIST_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
+/// How long `main.rs`'s background loop waits before proactively calling
+/// `TunnelManager::renew_credentials` again, even if nothing has failed yet. Proton issues the
+/// WireGuard certificate (`issue_credentials`, `client.rs`) for a fixed 168-minute lifetime;
+/// without a proactive renewal, a slot that goes quiet for longer than that would only discover
+/// its certificate is dead the next time it tries to connect (falling back to the slower
+/// readiness probe rather than the local-agent handshake — see `unlock_tunnel`). Comfortably
+/// under 168 minutes so renewal always lands before expiry even accounting for the 30-minute
+/// tick granularity above.
+pub const CREDENTIAL_RENEWAL_INTERVAL: Duration = Duration::from_secs(150 * 60);
+
 /// Fallback account tier used to filter the server list, only if `GET /vpn/v2` (see
 /// `client::fetch_account_info`) can't be reached — the manager otherwise always uses the
 /// account's real `MaxTier` from that call. This was previously the *only* tier value used at
@@ -312,7 +322,10 @@ struct ServerSlot {
     /// different server, so a client's SOCKS5 config pointing here gets a clear, stable
     /// error instead of silently starting to mean a different server later.
     removed: AtomicBool,
-    creds: VPNCredentials,
+    /// Mutable so a token/certificate renewal (see `TunnelManager::renew_credentials`) can
+    /// update every existing slot in place — a slot's `creds` otherwise never expires on its
+    /// own, and the WireGuard certificate Proton issues is only valid for 168 minutes.
+    creds: Mutex<VPNCredentials>,
     driver: Arc<dyn TunnelDriver>,
     port: u16,
     stats: Arc<TunnelStats>,
@@ -360,7 +373,7 @@ impl ServerSlot {
             id,
             server: Mutex::new(server),
             removed: AtomicBool::new(false),
-            creds,
+            creds: Mutex::new(creds),
             driver,
             port,
             stats: Arc::new(TunnelStats::default()),
@@ -375,6 +388,13 @@ impl ServerSlot {
             self_ref: weak.clone(),
             limiter,
         })
+    }
+
+    /// Swap in freshly renewed credentials (new access token, new WireGuard certificate) —
+    /// see `TunnelManager::renew_credentials`. Does not disturb an already-connected tunnel;
+    /// the new creds take effect the next time this slot connects or unlocks one.
+    fn update_creds(&self, creds: VPNCredentials) {
+        *self.creds.lock().unwrap() = creds;
     }
 
     /// Whether external TLS through this slot was confirmed working recently enough to trust
@@ -406,11 +426,9 @@ impl ServerSlot {
             let attempt_timeout = remaining.min(CONNECT_ATTEMPT_TIMEOUT);
             // Clone out of the lock rather than holding a guard across the `.await` below.
             let server = self.server.lock().unwrap().clone();
-            match tokio::time::timeout(
-                attempt_timeout,
-                self.driver.connect_tunnel(&server, &self.creds),
-            )
-            .await
+            let creds = self.creds.lock().unwrap().clone();
+            match tokio::time::timeout(attempt_timeout, self.driver.connect_tunnel(&server, &creds))
+                .await
             {
                 Ok(Ok(tunnel)) => return Ok(tunnel),
                 Ok(Err(err)) => last_err = err,
@@ -441,9 +459,10 @@ impl ServerSlot {
     async fn unlock_tunnel(&self, tunnel: &Tunnel) {
         let server = self.server.lock().unwrap().clone();
         let sni = server.pick_physical().map(|p| p.domain.clone());
+        let creds = self.creds.lock().unwrap().clone();
 
         let agent_result = match &sni {
-            Some(sni) => crate::agent::unlock(tunnel, sni, &self.creds).await,
+            Some(sni) => crate::agent::unlock(tunnel, sni, &creds).await,
             None => Err(ProtonError::Config(format!(
                 "server {} has no physical servers to derive a local-agent SNI from",
                 server.name
@@ -861,6 +880,50 @@ impl TunnelManager {
         Ok(updated)
     }
 
+    /// Re-authenticate a long-running daemon whose access token has expired (or whose
+    /// WireGuard certificate is approaching its 168-minute expiry) — the periodic maintenance
+    /// loop in `main.rs` calls this when `refresh_servers` comes back `ProtonError::Auth`.
+    ///
+    /// Deliberately does **not** call `finish_login`: that clears and rebuilds every slot,
+    /// which would re-bind every listener port while the *old* listener tasks are still bound
+    /// to them (a latent `EADDRINUSE` — see the concurrency review's finding on `finish_login`
+    /// non-idempotency). Instead this swaps in a fresh `ProtonVPNClient` + `VPNCredentials` and
+    /// pushes the new creds into every already-existing slot in place, leaving slots, ports,
+    /// and listener tasks completely untouched. A currently-connected tunnel keeps running on
+    /// its old (still-valid-for-now) certificate; only the *next* connect/unlock for that slot
+    /// picks up the renewed one.
+    pub async fn renew_credentials(&self, session: &Session) -> Result<Session> {
+        let mut client = ProtonVPNClient::new(&session.email);
+        client.auth_token = Some(session.access_token.clone());
+        client.uid = Some(session.uid.clone());
+
+        let mut updated = session.clone();
+        // The token may or may not actually be expired yet — this call is also used
+        // proactively for certificate rotation, not just reactively after an Auth error — so
+        // probe with `fetch_servers` the same way `login_with_session` does, and only refresh
+        // if the token has in fact lapsed.
+        if matches!(client.fetch_servers().await, Err(ProtonError::Auth)) {
+            let auth = client.refresh(&session.uid, &session.refresh_token).await?;
+            updated.access_token = auth.access_token.ok_or(ProtonError::Auth)?;
+            updated.refresh_token = auth
+                .refresh_token
+                .unwrap_or_else(|| session.refresh_token.clone());
+            updated.uid = auth.uid.unwrap_or_else(|| session.uid.clone());
+        }
+
+        let creds = client
+            .authenticate_with_session(&updated.uid, &updated.access_token)
+            .await?;
+
+        *self.creds.lock().unwrap() = Some(creds.clone());
+        for slot in self.slots.lock().unwrap().iter() {
+            slot.update_creds(creds.clone());
+        }
+        *self.client.lock().await = Some(client);
+
+        Ok(updated)
+    }
+
     /// Shared tail of `login`/`login_with_session`: bind one port + one always-on SOCKS5
     /// listener per reachable server, replacing any slots from a previous login.
     async fn finish_login(&self, client: ProtonVPNClient, creds: VPNCredentials) -> Result<()> {
@@ -1062,6 +1125,10 @@ mod tests {
     #[derive(Default)]
     struct FakeDriver {
         connect_calls: Mutex<Vec<String>>,
+        /// Records each `connect_tunnel` call's `wg_public_key` — lets a test observe which
+        /// credentials a slot actually used to connect (e.g. to confirm `update_creds` took
+        /// effect on the next connection rather than only updating in-memory state unused).
+        creds_used: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -1069,12 +1136,16 @@ mod tests {
         async fn connect_tunnel(
             &self,
             server: &VPNServer,
-            _creds: &VPNCredentials,
+            creds: &VPNCredentials,
         ) -> Result<SharedTunnel> {
             self.connect_calls
                 .lock()
                 .unwrap()
                 .push(server.country_code.clone());
+            self.creds_used
+                .lock()
+                .unwrap()
+                .push(creds.wg_public_key.clone());
             Ok(Arc::new(Tunnel::loopback_for_testing()))
         }
 
@@ -1294,6 +1365,27 @@ mod tests {
         assert_eq!(servers[0].country_code, "US");
         assert!(!servers[0].connected);
         assert_eq!(servers[0].open_connections, 0);
+    }
+
+    #[tokio::test]
+    async fn update_creds_takes_effect_on_the_next_connect() {
+        let driver = Arc::new(FakeDriver::default());
+        let (_manager, slot) = slot_with_driver(20050, driver.clone());
+
+        slot.connect_with_retry().await.unwrap();
+        let mut new_creds = test_creds();
+        new_creds.wg_public_key = "RENEWEDPUBKEYBASE64==".into();
+        slot.update_creds(new_creds);
+        slot.connect_with_retry().await.unwrap();
+
+        // `renew_credentials` (main.rs's periodic loop) must reach every existing slot's live
+        // creds, not just `TunnelManager`'s own copy used for slots created later — assert the
+        // second connect actually used the renewed public key, not the original one.
+        let used = driver.creds_used.lock().unwrap();
+        assert_eq!(
+            used.as_slice(),
+            ["CLIENTPUBKEYBASE64==", "RENEWEDPUBKEYBASE64=="]
+        );
     }
 
     #[tokio::test]
