@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::JoinHandle;
 
 /// How long a slot's tunnel is kept up with zero open connections before it's torn down. The
 /// listener stays bound the whole time; only the WireGuard session underneath it is dropped.
@@ -115,6 +116,12 @@ pub(crate) struct ServerSlot {
     self_ref: Weak<ServerSlot>,
     /// Shared across every slot from the same login — see [`ConnectionLimiter`].
     pub(crate) limiter: Arc<ConnectionLimiter>,
+    /// The listener task's handle, so a re-login (`TunnelManager::finish_login`) can abort the
+    /// old listener before re-binding its port — without this, `finish_login` running a second
+    /// time in one process would leave the old (now orphaned) listener bound and fail to bind
+    /// the new one with `EADDRINUSE`. `None` only for the brief window between construction and
+    /// `set_listener_handle` (the caller that creates a slot always spawns its listener next).
+    listener_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl ServerSlot {
@@ -144,7 +151,22 @@ impl ServerSlot {
             connect_lock: AsyncMutex::new(()),
             self_ref: weak.clone(),
             limiter,
+            listener_handle: Mutex::new(None),
         })
+    }
+
+    /// Record the listener task's handle — call once, right after spawning it. See
+    /// `listener_handle`'s doc comment for why this exists.
+    pub(crate) fn set_listener_handle(&self, handle: JoinHandle<()>) {
+        *self.listener_handle.lock().unwrap() = Some(handle);
+    }
+
+    /// Abort this slot's listener task, freeing its port immediately — call before a re-login
+    /// re-binds the same port for a fresh slot. A no-op if no handle was ever recorded.
+    pub(crate) fn abort_listener(&self) {
+        if let Some(handle) = self.listener_handle.lock().unwrap().take() {
+            handle.abort();
+        }
     }
 
     /// Swap in freshly renewed credentials (new access token, new WireGuard certificate) —

@@ -306,6 +306,69 @@ fn connection_limiter_release_with_no_matching_acquire_does_not_underflow() {
 }
 
 #[tokio::test]
+async fn abort_listener_actually_stops_the_listener_task() {
+    let (_manager, slot) = manager_with_one_slot(20055);
+
+    let handle = tokio::spawn(async {
+        std::future::pending::<()>().await;
+    });
+    let abort_handle = handle.abort_handle();
+    slot.set_listener_handle(handle);
+    assert!(
+        !abort_handle.is_finished(),
+        "test setup: the listener task must still be running"
+    );
+
+    slot.abort_listener();
+    // Give the runtime a tick to actually process the abort.
+    tokio::task::yield_now().await;
+
+    assert!(
+        abort_handle.is_finished(),
+        "abort_listener must actually stop the listener task — a re-login re-binding this \
+         slot's port would otherwise hit EADDRINUSE against the still-running old listener"
+    );
+}
+
+#[tokio::test]
+async fn finish_logins_reset_loop_aborts_every_slots_listener() {
+    // Mirrors `finish_login`'s actual reset: `for slot in &old_slots { slot.abort_listener(); }`
+    // over every slot from the previous login, not just one — a real network login isn't
+    // reachable from a unit test, so this drives the manager's slot list directly the same way
+    // `finish_login` does.
+    let (manager, slot_a) = manager_with_one_slot(20057);
+    let slot_b = ServerSlot::new(
+        test_server("srv-2", "NL"),
+        test_creds(),
+        Arc::new(FakeDriver::default()),
+        20058,
+        slot_a.limiter.clone(),
+    );
+    manager.slots.lock().unwrap().push(slot_b.clone());
+
+    let mut abort_handles = Vec::new();
+    for slot in manager.slots.lock().unwrap().iter() {
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        abort_handles.push(handle.abort_handle());
+        slot.set_listener_handle(handle);
+    }
+
+    let old_slots = std::mem::take(&mut *manager.slots.lock().unwrap());
+    for slot in &old_slots {
+        slot.abort_listener();
+    }
+    tokio::task::yield_now().await;
+
+    assert_eq!(abort_handles.len(), 2);
+    assert!(
+        abort_handles.iter().all(|h| h.is_finished()),
+        "every slot's listener must be aborted, not just the first"
+    );
+}
+
+#[tokio::test]
 async fn update_creds_takes_effect_on_the_next_connect() {
     let driver = Arc::new(FakeDriver::default());
     let (_manager, slot) = slot_with_driver(20050, driver.clone());

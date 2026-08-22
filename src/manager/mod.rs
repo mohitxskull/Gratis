@@ -347,8 +347,19 @@ impl TunnelManager {
 
         // A fresh login replaces everything from a previous one: discard old slots/port
         // assignments so `apply_refreshed_servers` (below) treats every fetched server as
-        // brand new, handing out fresh sequential ports from `port_range_start`.
-        self.slots.lock().unwrap().clear();
+        // brand new, handing out fresh sequential ports from `port_range_start`. Abort each old
+        // slot's listener *before* clearing — otherwise, on a process that calls `finish_login`
+        // more than once (a future re-login path; today's `resume_or_login` only calls it once
+        // per process), the old listeners would stay bound and the fresh ones below would fail
+        // to bind the same ports with `EADDRINUSE`.
+        // `mem::take` (rather than holding the lock guard across the loop below) keeps the
+        // guard's lifetime to this one statement — a guard held across a `for` loop here was
+        // enough to make the whole `async fn`'s generated future non-`Send` (`MutexGuard` isn't
+        // `Send`), which broke `tokio::spawn`ing anything that calls this.
+        let old_slots = std::mem::take(&mut *self.slots.lock().unwrap());
+        for slot in &old_slots {
+            slot.abort_listener();
+        }
         *self.next_port.lock().unwrap() = self.port_range_start;
 
         let server_list = client.server_list.clone();
@@ -437,15 +448,16 @@ impl TunnelManager {
                 limiter.clone(),
             );
             limiter.register(&slot);
-            // Fire-and-forget: this listener is meant to run for the rest of the process's
-            // life, so there's nothing useful to do with the JoinHandle (dropping it detaches
-            // the task rather than aborting it).
-            let _handle = self.driver.spawn_listener(
+            // Meant to run for the rest of the process's life under normal operation, but
+            // recorded on the slot (rather than dropped) so a future re-login can abort it
+            // before re-binding this port — see `ServerSlot::abort_listener`.
+            let handle = self.driver.spawn_listener(
                 format!("127.0.0.1:{port}"),
                 slot.clone(),
                 slot.stats.clone(),
                 self.protocol,
             );
+            slot.set_listener_handle(handle);
             slots.push(slot);
         }
 
