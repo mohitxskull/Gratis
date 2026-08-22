@@ -131,9 +131,12 @@ impl ksni::Tray for GratisTray {
 }
 
 /// Ask the control API how many servers are ready. `None` if it can't be reached (service not
-/// running yet, or not running at all) — not an error worth failing the tray over.
+/// running yet, or not running at all) — not an error worth failing the tray over. Deserializes
+/// into `manager::ServerStatus` (the same type the server actually returns) rather than untyped
+/// `serde_json::Value`, so a schema change there is a compile error here instead of a silent
+/// drift.
 async fn server_count(control_port: u16) -> Option<usize> {
-    let servers: Vec<serde_json::Value> =
+    let servers: Vec<crate::manager::ServerStatus> =
         reqwest::get(format!("http://127.0.0.1:{control_port}/api/servers"))
             .await
             .ok()?
@@ -143,21 +146,17 @@ async fn server_count(control_port: u16) -> Option<usize> {
     Some(servers.len())
 }
 
-#[derive(serde::Deserialize)]
-struct UpdateStatus {
-    available: Option<String>,
-}
-
 /// Ask the control API whether a newer release is available, per its periodic check — see
 /// `api::update_status`. `None` if the API can't be reached; treated the same as "no update
 /// known" rather than an error worth failing the tray over.
 async fn update_available(control_port: u16) -> Option<String> {
-    let status: UpdateStatus = reqwest::get(format!("http://127.0.0.1:{control_port}/api/update"))
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
+    let status: crate::api::UpdateStatus =
+        reqwest::get(format!("http://127.0.0.1:{control_port}/api/update"))
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
     status.available
 }
 

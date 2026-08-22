@@ -7,9 +7,11 @@
 //! moment a client connects to that server's assigned port (see `manager.rs`), so this API only
 //! ever needs to answer "what's here and what's it doing right now."
 //!
-//! No login route: authentication happens once, automatically, at daemon startup from a
-//! `.env` file (see `main.rs`) — there is no supported way to log in via this API or the web
-//! UI, and `TunnelManager::login` is only ever called from `main.rs`'s startup sequence.
+//! No login route: authentication happens once, automatically, at daemon startup — from a
+//! stored keychain session if one exists (see `session.rs`), otherwise falling back to a
+//! `.env` file (see `main.rs::resume_or_login`) — there is no supported way to log in via this
+//! API or the web UI, and `TunnelManager::login`/`login_with_session` are only ever called from
+//! `main.rs`'s startup and periodic-refresh sequences.
 use crate::manager::{ServerStatus, TunnelManager};
 use crate::webui::{IndexTemplate, ServersTemplate};
 use askama::Template;
@@ -75,11 +77,15 @@ async fn list_servers(
     Json(manager.servers())
 }
 
-#[derive(Serialize)]
-struct UpdateStatus {
+/// `pub` (not private) so `main.rs` and `tray.rs` — separate processes that deserialize this
+/// same JSON shape over HTTP rather than calling into `api.rs` directly — can share one
+/// definition instead of each hand-rolling their own, which could silently drift from this one
+/// on a schema change (see maintainability review F8/F10).
+#[derive(Serialize, Deserialize)]
+pub struct UpdateStatus {
     /// The newest available version, if the daemon's periodic check has found one; `None`
     /// means either not yet checked or already current. See `update::check_for_update`.
-    available: Option<String>,
+    pub available: Option<String>,
 }
 
 /// Exists so `gratis tray` can show "update available" without making its own GitHub API
@@ -92,15 +98,17 @@ async fn update_status(
     })
 }
 
+/// `pub` for the same reason as [`UpdateStatus`] — `main.rs`'s `gratis status` deserializes
+/// this exact shape over HTTP from a separate process.
 #[derive(Serialize, Deserialize)]
-struct HealthStatus {
+pub struct HealthStatus {
     /// Whether Proton auth is currently working, as of the last login attempt or periodic
     /// refresh — not merely "a session file exists on disk" (see `TunnelManager::auth_error`'s
     /// doc comment for the bug this replaces).
-    auth_ok: bool,
+    pub auth_ok: bool,
     /// The live reason auth is broken, if `auth_ok` is false.
-    auth_error: Option<String>,
-    servers_ready: usize,
+    pub auth_error: Option<String>,
+    pub servers_ready: usize,
 }
 
 /// Exists so `gratis status` can report what's actually true *right now* instead of just

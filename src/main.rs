@@ -481,18 +481,7 @@ fn control_port_from_unit() -> u16 {
         .unwrap_or(9000)
 }
 
-/// Mirrors `api::HealthStatus`'s JSON shape (that type is private to `api.rs`) — this is a
-/// separate process (`gratis status`) calling into the already-running daemon over HTTP, not a
-/// function call, so there's no way to share the type directly without making it `pub`, and
-/// duplicating this small shape is simpler than widening that module's public surface for it.
-#[derive(serde::Deserialize)]
-struct HealthStatus {
-    auth_ok: bool,
-    auth_error: Option<String>,
-    servers_ready: usize,
-}
-
-async fn health() -> anyhow::Result<HealthStatus> {
+async fn health() -> anyhow::Result<gratis::api::HealthStatus> {
     let port = control_port_from_unit();
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(3),
