@@ -7,9 +7,12 @@
 //! `proton-srp` crate's own test-suite (MIT/Apache). It is verified by `RPGPVerifier`, the
 //! same verifier the real flow uses, so `prove` exercises the genuine PGP path.
 use base64::Engine as _;
-use gratis::models::AuthResponse;
+use gratis::models::{AuthInfo, AuthResponse};
 use gratis::srp::prove;
 use proton_srp::{SRPProofB64, SrpHashVersion};
+
+const AUTH_INFO_FIXTURE: &str = include_str!("fixtures/auth_info.json");
+const AUTH_RESPONSE_FIXTURE: &str = include_str!("fixtures/auth_response.json");
 
 /// PGP-signed SRP modulus fixture (proton-srp test-suite). Verified by `RPGPVerifier`.
 const TEST_SIGNED_MODULUS: &str = "-----BEGIN PGP SIGNED MESSAGE-----
@@ -156,6 +159,45 @@ fn auth_response_parses_with_response_code_1000() {
     let auth: AuthResponse = serde_json::from_str(json).expect("AuthResponse must parse");
     assert_eq!(auth.response_code, Some(1000));
     assert!(auth.access_token.is_some());
+    assert_eq!(auth.server_proof.as_deref(), Some("c2VyaWZpZWRwcm9vZg=="));
+}
+
+/// `AuthInfo` (the `/auth/info` step-1 DTO) is parsed at `client.rs:126` but was never
+/// deserialized in any test — including the critical `Version` field, which `client.rs` casts
+/// to a `SrpHashVersion` right after this parse. `auth_info.json` existed as a checked-in
+/// fixture but had zero references anywhere before this test.
+#[test]
+fn auth_info_fixture_deserializes() {
+    let info: AuthInfo =
+        serde_json::from_str(AUTH_INFO_FIXTURE).expect("auth_info.json must parse");
+    assert_eq!(info.version, 4);
+    assert_eq!(info.salt, "tkCXC7BqxwRPMKxGf+oRyw==");
+    assert!(info.server_ephemeral.starts_with("AgB5C46khpJfBn67"));
+    assert_eq!(info.srp_session, "synthetic-srp-session-id-0001");
+    assert!(info.modulus.contains("BEGIN PGP SIGNED MESSAGE"));
+
+    // The `Version` -> `SrpHashVersion` cast `client.rs` does immediately after this parse
+    // (`client.rs:151`) must succeed for a real Proton response's version value.
+    assert!(SrpHashVersion::try_from(info.version as u8).is_ok());
+}
+
+/// `auth_response.json` carries `RefreshToken`/`UID`/`ServerProof` together, which the inline
+/// JSON in `auth_response_parses_with_response_code_1000` above also happens to cover — but the
+/// fixture itself had zero references anywhere before this test (dead checked-in file).
+#[test]
+fn auth_response_fixture_deserializes_refresh_token_uid_and_server_proof() {
+    let auth: AuthResponse =
+        serde_json::from_str(AUTH_RESPONSE_FIXTURE).expect("auth_response.json must parse");
+    assert_eq!(auth.response_code, Some(1000));
+    assert_eq!(
+        auth.access_token.as_deref(),
+        Some("synthetic-access-token-0001")
+    );
+    assert_eq!(
+        auth.refresh_token.as_deref(),
+        Some("synthetic-refresh-token-0001")
+    );
+    assert_eq!(auth.uid.as_deref(), Some("synthetic-uid-0001"));
     assert_eq!(auth.server_proof.as_deref(), Some("c2VyaWZpZWRwcm9vZg=="));
 }
 
