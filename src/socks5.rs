@@ -54,6 +54,18 @@ const REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 /// them map to the same generic SOCKS5 failure reply.
 pub type SourceError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Whether an `acquire` failure is [`crate::errors::ProtonError::AtCapacity`] — gratis's own
+/// `MaxConnect` cap being full, not the exit itself being broken. Shared by both proxy front
+/// ends (`http_connect.rs` calls this too) so the *classification* can't drift between them even
+/// though each maps it to a different wire-level signal — see `reply_code_for` and
+/// `http_connect::status_for`.
+pub(crate) fn is_at_capacity(err: &SourceError) -> bool {
+    matches!(
+        err.downcast_ref::<crate::errors::ProtonError>(),
+        Some(crate::errors::ProtonError::AtCapacity(_))
+    )
+}
+
 /// Which SOCKS5 reply code to send for an `acquire` failure. Almost everything gets the
 /// generic `GENERAL FAILURE` (0x01) — a client has no way to act differently on a more precise
 /// code for most of these anyway. The one deliberate exception is
@@ -62,9 +74,10 @@ pub type SourceError = Box<dyn std::error::Error + Send + Sync>;
 /// MaxConnect cap right now" apart from "this exit is broken" and was mistakenly banning
 /// perfectly healthy exits for hours over it) can treat the two differently.
 fn reply_code_for(err: &SourceError) -> u8 {
-    match err.downcast_ref::<crate::errors::ProtonError>() {
-        Some(crate::errors::ProtonError::AtCapacity(_)) => REP_CONNECTION_REFUSED,
-        _ => REP_GENERAL_FAILURE,
+    if is_at_capacity(err) {
+        REP_CONNECTION_REFUSED
+    } else {
+        REP_GENERAL_FAILURE
     }
 }
 
@@ -277,17 +290,23 @@ async fn read_port(client: &mut TcpStream) -> io::Result<u16> {
 async fn resolve_target(target: &Target) -> io::Result<SocketAddr> {
     match target {
         Target::Addr(addr) => Ok(*addr),
-        Target::Domain(domain, port) => {
-            // Normal (unbound) resolution on the host — the tunnel's own DNS path returns a
-            // diagnostic "MTU Probe" message rather than real answers (verified live), so
-            // domain names are resolved outside the tunnel; only the TCP connection itself
-            // goes through it.
-            let mut addrs = tokio::net::lookup_host((domain.as_str(), *port)).await?;
-            addrs
-                .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no addresses resolved"))
-        }
+        // Normal (unbound) resolution on the host — the tunnel's own DNS path returns a
+        // diagnostic "MTU Probe" message rather than real answers (verified live), so
+        // domain names are resolved outside the tunnel; only the TCP connection itself
+        // goes through it.
+        Target::Domain(domain, port) => resolve_host_port(domain, *port).await,
     }
+}
+
+/// Resolve `host:port` to one `SocketAddr` via normal (unbound) host resolution — shared by
+/// this module's own domain-name `CONNECT`/`Target::Domain` path and `http_connect.rs`'s CONNECT
+/// request-target resolution, so a fix to one (e.g. the IPv6-literal handling) can't silently
+/// stay missing from the other.
+pub(crate) async fn resolve_host_port(host: &str, port: u16) -> io::Result<SocketAddr> {
+    let mut addrs = tokio::net::lookup_host((host, port)).await?;
+    addrs
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no addresses resolved"))
 }
 
 async fn send_reply(client: &mut TcpStream, rep: u8, bound: SocketAddr) -> io::Result<()> {

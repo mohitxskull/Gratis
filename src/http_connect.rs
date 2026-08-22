@@ -168,9 +168,9 @@ async fn read_connect_request(client: &mut TcpStream) -> io::Result<RequestLine>
     Ok(RequestLine::Connect(target.to_string()))
 }
 
-/// `target` is `host:port`, per RFC 7231's CONNECT request-target — resolved the same way (and
-/// for the same reason) as `socks5.rs`'s own domain resolution: on the host, not through the
-/// tunnel.
+/// `target` is `host:port`, per RFC 7231's CONNECT request-target — resolved via
+/// `socks5::resolve_host_port`, the same shared helper `socks5.rs`'s own domain-name path uses,
+/// on the host rather than through the tunnel.
 async fn resolve_target(target: &str) -> io::Result<SocketAddr> {
     let (host, port) = target.rsplit_once(':').ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "CONNECT target missing a port")
@@ -184,21 +184,20 @@ async fn resolve_target(target: &str) -> io::Result<SocketAddr> {
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
-    let mut addrs = tokio::net::lookup_host((host, port)).await?;
-    addrs
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no addresses resolved"))
+    crate::socks5::resolve_host_port(host, port).await
 }
 
-/// Which HTTP status to reply with for a [`TunnelSource::acquire`] failure. Mirrors
-/// `socks5.rs`'s `reply_code_for`'s one deliberate special case: `AtCapacity` (gratis's own
-/// `MaxConnect` cap, not the exit itself being broken) gets `503 Service Unavailable` — a
-/// client-recognizable "try again shortly" — instead of the generic `502 Bad Gateway` everything
-/// else gets.
+/// Which HTTP status to reply with for a [`TunnelSource::acquire`] failure. Uses
+/// `socks5::is_at_capacity` for the same classification `socks5.rs`'s `reply_code_for` uses, so
+/// the two front ends can never drift on *which* errors count as "at capacity" even though they
+/// map it to different wire-level signals: `AtCapacity` (gratis's own `MaxConnect` cap, not the
+/// exit itself being broken) gets `503 Service Unavailable` — a client-recognizable "try again
+/// shortly" — instead of the generic `502 Bad Gateway` everything else gets.
 fn status_for(err: &SourceError) -> (u16, &'static str) {
-    match err.downcast_ref::<crate::errors::ProtonError>() {
-        Some(crate::errors::ProtonError::AtCapacity(_)) => (503, "Service Unavailable"),
-        _ => (502, "Bad Gateway"),
+    if crate::socks5::is_at_capacity(err) {
+        (503, "Service Unavailable")
+    } else {
+        (502, "Bad Gateway")
     }
 }
 
