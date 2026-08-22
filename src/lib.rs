@@ -2,6 +2,7 @@ pub mod agent;
 pub mod api;
 pub mod client;
 pub mod errors;
+pub mod http_connect;
 pub mod keys;
 pub mod manager;
 pub mod models;

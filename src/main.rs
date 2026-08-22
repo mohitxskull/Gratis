@@ -58,6 +58,12 @@ enum Command {
         /// ever hits the cap).
         #[arg(long)]
         evict_lru: bool,
+        /// Speak HTTP CONNECT on every port instead of the default SOCKS5. For clients/
+        /// frameworks that only support proxying through an HTTP CONNECT proxy (e.g. Pingora's
+        /// `Peer::proxy`) rather than SOCKS5. One choice for the whole daemon — every port
+        /// switches together.
+        #[arg(long)]
+        http_proxy: bool,
     },
     /// Stop the background service.
     Down,
@@ -101,6 +107,8 @@ enum Command {
         unlimited_connections: bool,
         #[arg(long)]
         evict_lru: bool,
+        #[arg(long)]
+        http_proxy: bool,
     },
 }
 
@@ -140,11 +148,13 @@ async fn main() {
             port_range_start,
             unlimited_connections,
             evict_lru,
+            http_proxy,
         } => cmd_up(
             control_port,
             port_range_start,
             unlimited_connections,
             evict_lru,
+            http_proxy,
         ),
         Command::Down => cmd_down(),
         Command::Status => cmd_status().await,
@@ -158,12 +168,14 @@ async fn main() {
             port_range_start,
             unlimited_connections,
             evict_lru,
+            http_proxy,
         } => {
             cmd_run(
                 control_port,
                 port_range_start,
                 unlimited_connections,
                 evict_lru,
+                http_proxy,
             )
             .await
         }
@@ -322,6 +334,7 @@ fn cmd_up(
     port_range_start: u16,
     unlimited_connections: bool,
     evict_lru: bool,
+    http_proxy: bool,
 ) -> anyhow::Result<()> {
     if session::load()?.is_none() {
         anyhow::bail!("not logged in — run `gratis login` first");
@@ -331,6 +344,7 @@ fn cmd_up(
         port_range_start,
         unlimited_connections,
         evict_lru,
+        http_proxy,
     )?;
     service::start()?;
 
@@ -360,18 +374,39 @@ fn cmd_down() -> anyhow::Result<()> {
 
 async fn cmd_status() -> anyhow::Result<()> {
     let session = session::load()?;
-    match &session {
-        Some(s) => println!("logged in: yes ({})", mask_email(&s.email)),
-        None => println!("logged in: no"),
+    let installed = service::is_installed()?;
+    let active = installed && service::is_active().unwrap_or(false);
+
+    // Prefer the running daemon's own *live* knowledge of whether Proton auth actually works
+    // right now (`/api/health`) over just checking whether a session file happens to exist on
+    // disk. Those are different questions — confirmed live: a stored session can expire (or the
+    // machine's clock jumps after a long sleep) while the file on disk is untouched, so the old
+    // disk-only check kept printing "logged in: yes" for a daemon that had already logged
+    // "stored session is no longer valid" and was running with zero servers. Only fall back to
+    // the disk-only check when there's no running daemon to ask at all.
+    let live_health = if active { health().await.ok() } else { None };
+
+    match (&live_health, &session) {
+        (Some(h), _) if h.auth_ok => match &session {
+            Some(s) => println!("logged in: yes ({})", mask_email(&s.email)),
+            None => println!("logged in: yes (session file missing, but daemon is authenticated)"),
+        },
+        (Some(h), _) => {
+            let reason = h.auth_error.as_deref().unwrap_or("unknown reason");
+            println!("logged in: NO — {reason}");
+        }
+        (None, Some(s)) => println!(
+            "logged in: yes ({}) [unverified — service not running, this is just what's on disk]",
+            mask_email(&s.email)
+        ),
+        (None, None) => println!("logged in: no"),
     }
 
-    let installed = service::is_installed()?;
     if !installed {
         println!("service: not installed (run `gratis up`)");
         return Ok(());
     }
 
-    let active = service::is_active().unwrap_or(false);
     let enabled = service::is_enabled().unwrap_or(false);
     println!("service: {}", if active { "running" } else { "stopped" });
     println!(
@@ -394,11 +429,23 @@ async fn cmd_status() -> anyhow::Result<()> {
             "off"
         }
     );
+    println!(
+        "proxy protocol: {}",
+        if unit_has_flag("--http-proxy") {
+            "http-connect"
+        } else {
+            "socks5"
+        }
+    );
 
     if active {
-        match server_count().await {
-            Ok((count, url)) => println!("servers: {count} ready, control API at {url}"),
-            Err(err) => println!("servers: could not reach control API ({err})"),
+        match &live_health {
+            Some(h) => println!(
+                "servers: {} ready, control API at http://127.0.0.1:{}",
+                h.servers_ready,
+                control_port_from_unit()
+            ),
+            None => println!("servers: could not reach control API"),
         }
     }
 
@@ -440,14 +487,23 @@ fn control_port_from_unit() -> u16 {
         .unwrap_or(9000)
 }
 
-async fn server_count() -> anyhow::Result<(usize, String)> {
+/// Mirrors `api::HealthStatus`'s JSON shape (that type is private to `api.rs`) — this is a
+/// separate process (`gratis status`) calling into the already-running daemon over HTTP, not a
+/// function call, so there's no way to share the type directly without making it `pub`, and
+/// duplicating this small shape is simpler than widening that module's public surface for it.
+#[derive(serde::Deserialize)]
+struct HealthStatus {
+    auth_ok: bool,
+    auth_error: Option<String>,
+    servers_ready: usize,
+}
+
+async fn health() -> anyhow::Result<HealthStatus> {
     let port = control_port_from_unit();
-    let url = format!("http://127.0.0.1:{port}");
-    let servers: Vec<serde_json::Value> = reqwest::get(format!("{url}/api/servers"))
+    Ok(reqwest::get(format!("http://127.0.0.1:{port}/api/health"))
         .await?
         .json()
-        .await?;
-    Ok((servers.len(), url))
+        .await?)
 }
 
 fn mask_email(email: &str) -> String {
@@ -587,9 +643,13 @@ async fn resume_or_login(manager: Arc<TunnelManager>, control_port: u16) {
                 }
                 let count = manager.servers().len();
                 log::info!("resumed session ({}), {count} servers ready", session.email);
+                manager.set_auth_error(None);
             }
             Err(err) => {
                 log::warn!("stored session is no longer valid ({err}) — run `gratis login` again");
+                manager.set_auth_error(Some(format!(
+                    "stored session is no longer valid: {err} — run `gratis login` again"
+                )));
                 gratis::notify::notify_clickable(
                     "gratis: session expired",
                     "Run `gratis login` again to reconnect. Click to open the dashboard.",
@@ -609,16 +669,24 @@ async fn resume_or_login(manager: Arc<TunnelManager>, control_port: u16) {
                     Ok(()) => {
                         let count = manager.servers().len();
                         log::info!("logged in from .env ({email}), {count} servers ready");
+                        manager.set_auth_error(None);
                     }
-                    Err(err) => log::warn!("login from .env failed: {err}"),
+                    Err(err) => {
+                        log::warn!("login from .env failed: {err}");
+                        manager.set_auth_error(Some(format!("login from .env failed: {err}")));
+                    }
                 },
-                _ => log::warn!(
-                    "no stored session and no .env (EMAIL + PASSWORD) — run `gratis login`"
-                ),
+                _ => {
+                    let msg = "no stored session and no .env (EMAIL + PASSWORD) — run \
+                                `gratis login`";
+                    log::warn!("{msg}");
+                    manager.set_auth_error(Some(msg.to_string()));
+                }
             }
         }
         Err(err) => {
-            log::warn!("failed to read stored session ({err}), starting with no servers")
+            log::warn!("failed to read stored session ({err}), starting with no servers");
+            manager.set_auth_error(Some(format!("failed to read stored session: {err}")));
         }
     }
 }
@@ -628,11 +696,18 @@ async fn cmd_run(
     port_range_start: u16,
     unlimited_connections: bool,
     evict_lru: bool,
+    http_proxy: bool,
 ) -> anyhow::Result<()> {
+    let protocol = if http_proxy {
+        gratis::manager::ProxyProtocol::Http
+    } else {
+        gratis::manager::ProxyProtocol::Socks5
+    };
     let manager = Arc::new(TunnelManager::new(
         port_range_start,
         unlimited_connections,
         evict_lru,
+        protocol,
     ));
 
     // Bind and start serving *before* logging in — see `resume_or_login`'s doc comment for
@@ -654,6 +729,7 @@ async fn cmd_run(
     };
 
     log::info!("control API + web UI listening on http://{addr}");
+    log::info!("per-server listeners speak {protocol:?} (pass --http-proxy for HTTP CONNECT)");
 
     // One task: the initial login/session-resume, then (whether or not it succeeded — a
     // stored session can still be fixed later by a fresh `gratis login` elsewhere) periodic
@@ -670,11 +746,31 @@ async fn cmd_run(
             interval.tick().await; // first tick fires immediately; the line above just refreshed.
             loop {
                 interval.tick().await;
-                if let Err(err) = manager.refresh_servers().await {
-                    log::warn!(
-                        "periodic server-list refresh failed ({err}); keeping the existing \
-                         list until the next attempt"
-                    );
+                let was_broken = manager.auth_error().is_some();
+                match manager.refresh_servers().await {
+                    Ok(()) => {
+                        if was_broken {
+                            // Loud on the way back up, not just the way down — a silent
+                            // recovery is just as confusing to debug live as a silent failure:
+                            // `gratis status` would keep showing the old error indefinitely
+                            // with nothing in the log explaining when or why it cleared.
+                            log::info!(
+                                "periodic server-list refresh succeeded, {} server(s) ready — \
+                                 auth problem has cleared",
+                                manager.servers().len()
+                            );
+                        }
+                        manager.set_auth_error(None);
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "periodic server-list refresh failed ({err}); keeping the existing \
+                             list until the next attempt"
+                        );
+                        manager.set_auth_error(Some(format!(
+                            "periodic server-list refresh failed: {err}"
+                        )));
+                    }
                 }
             }
         }

@@ -222,9 +222,21 @@ impl ConnectionLimiter {
 
 /// Seam for testing `TunnelManager` without root/live WireGuard/network access.
 ///
-/// Production code uses `RealDriver` (which just calls through to `wireguard`/`socks5`), and
-/// tests use a `FakeDriver` that records calls and spawns an inert task instead of a real
-/// tunnel/SOCKS5 listener.
+/// Which local proxy protocol a daemon's listeners speak — one choice for the whole daemon
+/// (`gratis up --http-proxy`), applied uniformly to every port. SOCKS5 is the default because
+/// it's what most proxy-aware clients and CLI tools (`curl --socks5-hostname`, etc.) already
+/// support out of the box; HTTP CONNECT exists for the clients/frameworks that only speak that
+/// (e.g. Pingora's `Peer::proxy`, which supports CONNECT proxies but not SOCKS5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProxyProtocol {
+    #[default]
+    Socks5,
+    Http,
+}
+
+/// Production code uses `RealDriver` (which just calls through to `wireguard`/`socks5`/
+/// `http_connect`), and tests use a `FakeDriver` that records calls and spawns an inert task
+/// instead of a real tunnel/listener.
 #[async_trait]
 pub trait TunnelDriver: Send + Sync {
     /// Bring up a userspace WireGuard tunnel to `server`, using `creds`.
@@ -234,20 +246,21 @@ pub trait TunnelDriver: Send + Sync {
         creds: &VPNCredentials,
     ) -> Result<SharedTunnel>;
 
-    /// Spawn whatever serves this slot's SOCKS5 proxy, returning its `JoinHandle`. `source` is
-    /// how the listener gets a tunnel per accepted connection — see
-    /// [`crate::socks5::TunnelSource`] — rather than a fixed tunnel, so it can run for the
-    /// entire process lifetime whether or not a tunnel currently happens to be up.
-    fn spawn_socks5(
+    /// Spawn whatever serves this slot's proxy listener (SOCKS5 or HTTP CONNECT, per
+    /// `protocol`), returning its `JoinHandle`. `source` is how the listener gets a tunnel per
+    /// accepted connection — see [`crate::socks5::TunnelSource`] — rather than a fixed tunnel,
+    /// so it can run for the entire process lifetime whether or not a tunnel currently happens
+    /// to be up.
+    fn spawn_listener(
         &self,
         listen_addr: String,
         source: Arc<dyn TunnelSource>,
         stats: Arc<TunnelStats>,
+        protocol: ProxyProtocol,
     ) -> JoinHandle<()>;
 }
 
-/// Production driver: brings up a real userspace WireGuard tunnel and binds a real SOCKS5
-/// listener.
+/// Production driver: brings up a real userspace WireGuard tunnel and binds a real listener.
 pub struct RealDriver;
 
 #[async_trait]
@@ -261,15 +274,22 @@ impl TunnelDriver for RealDriver {
         Ok(Arc::new(tunnel))
     }
 
-    fn spawn_socks5(
+    fn spawn_listener(
         &self,
         listen_addr: String,
         source: Arc<dyn TunnelSource>,
         stats: Arc<TunnelStats>,
+        protocol: ProxyProtocol,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
-            if let Err(err) = socks5::run_socks5(&listen_addr, source, stats).await {
-                log::warn!("socks5 listener on {listen_addr} exited: {err}");
+            let result = match protocol {
+                ProxyProtocol::Socks5 => socks5::run_socks5(&listen_addr, source, stats).await,
+                ProxyProtocol::Http => {
+                    crate::http_connect::run_http_connect(&listen_addr, source, stats).await
+                }
+            };
+            if let Err(err) = result {
+                log::warn!("{protocol:?} listener on {listen_addr} exited: {err}");
             }
         })
     }
@@ -697,6 +717,9 @@ pub struct TunnelManager {
     /// instead of rejecting a new connection once `MaxConnect` is reached. See
     /// `ConnectionLimiter::evict_least_recently_used`.
     evict_lru: bool,
+    /// Which protocol every port's listener speaks — see [`ProxyProtocol`]. One choice for the
+    /// whole daemon, set once at construction from `gratis up --http-proxy`.
+    protocol: ProxyProtocol,
     account: Mutex<Option<AccountSummary>>,
     /// Set by `finish_login`, read by `refresh_servers` — the account's real tier, so a
     /// periodic refresh doesn't need to re-fetch account info (which rarely changes) on
@@ -719,16 +742,35 @@ pub struct TunnelManager {
     /// it without making its own GitHub API call. `None` means either not yet checked or
     /// already on the latest release.
     update_available: Mutex<Option<String>>,
+    /// Set by `main.rs`'s `resume_or_login` and periodic refresh loop, read by the control API
+    /// (and from there, `gratis status`) — the live reason gratis currently can't reach Proton,
+    /// if any. `None` means the last attempt succeeded.
+    ///
+    /// Exists specifically because `gratis status`'s "logged in" line used to read only the
+    /// *static session file on disk* (`session::load()`), which just means "we have some stored
+    /// credentials" — not "those credentials still work right now". Confirmed live: a session
+    /// can expire (Proton invalidates it, or the machine's clock jumps after a long sleep) while
+    /// the file on disk is untouched, so the daemon logs `"stored session is no longer valid"`
+    /// and keeps running with zero servers while `status` still confidently prints
+    /// `"logged in: yes"`. This field is the daemon's own live knowledge of that failure, so
+    /// `status` can report what's actually true right now instead of what's merely on disk.
+    auth_error: Mutex<Option<String>>,
 }
 
 impl TunnelManager {
     /// Build a manager using the real tunnel/SOCKS5 driver.
-    pub fn new(port_range_start: u16, unlimited_connections: bool, evict_lru: bool) -> Self {
+    pub fn new(
+        port_range_start: u16,
+        unlimited_connections: bool,
+        evict_lru: bool,
+        protocol: ProxyProtocol,
+    ) -> Self {
         Self::with_driver(
             port_range_start,
             Arc::new(RealDriver),
             unlimited_connections,
             evict_lru,
+            protocol,
         )
     }
 
@@ -739,6 +781,7 @@ impl TunnelManager {
         driver: Arc<dyn TunnelDriver>,
         unlimited_connections: bool,
         evict_lru: bool,
+        protocol: ProxyProtocol,
     ) -> Self {
         Self {
             client: AsyncMutex::new(None),
@@ -748,11 +791,13 @@ impl TunnelManager {
             slots: Mutex::new(Vec::new()),
             unlimited: unlimited_connections,
             evict_lru,
+            protocol,
             max_tier: Mutex::new(FALLBACK_TIER),
             creds: Mutex::new(None),
             limiter: Mutex::new(None),
             next_port: Mutex::new(port_range_start),
             update_available: Mutex::new(None),
+            auth_error: Mutex::new(None),
         }
     }
 
@@ -765,6 +810,17 @@ impl TunnelManager {
     /// The newest available version, if the periodic update check has found one.
     pub fn update_available(&self) -> Option<String> {
         self.update_available.lock().unwrap().clone()
+    }
+
+    /// Record the live reason gratis currently can't reach Proton (`Some`), or clear it after a
+    /// subsequent success (`None`) — see the field's doc comment for why this exists.
+    pub fn set_auth_error(&self, error: Option<String>) {
+        *self.auth_error.lock().unwrap() = error;
+    }
+
+    /// The live auth problem, if any, as of the last login attempt or periodic refresh.
+    pub fn auth_error(&self) -> Option<String> {
+        self.auth_error.lock().unwrap().clone()
     }
 
     /// Authenticate via SRP, fetch the server list, and bind one port + one always-on SOCKS5
@@ -934,10 +990,11 @@ impl TunnelManager {
             // Fire-and-forget: this listener is meant to run for the rest of the process's
             // life, so there's nothing useful to do with the JoinHandle (dropping it detaches
             // the task rather than aborting it).
-            let _handle = self.driver.spawn_socks5(
+            let _handle = self.driver.spawn_listener(
                 format!("127.0.0.1:{port}"),
                 slot.clone(),
                 slot.stats.clone(),
+                self.protocol,
             );
             slots.push(slot);
         }
@@ -981,6 +1038,24 @@ impl TunnelManager {
 mod tests {
     use super::*;
 
+    #[test]
+    fn auth_error_starts_clear_and_reflects_the_last_set_call() {
+        let manager = TunnelManager::new(20000, false, false, ProxyProtocol::default());
+        assert_eq!(manager.auth_error(), None);
+
+        manager.set_auth_error(Some("stored session is no longer valid".to_string()));
+        assert_eq!(
+            manager.auth_error(),
+            Some("stored session is no longer valid".to_string())
+        );
+
+        // A later success must clear it — `gratis status`'s "logged in: yes" bug was exactly
+        // this: nothing ever cleared a stale problem, so it read from a static file instead of
+        // live daemon state.
+        manager.set_auth_error(None);
+        assert_eq!(manager.auth_error(), None);
+    }
+
     /// Records `connect_tunnel` calls (no real WireGuard/network) and spawns an inert task
     /// instead of a real SOCKS5 listener, so `TunnelManager` bookkeeping can be tested without
     /// root or network access.
@@ -1003,11 +1078,12 @@ mod tests {
             Ok(Arc::new(Tunnel::loopback_for_testing()))
         }
 
-        fn spawn_socks5(
+        fn spawn_listener(
             &self,
             _listen_addr: String,
             _source: Arc<dyn TunnelSource>,
             _stats: Arc<TunnelStats>,
+        _protocol: ProxyProtocol,
         ) -> JoinHandle<()> {
             tokio::spawn(async {
                 // Stand in for `run_socks5`'s infinite accept loop: never returns on its own.
@@ -1041,11 +1117,12 @@ mod tests {
             Ok(Arc::new(Tunnel::loopback_for_testing()))
         }
 
-        fn spawn_socks5(
+        fn spawn_listener(
             &self,
             _listen_addr: String,
             _source: Arc<dyn TunnelSource>,
             _stats: Arc<TunnelStats>,
+        _protocol: ProxyProtocol,
         ) -> JoinHandle<()> {
             tokio::spawn(async {
                 std::future::pending::<()>().await;
@@ -1067,11 +1144,12 @@ mod tests {
             Err(ProtonError::Config("simulated dead server".into()))
         }
 
-        fn spawn_socks5(
+        fn spawn_listener(
             &self,
             _listen_addr: String,
             _source: Arc<dyn TunnelSource>,
             _stats: Arc<TunnelStats>,
+        _protocol: ProxyProtocol,
         ) -> JoinHandle<()> {
             tokio::spawn(async {
                 std::future::pending::<()>().await;
@@ -1100,11 +1178,12 @@ mod tests {
             Ok(Arc::new(Tunnel::loopback_for_testing()))
         }
 
-        fn spawn_socks5(
+        fn spawn_listener(
             &self,
             _listen_addr: String,
             _source: Arc<dyn TunnelSource>,
             _stats: Arc<TunnelStats>,
+        _protocol: ProxyProtocol,
         ) -> JoinHandle<()> {
             tokio::spawn(async {
                 std::future::pending::<()>().await;
@@ -1128,11 +1207,12 @@ mod tests {
             unreachable!("pending() never resolves");
         }
 
-        fn spawn_socks5(
+        fn spawn_listener(
             &self,
             _listen_addr: String,
             _source: Arc<dyn TunnelSource>,
             _stats: Arc<TunnelStats>,
+        _protocol: ProxyProtocol,
         ) -> JoinHandle<()> {
             tokio::spawn(async {
                 std::future::pending::<()>().await;
@@ -1190,6 +1270,7 @@ mod tests {
             driver.clone(),
             false,
             false,
+            ProxyProtocol::default(),
         ));
         let limiter = Arc::new(ConnectionLimiter::new(None, false));
         let slot = ServerSlot::new(
@@ -1539,6 +1620,7 @@ mod tests {
             Arc::new(FakeDriver::default()),
             false,
             evict_lru,
+            ProxyProtocol::default(),
         ));
         *manager.max_tier.lock().unwrap() = max_tier;
         *manager.creds.lock().unwrap() = Some(test_creds());

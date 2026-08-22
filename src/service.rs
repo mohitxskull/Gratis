@@ -44,6 +44,7 @@ fn unit_contents(
     port_range_start: u16,
     unlimited_connections: bool,
     evict_lru: bool,
+    http_proxy: bool,
 ) -> Result<String> {
     let bin = binary_path()?;
     let bin = bin
@@ -55,6 +56,9 @@ fn unit_contents(
     }
     if evict_lru {
         flags.push_str(" --evict-lru");
+    }
+    if http_proxy {
+        flags.push_str(" --http-proxy");
     }
     Ok(format!(
         "[Unit]\n\
@@ -81,6 +85,7 @@ pub fn install(
     port_range_start: u16,
     unlimited_connections: bool,
     evict_lru: bool,
+    http_proxy: bool,
 ) -> Result<()> {
     let dir = unit_dir()?;
     std::fs::create_dir_all(&dir)?;
@@ -91,6 +96,7 @@ pub fn install(
             port_range_start,
             unlimited_connections,
             evict_lru,
+            http_proxy,
         )?,
     )?;
     daemon_reload()
@@ -243,7 +249,7 @@ mod tests {
     #[test]
     fn unit_contents_bakes_the_given_flags_into_exec_start() {
         let unit =
-            unit_contents(9500, 21000, false, false).expect("binary_path must resolve in tests");
+            unit_contents(9500, 21000, false, false, false).expect("binary_path must resolve in tests");
         let exec_start = unit
             .lines()
             .find(|l| l.starts_with("ExecStart="))
@@ -255,7 +261,7 @@ mod tests {
 
     #[test]
     fn unit_contents_includes_the_unlimited_flag_when_requested() {
-        let unit = unit_contents(9500, 21000, true, false).unwrap();
+        let unit = unit_contents(9500, 21000, true, false, false).unwrap();
         let exec_start = unit.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
         assert!(
             exec_start.ends_with(
@@ -266,7 +272,7 @@ mod tests {
 
     #[test]
     fn unit_contents_includes_the_evict_lru_flag_when_requested() {
-        let unit = unit_contents(9500, 21000, false, true).unwrap();
+        let unit = unit_contents(9500, 21000, false, true, false).unwrap();
         let exec_start = unit.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
         assert!(
             exec_start.ends_with("run --control-port 9500 --port-range-start 21000 --evict-lru")
@@ -275,7 +281,7 @@ mod tests {
 
     #[test]
     fn unit_contents_includes_both_flags_when_both_requested() {
-        let unit = unit_contents(9500, 21000, true, true).unwrap();
+        let unit = unit_contents(9500, 21000, true, true, false).unwrap();
         let exec_start = unit.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
         assert!(exec_start.ends_with(
             "run --control-port 9500 --port-range-start 21000 --unlimited-connections --evict-lru"
@@ -283,10 +289,19 @@ mod tests {
     }
 
     #[test]
+    fn unit_contents_includes_the_http_proxy_flag_when_requested() {
+        let unit = unit_contents(9500, 21000, false, false, true).unwrap();
+        let exec_start = unit.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
+        assert!(
+            exec_start.ends_with("run --control-port 9500 --port-range-start 21000 --http-proxy")
+        );
+    }
+
+    #[test]
     fn unit_contents_is_a_valid_systemd_unit_shape() {
         // Not a full systemd parser — just the section headers a real unit file needs, so a
         // typo in the format string (e.g. a missing newline collapsing two sections) is caught.
-        let unit = unit_contents(9000, 20000, false, false).unwrap();
+        let unit = unit_contents(9000, 20000, false, false, false).unwrap();
         assert!(unit.contains("[Unit]\n"));
         assert!(unit.contains("[Service]\n"));
         assert!(unit.contains("[Install]\n"));

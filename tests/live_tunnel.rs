@@ -75,7 +75,12 @@ async fn live_tunnel_relays_real_http_request() {
     };
     let password = read_dotenv_var("PASSWORD").expect(".env has EMAIL but no PASSWORD");
 
-    let manager = gratis::manager::TunnelManager::new(19900, false, false);
+    let manager = gratis::manager::TunnelManager::new(
+        19900,
+        false,
+        false,
+        gratis::manager::ProxyProtocol::default(),
+    );
     println!("logging in...");
     manager.login(&email, &password).await.expect("login");
     // `login()` already assigned every free-tier server a port and spawned its listener (see

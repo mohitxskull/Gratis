@@ -49,28 +49,40 @@ async fn spawn_echo_server() -> u16 {
 /// A `TunnelSource` that always hands back the same loopback test tunnel (no WireGuard/root
 /// involved — see `wireguard::Tunnel::loopback_for_testing`) and never tears it down —
 /// `run_socks5`'s relay behavior is what's under test here, not the lazy-connect/idle-teardown
-/// bookkeeping `gratis::manager::ServerSlot` layers on top in production.
-struct FixedTunnel(gratis::wireguard::SharedTunnel);
+/// bookkeeping `gratis::manager::ServerSlot` layers on top in production. Counts `release()`
+/// calls so tests can observe when a relayed connection's task has actually finished, without
+/// reaching into `relay()` itself.
+struct FixedTunnel {
+    tunnel: gratis::wireguard::SharedTunnel,
+    releases: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
 
 #[async_trait::async_trait]
 impl gratis::socks5::TunnelSource for FixedTunnel {
     async fn acquire(
         &self,
     ) -> Result<gratis::wireguard::SharedTunnel, gratis::socks5::SourceError> {
-        Ok(self.0.clone())
+        Ok(self.tunnel.clone())
     }
 
-    fn release(&self) {}
+    fn release(&self) {
+        self.releases
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Start the SOCKS5 proxy against a loopback test tunnel, returning the port it is listening
-/// on.
-async fn spawn_proxy() -> u16 {
+/// on and a counter of how many relayed connections have released their slot so far.
+async fn spawn_proxy() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
     let port = free_port();
     let listen_addr = format!("127.0.0.1:{port}");
     let tunnel = std::sync::Arc::new(gratis::wireguard::Tunnel::loopback_for_testing());
+    let releases = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let source: std::sync::Arc<dyn gratis::socks5::TunnelSource> =
-        std::sync::Arc::new(FixedTunnel(tunnel));
+        std::sync::Arc::new(FixedTunnel {
+            tunnel,
+            releases: releases.clone(),
+        });
     tokio::spawn(async move {
         let _ = gratis::socks5::run_socks5(
             &listen_addr,
@@ -88,6 +100,38 @@ async fn spawn_proxy() -> u16 {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    (port, releases)
+}
+
+/// A TCP listener that accepts connections and then never sends anything back — stands in for
+/// an upstream that's alive but has gone quiet for a long time (e.g. a slow LLM response), as
+/// opposed to one that has actually closed.
+async fn spawn_silent_server() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((sock, _)) => {
+                    // Hold the connection open forever, reading and discarding whatever the
+                    // relay sends it, but never writing back — the relay's `to_client` side has
+                    // nothing to read and just waits.
+                    tokio::spawn(async move {
+                        let mut sock = sock;
+                        let mut sink = [0u8; 1024];
+                        loop {
+                            use tokio::io::AsyncReadExt;
+                            match sock.read(&mut sink).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(_) => {}
+                            }
+                        }
+                    });
+                }
+                Err(_) => return,
+            }
+        }
+    });
     port
 }
 
@@ -135,7 +179,7 @@ async fn socks5_request(stream: &mut TcpStream, cmd: u8, target_port: u16) -> u8
 #[tokio::test]
 async fn socks5_relays_tcp_and_survives_idle() {
     let echo_port = spawn_echo_server().await;
-    let proxy_port = spawn_proxy().await;
+    let (proxy_port, _releases) = spawn_proxy().await;
 
     let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
     socks5_handshake(&mut client).await;
@@ -165,7 +209,7 @@ async fn socks5_relays_tcp_and_survives_idle() {
 #[tokio::test]
 async fn socks5_rejects_unsupported_command() {
     let echo_port = spawn_echo_server().await;
-    let proxy_port = spawn_proxy().await;
+    let (proxy_port, _releases) = spawn_proxy().await;
 
     let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
     socks5_handshake(&mut client).await;
@@ -183,5 +227,47 @@ async fn socks5_rejects_unsupported_command() {
     assert_eq!(
         n, 0,
         "connection should be closed after an unsupported command"
+    );
+}
+
+/// Regression test for a real leak: if the client disconnects while the upstream side is still
+/// alive but has gone quiet (a slow response, not a closed connection), the relay must release
+/// its connection slot promptly instead of waiting forever for the quiet side to also finish.
+/// Waiting for both directions unconditionally (`tokio::join!`) meant an abandoned client left
+/// its connection's slot held open indefinitely — confirmed live: connections piled up on exits
+/// nobody was using anymore, which then made every *new* request landing on the same exit
+/// slower for no reason.
+#[tokio::test]
+async fn releases_the_connection_promptly_when_the_client_disconnects_mid_relay() {
+    let silent_port = spawn_silent_server().await;
+    let (proxy_port, releases) = spawn_proxy().await;
+
+    let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
+    socks5_handshake(&mut client).await;
+    let rep = socks5_connect(&mut client, silent_port).await;
+    assert_eq!(rep, 0x00, "CONNECT should succeed");
+
+    // Send a little data (like a request body) so the relay is fully up and running, then just
+    // drop the client connection outright — exactly what happens when zen-relay's own request
+    // timeout fires and it abandons the connection while the (silent, but alive) upstream is
+    // still being waited on.
+    client.write_all(b"request body").await.unwrap();
+    drop(client);
+
+    // The release must happen promptly — bounded well under the old failure mode, where it
+    // would never happen at all as long as the silent server kept accepting the connection.
+    let released = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if releases.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        released.is_ok(),
+        "connection slot must be released promptly after the client disconnects, even though \
+         the upstream side never sent anything and never closed"
     );
 }

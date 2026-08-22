@@ -153,12 +153,35 @@ pub trait TunnelConnection: Send + Sync {
 
 #[async_trait]
 impl TunnelConnection for wireguard_netstack::TcpConnection {
+    /// `wireguard_netstack::TcpConnection::read` enforces its own hardcoded 30-second no-data
+    /// timeout internally (see its `netstack.rs`) and returns `Error::ReadTimeout` even though
+    /// the connection itself is still fully alive — genuine closes are already reported
+    /// separately (`Ok(0)`, checked via `may_recv` before the timeout check even runs), so a
+    /// `ReadTimeout` specifically means "no bytes in this particular 30s window," not "this
+    /// connection is dead." Left unhandled, that directly contradicts `socks5.rs`'s own
+    /// documented "no idle timeout — streaming/SSE/WebSocket connections with long quiet gaps
+    /// must survive" guarantee: a relayed SSE stream (e.g. Zen's free-tier models, which
+    /// routinely pause 30-90s mid-response during "thinking") would get cut after 30 seconds of
+    /// silence, indistinguishable downstream from the exit itself failing. Retrying past it
+    /// keeps this call blocked exactly as long as the caller's own actual idle tolerance
+    /// dictates, matching the module's stated intent instead of the crate's internal default.
     async fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        wireguard_netstack::TcpConnection::read(self, buf)
-            .await
-            .map_err(std::io::Error::other)
+        loop {
+            match wireguard_netstack::TcpConnection::read(self, buf).await {
+                Ok(n) => return Ok(n),
+                Err(wireguard_netstack::Error::ReadTimeout) => continue,
+                Err(err) => return Err(std::io::Error::other(err)),
+            }
+        }
     }
 
+    /// Deliberately NOT retried on `WriteTimeout` the way `read` retries `ReadTimeout` above:
+    /// the crate's internal `write()` tracks how many bytes it got through before timing out,
+    /// but `Err(WriteTimeout)` discards that count rather than returning it — so blindly
+    /// retrying with the same full `data` here would re-send whatever prefix already made it
+    /// out, corrupting the stream. Safely retrying would need the crate itself to report partial
+    /// progress on timeout; without that, surfacing the error as-is (ending this connection) is
+    /// the only correct option.
     async fn write_all(&self, data: &[u8]) -> std::io::Result<()> {
         wireguard_netstack::TcpConnection::write_all(self, data)
             .await

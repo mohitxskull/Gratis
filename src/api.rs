@@ -19,7 +19,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::get,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Render an Askama template to an HTML response, mapping a render failure (should never
@@ -42,6 +42,7 @@ pub fn router(manager: Arc<TunnelManager>) -> Router {
         .route("/ui/servers", get(ui_servers))
         .route("/api/servers", get(list_servers))
         .route("/api/update", get(update_status))
+        .route("/api/health", get(health_status))
         .with_state(manager)
 }
 
@@ -91,6 +92,31 @@ async fn update_status(
     })
 }
 
+#[derive(Serialize, Deserialize)]
+struct HealthStatus {
+    /// Whether Proton auth is currently working, as of the last login attempt or periodic
+    /// refresh — not merely "a session file exists on disk" (see `TunnelManager::auth_error`'s
+    /// doc comment for the bug this replaces).
+    auth_ok: bool,
+    /// The live reason auth is broken, if `auth_ok` is false.
+    auth_error: Option<String>,
+    servers_ready: usize,
+}
+
+/// Exists so `gratis status` can report what's actually true *right now* instead of just
+/// whether a session file happens to exist on disk — see `TunnelManager::auth_error`'s doc
+/// comment.
+async fn health_status(
+    axum::extract::State(manager): axum::extract::State<Arc<TunnelManager>>,
+) -> Json<HealthStatus> {
+    let auth_error = manager.auth_error();
+    Json(HealthStatus {
+        auth_ok: auth_error.is_none(),
+        auth_error,
+        servers_ready: manager.servers().len(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,6 +134,7 @@ mod tests {
             Arc::new(RealDriver),
             false,
             false,
+            crate::manager::ProxyProtocol::default(),
         ))
     }
 
@@ -153,5 +180,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_reflects_live_auth_state_not_just_server_count() {
+        let manager = stub_manager();
+        let app = router(manager.clone());
+
+        // Nothing has gone wrong yet (no login attempted at all in this test) — auth_ok must
+        // default to true, not false, since "never tried" isn't the same as "known broken".
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/api/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let health: HealthStatus = serde_json::from_slice(&body).unwrap();
+        assert!(health.auth_ok);
+        assert_eq!(health.auth_error, None);
+        assert_eq!(health.servers_ready, 0);
+
+        // Now simulate what `resume_or_login` does on a real failure — the exact bug this
+        // endpoint exists to fix: `servers()`/session-file-on-disk alone can't show this.
+        manager.set_auth_error(Some("stored session is no longer valid".to_string()));
+        let resp = app
+            .oneshot(Request::get("/api/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let health: HealthStatus = serde_json::from_slice(&body).unwrap();
+        assert!(!health.auth_ok);
+        assert_eq!(
+            health.auth_error.as_deref(),
+            Some("stored session is no longer valid")
+        );
     }
 }

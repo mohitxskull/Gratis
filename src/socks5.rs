@@ -88,7 +88,10 @@ pub trait TunnelSource: Send + Sync {
 /// Calls [`TunnelSource::release`] exactly once when dropped — RAII pairing for the `acquire`
 /// call that produced the tunnel this guard is holding open, so `release` still fires even if
 /// the connection's handling exits early via `?` or a panic.
-struct ReleaseGuard(Arc<dyn TunnelSource>);
+///
+/// `pub(crate)` (not private) — `http_connect.rs` reuses this exact type rather than
+/// duplicating the same RAII pairing for its own front end.
+pub(crate) struct ReleaseGuard(pub(crate) Arc<dyn TunnelSource>);
 
 impl Drop for ReleaseGuard {
     fn drop(&mut self) {
@@ -121,10 +124,12 @@ pub async fn run_socks5(
         };
         let source = source.clone();
         let stats = stats.clone();
+        let label = listen_addr.to_string();
         tokio::spawn(async move {
-            if let Err(_err) = handle_client(client, source, stats.clone()).await {
-                // Best-effort relay: any I/O error just ends this connection's task.
-            }
+            // Best-effort relay: an I/O error just ends this connection's task — `handle_client`
+            // (via `relay`) already logs anything worth a human's attention before returning it,
+            // so there's nothing more to do with the error here.
+            let _ = handle_client(client, source, stats.clone(), label).await;
         });
     }
 }
@@ -133,6 +138,7 @@ async fn handle_client(
     mut client: TcpStream,
     source: Arc<dyn TunnelSource>,
     stats: Arc<TunnelStats>,
+    label: String,
 ) -> io::Result<()> {
     negotiate_method(&mut client).await?;
 
@@ -187,7 +193,7 @@ async fn handle_client(
 
     send_reply(&mut client, REP_SUCCEEDED, local_v4_zero()).await?;
 
-    relay(client, outbound, stats).await
+    relay(client, outbound, stats, &label).await
 }
 
 /// The target of a `CONNECT` request: either an already-resolved socket address, or a
@@ -312,12 +318,45 @@ fn local_v4_zero() -> SocketAddr {
 /// `TunnelConnection` isn't `AsyncRead`/`AsyncWrite`, so this is a manual pump rather than
 /// `tokio::io::copy_bidirectional`, but the streaming-safety property is the same: no timeout
 /// is ever applied to either direction, so quiet gaps (SSE/WebSocket) don't kill the relay.
-async fn relay(
+///
+/// Ends as soon as **either** direction finishes — deliberately not full-duplex half-close
+/// aware, which would be wrong for general-purpose TCP but is *correct* for what this actually
+/// proxies: one `zen-relay` HTTP request/response pair per connection. A normal HTTP client
+/// never half-closes its write side mid-request while still waiting on the response — it keeps
+/// the whole socket open until the exchange is fully done — so if `to_tunnel` (client → tunnel)
+/// ends before `to_client` (tunnel → client) does, that only means the client's connection is
+/// actually gone (its own request timeout fired, it crashed, whatever), not that it finished
+/// sending and is patiently waiting to read. In that case there is no one left to deliver
+/// `to_client`'s bytes to, so continuing to wait on it just leaks the connection.
+///
+/// That leak was real, not theoretical: `to_client` reads via
+/// [`crate::wireguard::TunnelConnection::read`], which retries past the underlying crate's
+/// internal `ReadTimeout` indefinitely (see that method's doc comment) so a merely-slow upstream
+/// (a "thinking" LLM response) isn't mistaken for a dead one. Combined with the previous
+/// `tokio::join!`, which waits for *both* directions unconditionally, an abandoned client left
+/// `to_client` spinning forever waiting for a tunnel that was still alive but simply had nothing
+/// to send yet — never returning, never releasing its connection slot. Confirmed live:
+/// connections piled up on exits nobody was using anymore, which then made every *new* request
+/// landing on the same exit slower for no reason (see
+/// `releases_the_connection_promptly_when_the_client_disconnects_mid_relay` in
+/// `tests/socks5_relay.rs`).
+///
+/// Byte counts are tracked in shared atomics rather than returned from the futures themselves,
+/// since `select!` drops whichever one loses the race mid-flight — its local state would
+/// otherwise be lost and the log below would have no count for that side.
+///
+/// `pub(crate)` — `http_connect.rs`'s front end reuses this verbatim rather than reimplementing
+/// the same leak-safety/logging behavior for its own protocol.
+pub(crate) async fn relay(
     client: TcpStream,
     outbound: Box<dyn crate::wireguard::TunnelConnection>,
     stats: Arc<TunnelStats>,
+    label: &str,
 ) -> io::Result<()> {
+    let started = std::time::Instant::now();
     let (mut client_rd, mut client_wr) = client.into_split();
+    let sent = std::sync::atomic::AtomicU64::new(0);
+    let received = std::sync::atomic::AtomicU64::new(0);
 
     let to_tunnel = async {
         let mut buf = vec![0u8; 8192];
@@ -328,6 +367,7 @@ async fn relay(
             }
             outbound.write_all(&buf[..n]).await?;
             stats.add_sent(n as u64);
+            sent.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         }
         outbound.shutdown();
         Ok::<(), io::Error>(())
@@ -342,13 +382,37 @@ async fn relay(
             }
             client_wr.write_all(&buf[..n]).await?;
             stats.add_received(n as u64);
+            received.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         }
         let _ = client_wr.shutdown().await;
         Ok::<(), io::Error>(())
     };
 
-    let _ = tokio::join!(to_tunnel, to_client);
-    Ok(())
+    tokio::pin!(to_tunnel);
+    tokio::pin!(to_client);
+
+    let (result, which) = tokio::select! {
+        result = &mut to_tunnel => (result, "client->tunnel"),
+        result = &mut to_client => (result, "tunnel->client"),
+    };
+
+    let sent = sent.load(std::sync::atomic::Ordering::Relaxed);
+    let received = received.load(std::sync::atomic::Ordering::Relaxed);
+
+    match &result {
+        Ok(()) => log::debug!(
+            "{label}: relay closed cleanly ({which} finished first), sent {sent} \
+             byte(s)/received {received} byte(s) in {:?}",
+            started.elapsed()
+        ),
+        Err(err) => log::warn!(
+            "{label}: relay ended with an error on {which} after sent {sent} byte(s)/received \
+             {received} byte(s) in {:?}: {err}",
+            started.elapsed()
+        ),
+    }
+
+    result
 }
 
 #[cfg(test)]
