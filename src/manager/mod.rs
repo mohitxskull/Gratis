@@ -436,9 +436,7 @@ impl TunnelManager {
 
             // Genuinely new server: hand out the next never-before-used port.
             let port = *next_port;
-            *next_port = next_port.checked_add(1).ok_or_else(|| {
-                ProtonError::Config("ran out of ports for the server list".into())
-            })?;
+            *next_port = next_port.checked_add(1).ok_or(ProtonError::OutOfPorts)?;
 
             let slot = ServerSlot::new(
                 server,

@@ -252,7 +252,7 @@ impl Tunnel {
     /// generated WireGuard keypair. Performs the handshake before returning.
     pub async fn connect(server: &VPNServer, creds: &VPNCredentials) -> Result<Self> {
         let physical = server.pick_physical().ok_or_else(|| {
-            ProtonError::Config(format!("server {} has no physical servers", server.name))
+            ProtonError::NoPhysicalServer(format!("server {} has no physical servers", server.name))
         })?;
 
         let peer_endpoint: SocketAddr = format!("{}:{WG_PORT}", physical.entry_ip)

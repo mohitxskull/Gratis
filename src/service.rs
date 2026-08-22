@@ -14,7 +14,7 @@ const UNIT_NAME: &str = "gratis.service";
 const TRAY_UNIT_NAME: &str = "gratis-tray.service";
 
 fn unit_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME").map_err(|_| ProtonError::Config("HOME is not set".into()))?;
+    let home = std::env::var("HOME").map_err(|_| ProtonError::BadUnit("HOME is not set".into()))?;
     Ok(PathBuf::from(home).join(".config/systemd/user"))
 }
 
@@ -75,7 +75,7 @@ fn unit_contents(
     let bin = binary_path()?;
     let bin = bin
         .to_str()
-        .ok_or_else(|| ProtonError::Config("gratis binary path is not valid UTF-8".into()))?;
+        .ok_or_else(|| ProtonError::BadUnit("gratis binary path is not valid UTF-8".into()))?;
     let bin = systemd_quote(bin);
     let mut flags = String::new();
     if unlimited_connections {
@@ -145,7 +145,7 @@ fn tray_unit_contents(control_port: u16) -> Result<String> {
     let bin = binary_path()?;
     let bin = bin
         .to_str()
-        .ok_or_else(|| ProtonError::Config("gratis binary path is not valid UTF-8".into()))?;
+        .ok_or_else(|| ProtonError::BadUnit("gratis binary path is not valid UTF-8".into()))?;
     let bin = systemd_quote(bin);
     Ok(format!(
         "[Unit]\n\
@@ -196,7 +196,7 @@ fn run_ok(args: &[&str]) -> Result<()> {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
-    Err(ProtonError::Config(format!(
+    Err(ProtonError::BadUnit(format!(
         "systemctl --user {} failed: {}",
         args.join(" "),
         stderr.trim()

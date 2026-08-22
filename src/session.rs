@@ -19,7 +19,7 @@ pub struct Session {
 
 fn entry() -> Result<keyring::Entry> {
     keyring::Entry::new(SERVICE, USERNAME)
-        .map_err(|e| ProtonError::Config(format!("keychain unavailable: {e}")))
+        .map_err(|e| ProtonError::Keychain(format!("keychain unavailable: {e}")))
 }
 
 /// `None` if no session is stored yet (not an error — the normal state before `gratis login`).
@@ -27,7 +27,7 @@ pub fn load() -> Result<Option<Session>> {
     match entry()?.get_password() {
         Ok(json) => Ok(Some(serde_json::from_str(&json)?)),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(ProtonError::Config(format!("keychain read failed: {e}"))),
+        Err(e) => Err(ProtonError::Keychain(format!("keychain read failed: {e}"))),
     }
 }
 
@@ -35,14 +35,16 @@ pub fn store(session: &Session) -> Result<()> {
     let json = serde_json::to_string(session)?;
     entry()?
         .set_password(&json)
-        .map_err(|e| ProtonError::Config(format!("keychain write failed: {e}")))
+        .map_err(|e| ProtonError::Keychain(format!("keychain write failed: {e}")))
 }
 
 /// No-op (not an error) if nothing was stored.
 pub fn delete() -> Result<()> {
     match entry()?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(ProtonError::Config(format!("keychain delete failed: {e}"))),
+        Err(e) => Err(ProtonError::Keychain(format!(
+            "keychain delete failed: {e}"
+        ))),
     }
 }
 

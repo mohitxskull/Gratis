@@ -242,7 +242,7 @@ impl ServerSlot {
 
         let agent_result = match &sni {
             Some(sni) => crate::agent::unlock(tunnel, sni, &creds).await,
-            None => Err(ProtonError::Config(format!(
+            None => Err(ProtonError::NoPhysicalServer(format!(
                 "server {} has no physical servers to derive a local-agent SNI from",
                 server.name
             ))),
