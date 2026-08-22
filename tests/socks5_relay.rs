@@ -230,6 +230,39 @@ async fn socks5_rejects_unsupported_command() {
     );
 }
 
+/// The upstream-refuses path is untested elsewhere and is exactly where a hang or unhandled
+/// `Err` is most likely to hide: `tunnel.connect_tcp(addr)` failing must produce a clear
+/// `GENERAL FAILURE` reply and a closed connection, not a stuck client. Slow (~5s): integration
+/// tests link the production (non-`cfg(test)`) build, so this exercises the real
+/// `TCP_CONNECT_RETRY_BUDGET`, not the shortened unit-test one — same tradeoff already accepted
+/// by `tests/wireguard_config.rs`'s equivalent test.
+#[tokio::test]
+async fn socks5_reports_general_failure_when_the_upstream_refuses() {
+    let dead_port = free_port(); // reserved, then immediately released — nothing ever binds it.
+    let (proxy_port, _releases) = spawn_proxy().await;
+
+    let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
+    socks5_handshake(&mut client).await;
+
+    let rep = tokio::time::timeout(Duration::from_secs(10), async {
+        socks5_connect(&mut client, dead_port).await
+    })
+    .await
+    .expect("connect_tcp must give up within its retry budget, not hang forever");
+    assert_ne!(
+        rep, 0x00,
+        "CONNECT to a refusing upstream must not report success"
+    );
+
+    // The proxy must close the connection after reporting failure, not leave it dangling.
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+        .await
+        .expect("connection must be closed promptly after a failure reply")
+        .unwrap();
+    assert_eq!(n, 0, "connection should be closed after a failed CONNECT");
+}
+
 /// Regression test for a real leak: if the client disconnects while the upstream side is still
 /// alive but has gone quiet (a slow response, not a closed connection), the relay must release
 /// its connection slot promptly instead of waiting forever for the quiet side to also finish.

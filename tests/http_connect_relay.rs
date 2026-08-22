@@ -148,12 +148,45 @@ async fn a_non_connect_method_is_rejected_with_405() {
         .unwrap();
 
     let mut buf = [0u8; 64];
-    let n = client.read(&mut buf).await.unwrap();
+    // Matches the 400 test below's use of `timeout` — a server-side hang here would otherwise
+    // hang the whole test suite instead of failing this one test fast.
+    let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+        .await
+        .expect("must not hang on a non-CONNECT method")
+        .unwrap();
     let text = String::from_utf8_lossy(&buf[..n]);
     assert!(
         text.starts_with("HTTP/1.1 405"),
         "expected a 405 response, got: {text}"
     );
+}
+
+/// Mirrors `tests/socks5_relay.rs`'s equivalent — the upstream-refuses path is where a hang or
+/// unhandled `Err` is most likely to hide. Slow (~5s): see that test's doc comment for why
+/// (integration tests link the production, non-shortened `TCP_CONNECT_RETRY_BUDGET`).
+#[tokio::test]
+async fn http_connect_reports_502_when_the_upstream_refuses() {
+    let dead_port = free_port();
+    let proxy_port = spawn_proxy().await;
+    let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
+
+    let status = tokio::time::timeout(
+        Duration::from_secs(10),
+        http_connect(&mut client, dead_port),
+    )
+    .await
+    .expect("connect_tcp must give up within its retry budget, not hang forever");
+    assert_eq!(
+        status, 502,
+        "CONNECT to a refusing upstream must report Bad Gateway, not success"
+    );
+
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+        .await
+        .expect("connection must be closed promptly after a failure reply")
+        .unwrap();
+    assert_eq!(n, 0, "connection should be closed after a failed CONNECT");
 }
 
 #[tokio::test]
