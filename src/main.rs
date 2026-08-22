@@ -342,6 +342,19 @@ fn cmd_up(
     if session::load()?.is_none() {
         anyhow::bail!("not logged in — run `gratis login` first");
     }
+
+    // `systemctl start` on an already-active unit is a no-op — it does NOT restart the service
+    // to pick up a rewritten `ExecStart`. Silently rewriting the unit file while the old
+    // process keeps running with its old flags would leave `gratis status` (which reads the
+    // unit file) claiming flags the live process doesn't actually have. Refuse outright instead
+    // — `gratis down` first makes the intent explicit.
+    if service::is_installed()? && service::is_active().unwrap_or(false) {
+        anyhow::bail!(
+            "gratis is already running — run `gratis down` first if you want to change flags \
+             and start again"
+        );
+    }
+
     service::install(
         control_port,
         port_range_start,
