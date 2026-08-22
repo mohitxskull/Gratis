@@ -61,20 +61,31 @@ async fn spawn_proxy() -> u16 {
     let source: std::sync::Arc<dyn gratis::socks5::TunnelSource> =
         std::sync::Arc::new(FixedTunnel(tunnel));
     tokio::spawn(async move {
-        let _ = gratis::http_connect::run_http_connect(
+        if let Err(err) = gratis::http_connect::run_http_connect(
             &listen_addr,
             source,
             std::sync::Arc::new(gratis::wireguard::TunnelStats::default()),
         )
-        .await;
+        .await
+        {
+            // `run_http_connect` only returns on a bind failure — surface that immediately
+            // rather than letting the readiness probe below spin for a port that never comes up.
+            panic!("test setup: run_http_connect failed to bind {listen_addr}: {err}");
+        }
     });
 
+    let mut ready = false;
     for _ in 0..50 {
         if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            ready = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert!(
+        ready,
+        "test setup: HTTP CONNECT proxy on port {port} never became ready to accept connections"
+    );
 
     port
 }

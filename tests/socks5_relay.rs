@@ -84,21 +84,35 @@ async fn spawn_proxy() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) 
             releases: releases.clone(),
         });
     tokio::spawn(async move {
-        let _ = gratis::socks5::run_socks5(
+        if let Err(err) = gratis::socks5::run_socks5(
             &listen_addr,
             source,
             std::sync::Arc::new(gratis::wireguard::TunnelStats::default()),
         )
-        .await;
+        .await
+        {
+            // `run_socks5` only returns on a bind failure (its accept loop retries everything
+            // else forever) — surface that immediately rather than letting the caller's
+            // readiness probe below spin for a port that will never come up.
+            panic!("test setup: run_socks5 failed to bind {listen_addr}: {err}");
+        }
     });
 
-    // Give the listener a moment to bind before clients try to connect.
+    // Give the listener a moment to bind before clients try to connect. Previously silent on
+    // exhaustion — a bind race or a genuine bug here surfaced as a confusing connection-refused
+    // deep inside whatever test called this, rather than a clear setup failure at the source.
+    let mut ready = false;
     for _ in 0..50 {
         if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            ready = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert!(
+        ready,
+        "test setup: SOCKS5 proxy on port {port} never became ready to accept connections"
+    );
 
     (port, releases)
 }
