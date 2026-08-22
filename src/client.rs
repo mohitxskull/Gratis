@@ -28,7 +28,12 @@ pub struct ProtonVPNClient {
 }
 
 impl ProtonVPNClient {
-    pub fn new(username: &str) -> Self {
+    /// Fails only if the underlying TLS/crypto backend can't be initialized (never on these
+    /// fixed, valid header values) — but that failure is real on a misconfigured system, so it
+    /// propagates as `ProtonError::Http` instead of panicking the whole process (see
+    /// error_handling review F3: this used to be an `expect()` that could take down a
+    /// long-running daemon over a one-time client-construction failure).
+    pub fn new(username: &str) -> Result<Self> {
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .default_headers({
@@ -43,9 +48,8 @@ impl ProtonVPNClient {
                 h.insert("x-pm-apiversion", header::HeaderValue::from_static("3"));
                 h
             })
-            .build()
-            .expect("reqwest client");
-        Self {
+            .build()?;
+        Ok(Self {
             username: username.to_string(),
             client,
             auth_token: None,
@@ -53,7 +57,7 @@ impl ProtonVPNClient {
             refresh_token: None,
             vpn_credentials: None,
             server_list: Vec::new(),
-        }
+        })
     }
 
     /// Attach session auth headers (`Authorization: Bearer`, `x-pm-uid`) when logged in. Both

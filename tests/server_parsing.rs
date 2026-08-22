@@ -142,7 +142,7 @@ fn server(id: &str, country_code: &str, tier: i32, load: f64) -> VPNServer {
 /// `country_code` doesn't match, and sorts the remainder ascending by `load`.
 #[test]
 fn find_servers_filters_tier_and_country_and_sorts_by_load() {
-    let mut client = ProtonVPNClient::new("test");
+    let mut client = ProtonVPNClient::new("test").unwrap();
     client.server_list = vec![
         server("us-1", "US", 0, 42.0),
         server("us-2", "US", 0, 11.0),

@@ -291,7 +291,7 @@ async fn cmd_login() -> anyhow::Result<()> {
     let (email, password) = read_credentials()?;
 
     println!("gratis: authenticating...");
-    let mut client = ProtonVPNClient::new(&email);
+    let mut client = ProtonVPNClient::new(&email)?;
     match client.login(&email, &password).await {
         Ok(_) => {}
         Err(ProtonError::TwoFactorRequired) => {

@@ -225,8 +225,19 @@ impl ConnectionLimiter {
     /// Release a slot reserved by a successful `try_acquire` — call exactly once per tunnel
     /// that goes from connected back to disconnected (a failed connect attempt that never
     /// actually reserved doesn't call this; see the call sites in `ServerSlot`).
+    ///
+    /// Guards against underflow the same way `ServerSlot::release` does: an unbalanced call
+    /// here would otherwise wrap `current` to `u32::MAX` and permanently (silently) disable
+    /// the account's `MaxConnect` cap instead of just under-counting by one.
     fn release(&self) {
-        self.current.fetch_sub(1, Ordering::SeqCst);
+        let prev = self.current.fetch_sub(1, Ordering::SeqCst);
+        if prev == 0 {
+            self.current.fetch_add(1, Ordering::SeqCst);
+            log::warn!(
+                "ConnectionLimiter::release called with current already at 0 — ignoring an \
+                 unbalanced release instead of corrupting the cap counter"
+            );
+        }
     }
 }
 
@@ -643,7 +654,23 @@ impl TunnelSource for ServerSlot {
     }
 
     fn release(&self) {
-        let remaining = self.open_connections.fetch_sub(1, Ordering::SeqCst) - 1;
+        let prev = self.open_connections.fetch_sub(1, Ordering::SeqCst);
+        // `AtomicU32::fetch_sub` wraps on underflow rather than panicking. A `release` with no
+        // matching `acquire` should never happen (see `ReleaseGuard`'s RAII pairing), but if it
+        // ever did, wrapping to `u32::MAX` would make the `== 0` check below never fire again —
+        // a silent, permanent leak of this slot's tunnel and its connection-cap reservation.
+        // Restoring the count and bailing turns that failure mode into a contained no-op
+        // instead.
+        if prev == 0 {
+            self.open_connections.fetch_add(1, Ordering::SeqCst);
+            log::warn!(
+                "server {}: release() called with open_connections already at 0 — ignoring an \
+                 unbalanced release instead of corrupting the counter",
+                self.id
+            );
+            return;
+        }
+        let remaining = prev - 1;
         if remaining != 0 {
             return;
         }
@@ -846,7 +873,7 @@ impl TunnelManager {
     /// listener per reachable server (see the module doc comment). Replaces any slots from a
     /// previous login.
     pub async fn login(&self, email: &str, password: &str) -> Result<()> {
-        let mut client = ProtonVPNClient::new(email);
+        let mut client = ProtonVPNClient::new(email)?;
         let creds = client.login(email, password).await?;
         client.fetch_servers().await?;
         self.finish_login(client, creds).await
@@ -858,7 +885,7 @@ impl TunnelManager {
     /// (unchanged if no refresh was needed, updated tokens if it was) — the caller is
     /// responsible for writing it back to the keychain via `session::store`.
     pub async fn login_with_session(&self, session: &Session) -> Result<Session> {
-        let mut client = ProtonVPNClient::new(&session.email);
+        let mut client = ProtonVPNClient::new(&session.email)?;
         client.auth_token = Some(session.access_token.clone());
         client.uid = Some(session.uid.clone());
 
@@ -893,7 +920,7 @@ impl TunnelManager {
     /// its old (still-valid-for-now) certificate; only the *next* connect/unlock for that slot
     /// picks up the renewed one.
     pub async fn renew_credentials(&self, session: &Session) -> Result<Session> {
-        let mut client = ProtonVPNClient::new(&session.email);
+        let mut client = ProtonVPNClient::new(&session.email)?;
         client.auth_token = Some(session.access_token.clone());
         client.uid = Some(session.uid.clone());
 
@@ -1365,6 +1392,35 @@ mod tests {
         assert_eq!(servers[0].country_code, "US");
         assert!(!servers[0].connected);
         assert_eq!(servers[0].open_connections, 0);
+    }
+
+    #[test]
+    fn server_slot_release_with_no_matching_acquire_does_not_underflow() {
+        let (_manager, slot) = manager_with_one_slot(20051);
+        assert_eq!(slot.open_connections.load(Ordering::SeqCst), 0);
+
+        // No `acquire` happened — this must be a contained no-op, not wrap to u32::MAX.
+        slot.release();
+        assert_eq!(
+            slot.open_connections.load(Ordering::SeqCst),
+            0,
+            "an unbalanced release must not corrupt the connection counter"
+        );
+    }
+
+    #[test]
+    fn connection_limiter_release_with_no_matching_acquire_does_not_underflow() {
+        let limiter = ConnectionLimiter::new(Some(1), false);
+        assert_eq!(limiter.current.load(Ordering::SeqCst), 0);
+
+        limiter.release();
+        assert_eq!(
+            limiter.current.load(Ordering::SeqCst),
+            0,
+            "an unbalanced release must not corrupt the MaxConnect cap counter"
+        );
+        // The cap must still work correctly afterwards — not saturated at u32::MAX.
+        assert!(limiter.try_acquire());
     }
 
     #[tokio::test]
