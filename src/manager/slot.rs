@@ -366,7 +366,14 @@ impl TunnelSource for ServerSlot {
                     };
                     return Err(Box::new(ProtonError::AtCapacity(format!(
                         "max simultaneous tunnels reached ({}) — {hint}",
-                        self.limiter.max.unwrap_or(0)
+                        // `try_acquire` only returns `false` (reaching this branch) when `max`
+                        // is `Some` — see its doc comment — so this can never actually
+                        // substitute a value; `expect` makes that invariant explicit instead of
+                        // `unwrap_or(0)` silently printing a misleading "reached (0)" if it ever
+                        // did.
+                        self.limiter
+                            .max
+                            .expect("AtCapacity is only returned when max is Some")
                     ))));
                 }
                 match self.connect_with_retry().await {

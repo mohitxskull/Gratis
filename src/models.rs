@@ -10,6 +10,12 @@ use serde::Deserialize;
 pub const PROTON_API_URL: &str = "https://api.protonvpn.ch";
 pub const USER_AGENT: &str = "ProtonVPN-CustomClient/1.0";
 
+/// Proton's API-wide "this call succeeded" sentinel, carried in the response body's `Code`
+/// field (distinct from the HTTP status, which is a plain 200 either way) — verified against
+/// `proton-core`'s `proton.session.exceptions`. `client.rs` checks it after `login`/`submit_2fa`/
+/// `refresh`; a mismatch there means the request reached the API but Proton itself rejected it.
+pub const PROTON_SUCCESS_CODE: i32 = 1000;
+
 /// One physical server backing a logical server. A logical server ("CH#10") can be served by
 /// several physical machines; the entry IP and WireGuard peer public key are properties of the
 /// *physical* server, never mixed across two different physical entries (this was the root
@@ -164,25 +170,32 @@ pub struct VPNAccountInfo {
     pub max_connect: i32,
 }
 
-/// Map a `LogicalServerDto.features` bitmask into strings. Verified against
-/// `proton.vpn.session.servers.types.ServerFeatureEnum`: `SECURE_CORE=1, TOR=2, P2P=4,
-/// STREAMING=8, IPV6=16` — the old `1=P2P, 8=TOR` assumption (never verified against a live
-/// account) was wrong.
+/// Bitmask values for `LogicalServerDto.features`, verified against
+/// `proton.vpn.session.servers.types.ServerFeatureEnum` — the old `1=P2P, 8=TOR` assumption
+/// (never verified against a live account) was wrong. Named rather than inlined so a new
+/// feature bit can't be added as a bare, unexplained literal.
+const FEATURE_SECURE_CORE: i32 = 1;
+const FEATURE_TOR: i32 = 2;
+const FEATURE_P2P: i32 = 4;
+const FEATURE_STREAMING: i32 = 8;
+const FEATURE_IPV6: i32 = 16;
+
+/// Map a `LogicalServerDto.features` bitmask into strings.
 pub fn features_to_strings(features: i32) -> Vec<String> {
     let mut out = Vec::new();
-    if features & 1 != 0 {
+    if features & FEATURE_SECURE_CORE != 0 {
         out.push("secure-core".to_string());
     }
-    if features & 2 != 0 {
+    if features & FEATURE_TOR != 0 {
         out.push("tor".to_string());
     }
-    if features & 4 != 0 {
+    if features & FEATURE_P2P != 0 {
         out.push("p2p".to_string());
     }
-    if features & 8 != 0 {
+    if features & FEATURE_STREAMING != 0 {
         out.push("streaming".to_string());
     }
-    if features & 16 != 0 {
+    if features & FEATURE_IPV6 != 0 {
         out.push("ipv6".to_string());
     }
     out

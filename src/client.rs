@@ -174,7 +174,7 @@ impl ProtonVPNClient {
         let auth: AuthResponse = self.post("/auth", &body).await?;
 
         // 4. The API signals success with `Code == 1000`.
-        if auth.response_code != Some(1000) {
+        if auth.response_code != Some(PROTON_SUCCESS_CODE) {
             return Err(ProtonError::Auth);
         }
 
@@ -217,7 +217,7 @@ impl ProtonVPNClient {
         let resp: TwoFactorResponse = self
             .post("/auth/2fa", &serde_json::json!({ "TwoFactorCode": code }))
             .await?;
-        if resp.response_code != Some(1000) {
+        if resp.response_code != Some(PROTON_SUCCESS_CODE) {
             return Err(ProtonError::Auth);
         }
         self.issue_credentials(&email).await
@@ -255,7 +255,7 @@ impl ProtonVPNClient {
             "RedirectURI": "http://protonmail.ch",
         });
         let auth: AuthResponse = self.post("/auth/refresh", &body).await?;
-        if auth.response_code != Some(1000) {
+        if auth.response_code != Some(PROTON_SUCCESS_CODE) {
             return Err(ProtonError::Auth);
         }
         self.auth_token = auth.access_token.clone();

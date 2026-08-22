@@ -18,6 +18,14 @@ pub(crate) struct ConnectionLimiter {
     /// *idle* connected slot instead of rejecting the new connection. Every slot from one login
     /// registers itself here (see `register`) so eviction can scan across all of them.
     pub(crate) evict_lru: bool,
+    /// Lock-ordering contract: `evict_least_recently_used` holds this lock for the *entire*
+    /// duration of the victim's `slot.evict()` call, not just the scan. That's what lets two
+    /// concurrent `try_acquire` callers avoid double-evicting the same victim (the second
+    /// caller re-locks `slots`, sees the victim's `tunnel` is now `None`, and picks a
+    /// different/no victim) and lets `evict()` safely bump `idle_generation` before any other
+    /// caller can observe a half-evicted slot. Do not call back into `TunnelManager` (which
+    /// locks `manager.slots`) from inside code that holds this lock — the crate-wide ordering
+    /// is `manager.slots -> limiter.slots`, never the reverse, and reversing it would deadlock.
     slots: Mutex<Vec<Weak<ServerSlot>>>,
 }
 

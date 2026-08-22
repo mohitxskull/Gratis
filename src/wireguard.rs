@@ -382,16 +382,28 @@ impl Tunnel {
     pub async fn connect_tcp(&self, addr: SocketAddr) -> Result<Box<dyn TunnelConnection>> {
         let deadline = std::time::Instant::now() + TCP_CONNECT_RETRY_BUDGET;
         loop {
-            match self.connect_tcp_once(addr).await {
-                Ok(conn) => return Ok(conn),
-                Err(err) => {
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    if remaining.is_zero() {
-                        return Err(err);
-                    }
-                    tokio::time::sleep(TCP_CONNECT_RETRY_BACKOFF.min(remaining)).await;
-                }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(ProtonError::Config(format!(
+                    "connect attempt to {addr} did not finish within {TCP_CONNECT_RETRY_BUDGET:?}"
+                )));
             }
+            // Bound each individual attempt to whatever's left of the overall budget —
+            // `wireguard_netstack::TcpConnection::connect` has its own internal polling but no
+            // *enforced* deadline in this code, so a single hung handshake could otherwise burn
+            // the whole retry budget on one attempt with no chance for the loop below to retry.
+            let err = match tokio::time::timeout(remaining, self.connect_tcp_once(addr)).await {
+                Ok(Ok(conn)) => return Ok(conn),
+                Ok(Err(err)) => err,
+                Err(_elapsed) => ProtonError::Config(format!(
+                    "connect attempt to {addr} did not finish within {remaining:?}"
+                )),
+            };
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(err);
+            }
+            tokio::time::sleep(TCP_CONNECT_RETRY_BACKOFF.min(remaining)).await;
         }
     }
 

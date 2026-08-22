@@ -608,6 +608,16 @@ fn read_dotenv_var(path: &std::path::Path, key: &str) -> Option<String> {
         .find_map(|line| line.strip_prefix(&format!("{key}=")).map(|v| v.to_string()))
 }
 
+/// `Some((email, password))` only when a `.env` in the current directory has *both* keys — a
+/// partial pair (e.g. `EMAIL` set but not `PASSWORD`) is treated the same as neither being set,
+/// since half a credential pair can't log in either way.
+fn read_dotenv_credentials() -> Option<(String, String)> {
+    let path = std::path::Path::new(".env");
+    let email = read_dotenv_var(path, "EMAIL")?;
+    let password = read_dotenv_var(path, "PASSWORD")?;
+    Some((email, password))
+}
+
 /// Resume the stored session (or fall back to a `.env`) and populate `manager`'s server list.
 /// Split out of `cmd_run` so it can run *concurrently* with the control API instead of
 /// blocking the listener bind — this is a real ~15-20s network round trip (session-resume:
@@ -657,17 +667,11 @@ async fn resume_or_login(manager: Arc<TunnelManager>, control_port: u16) -> Opti
             // reason as `session::load_async` — `std::fs::read_to_string` blocks the only
             // worker thread on a `current_thread` runtime, freezing every live relay/the
             // control API for however long that read takes.
-            let dotenv_creds = tokio::task::spawn_blocking(|| {
-                let path = std::path::Path::new(".env");
-                (
-                    read_dotenv_var(path, "EMAIL"),
-                    read_dotenv_var(path, "PASSWORD"),
-                )
-            })
-            .await
-            .unwrap_or((None, None));
+            let dotenv_creds = tokio::task::spawn_blocking(read_dotenv_credentials)
+                .await
+                .unwrap_or(None);
             match dotenv_creds {
-                (Some(email), Some(password)) => match manager.login(&email, &password).await {
+                Some((email, password)) => match manager.login(&email, &password).await {
                     Ok(()) => {
                         let count = manager.servers().len();
                         log::info!("logged in from .env ({email}), {count} servers ready");
@@ -678,7 +682,7 @@ async fn resume_or_login(manager: Arc<TunnelManager>, control_port: u16) -> Opti
                         manager.set_auth_error(Some(format!("login from .env failed: {err}")));
                     }
                 },
-                _ => {
+                None => {
                     let msg = "no stored session and no .env (EMAIL + PASSWORD) — run \
                                 `gratis login`";
                     log::warn!("{msg}");

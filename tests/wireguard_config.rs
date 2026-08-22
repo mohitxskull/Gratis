@@ -44,6 +44,13 @@ fn client_address_is_the_fixed_proton_address() {
     // every Proton WireGuard connection uses this fixed address, never anything derived
     // per-account or per-connection.
     assert_eq!(CLIENT_ADDRESS, "10.2.0.2");
+    // `Tunnel::connect` parses this with `.expect(...)` rather than propagating a `Result` —
+    // tolerable only because it's a fixed literal, never user input. Lock that assumption with
+    // a test rather than discovering a typo via a runtime panic.
+    assert!(
+        CLIENT_ADDRESS.parse::<std::net::Ipv4Addr>().is_ok(),
+        "CLIENT_ADDRESS must always be a valid IPv4 literal — Tunnel::connect expect()s this"
+    );
 }
 
 #[tokio::test]
