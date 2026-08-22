@@ -114,3 +114,18 @@ fn certificate_fixture_deserializes() {
     assert!(cert.certificate.contains("BEGIN CERTIFICATE"));
     assert_eq!(cert.expiration_time, 1999999999);
 }
+
+#[test]
+fn certificate_response_rejects_a_string_expiration_time() {
+    let json = r#"{ "Certificate": "-----BEGIN CERTIFICATE-----", "ExpirationTime": "never" }"#;
+    assert!(
+        serde_json::from_str::<CertificateResponse>(json).is_err(),
+        "ExpirationTime as a string must fail to parse, not silently become garbage"
+    );
+}
+
+#[test]
+fn logical_servers_response_rejects_truncated_json() {
+    let truncated = &SERVERS_FIXTURE[..SERVERS_FIXTURE.len() / 2];
+    assert!(serde_json::from_str::<LogicalServersResponse>(truncated).is_err());
+}
