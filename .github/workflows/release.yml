@@ -100,10 +100,28 @@ jobs:
           cp README.md CHANGELOG.md LICENSE "$name/"
           tar czf "$name.tar.gz" "$name"
 
+      # `gratis update` (src/update.rs) refuses to install a release whose tarball doesn't carry
+      # a valid detached Ed25519 signature from this key — without it, a compromised GitHub
+      # account/release/CDN could hand back an arbitrary binary and the client would run it. The
+      # private key lives only in this repo's `RELEASE_SIGNING_KEY` secret; the matching public
+      # key is embedded in `src/update.rs`'s `RELEASE_SIGNING_PUBLIC_KEY`. `-rawin` signs the
+      # tarball bytes directly (Ed25519 hashes internally) — no separate digest step needed.
+      - name: Sign release tarball
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          name="gratis-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          key_file="$(mktemp)"
+          printf '%s' "$RELEASE_SIGNING_KEY" > "$key_file"
+          openssl pkeyutl -sign -inkey "$key_file" -rawin -in "$name.tar.gz" -out "$name.tar.gz.sig"
+          rm -f "$key_file"
+
       - uses: actions/upload-artifact@v7
         with:
           name: gratis-${{ matrix.target }}
-          path: gratis-*.tar.gz
+          path: |
+            gratis-*.tar.gz
+            gratis-*.tar.gz.sig
           retention-days: 1
 
   release:
@@ -137,6 +155,8 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           body_path: RELEASE_NOTES.md
-          files: dist/*.tar.gz
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sig
           # Pre-1.0 and pre-release tags are marked as such.
           prerelease: ${{ contains(github.ref_name, '-') }}

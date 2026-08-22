@@ -180,7 +180,10 @@ async fn resolve_target(target: &str) -> io::Result<SocketAddr> {
     })?;
     // RFC 3986 requires bracketing an IPv6 literal when it's paired with a port, e.g.
     // `[::1]:443` — strip the brackets before resolving, since lookup_host/getaddrinfo reject them.
-    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     let mut addrs = tokio::net::lookup_host((host, port)).await?;
     addrs
         .next()
