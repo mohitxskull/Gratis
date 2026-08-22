@@ -4,6 +4,51 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-08-22
+
+### Added
+
+- Add HTTP CONNECT proxy support (`gratis up --http-proxy`)
+
+### Changed
+
+- Share one systemd unit-file parser instead of two
+- Split the 1788-line manager.rs god module into submodules
+- Share AtCapacity classification and DNS resolution across proxy front ends
+- Delete dead find_servers/get_fastest_server/from_seed
+- Share HealthStatus/UpdateStatus DTOs instead of re-declaring them
+- Add targeted ProtonError variants for the genuinely distinct cases
+- Named constants, per-attempt connect timeout, lock-ordering doc
+
+### Documentation
+
+- Document --http-proxy, the manager/ split, and update signing
+
+### Fixed
+
+- Address ultrareview findings on HTTP CONNECT and status reporting
+- Re-authenticate the daemon before its token/certificate expires
+- No panics on reqwest builder failure; guard connection counters
+- Move blocking keychain/fs calls off the daemon's async runtime
+- Stop leaking response bodies in errors, add update timeouts, log fallback
+- Quote the ExecStart binary path in generated systemd units
+- Stage gratis update downloads in a private, unpredictable work dir
+- Abort old listeners on re-login instead of leaking them
+
+### Security
+
+- Verify Ed25519 signatures on gratis update before installing
+- Add X-Content-Type-Options and a CSP to the control API
+- Zeroize credential material on drop
+
+### Testing
+
+- Cover the SRP server-proof MITM guard and tampered-modulus rejection
+- Cover the upstream-connection-refused path in both relay front ends
+- Wire up the previously-dead auth_info.json/auth_response.json fixtures
+- Add negative DTO-parse assertions
+- Fail loudly instead of silently on proxy test-setup failures
+
 ## [0.5.3] — 2026-08-20
 
 ### Added
