@@ -195,8 +195,7 @@ pub async fn run() -> Result<UpdateOutcome> {
     verify_signature(&bytes, &sig_bytes)?;
 
     print_progress("gratis: installing...");
-    let work_dir = std::env::temp_dir().join(format!("gratis-update-{}", std::process::id()));
-    std::fs::create_dir_all(&work_dir)?;
+    let work_dir = create_private_work_dir()?;
     let tarball_path = work_dir.join(&asset.name);
     std::fs::write(&tarball_path, &bytes)?;
 
@@ -303,6 +302,23 @@ fn find_binary(work_dir: &Path, asset_name: &str) -> Result<std::path::PathBuf> 
     }
 }
 
+/// Create a private (`0700`), unpredictably-named work dir for staging the downloaded tarball
+/// and its extracted contents. `std::env::temp_dir()` (typically `/tmp`) is world-readable and
+/// sticky, and the old `gratis-update-<pid>` name was guessable from `ps` — a local attacker
+/// could read the in-flight download or race the directory's creation. The tarball's contents
+/// are already verified (`verify_signature`, above) before anything is written here, so this is
+/// defense-in-depth rather than the primary safeguard.
+fn create_private_work_dir() -> Result<std::path::PathBuf> {
+    let mut suffix = [0u8; 8];
+    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut suffix);
+    let suffix: String = suffix.iter().map(|b| format!("{b:02x}")).collect();
+    let name = format!("gratis-update-{suffix}");
+    let work_dir = std::env::temp_dir().join(name);
+    std::fs::create_dir(&work_dir)?;
+    std::fs::set_permissions(&work_dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(work_dir)
+}
+
 /// Replace the currently-running binary's file. Writes the new binary next to the current
 /// one and renames over it — a rename within the same directory is atomic on Linux, so a
 /// process that's still running the old binary (its inode stays open) or a concurrent `gratis`
@@ -319,6 +335,20 @@ fn replace_running_binary(new_binary: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_private_work_dir_is_owner_only_and_unpredictable() {
+        let a = create_private_work_dir().unwrap();
+        let b = create_private_work_dir().unwrap();
+
+        assert_ne!(a, b, "each call must get a fresh, unpredictable name");
+
+        let mode = std::fs::metadata(&a).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "work dir must not be readable by other users");
+
+        std::fs::remove_dir_all(&a).unwrap();
+        std::fs::remove_dir_all(&b).unwrap();
+    }
 
     #[test]
     fn triple_for_arch_covers_the_two_release_targets() {
