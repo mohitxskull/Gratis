@@ -22,10 +22,11 @@ const ED25519_SPKI_PREFIX: [u8; 12] = [
     0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x03, 0x21, 0x00,
 ];
 
-/// A freshly (or previously) generated client WireGuard/certificate identity.
+/// A freshly generated client WireGuard/certificate identity. `client::issue_credentials`
+/// generates a new one on every login (fresh SRP or session resume alike) — there is no restore
+/// path from a persisted seed, even though `VPNCredentials::ed25519_seed_b64` is itself stored.
 pub struct ClientIdentity {
-    /// Raw 32-byte ed25519 seed. Persisted so the same identity (and therefore the same
-    /// WireGuard keypair) can be reused across logins instead of minting a new device each time.
+    /// Raw 32-byte ed25519 seed.
     pub ed25519_seed: [u8; 32],
 }
 
@@ -36,11 +37,6 @@ impl ClientIdentity {
         Self {
             ed25519_seed: signing_key.to_bytes(),
         }
-    }
-
-    /// Reconstruct a previously generated identity from its persisted seed.
-    pub fn from_seed(seed: [u8; 32]) -> Self {
-        Self { ed25519_seed: seed }
     }
 
     fn signing_key(&self) -> SigningKey {

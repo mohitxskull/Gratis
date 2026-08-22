@@ -321,55 +321,6 @@ impl ProtonVPNClient {
     pub async fn fetch_account_info(&self) -> Result<VPNSettings> {
         self.get("/vpn/v2").await
     }
-
-    /// Find servers matching criteria, lowest load first. Pure (operates on `server_list`).
-    pub fn find_servers(
-        &self,
-        country: Option<&str>,
-        city: Option<&str>,
-        feature: Option<&str>,
-        user_tier: i32,
-    ) -> Vec<VPNServer> {
-        let mut results: Vec<VPNServer> = self
-            .server_list
-            .iter()
-            .filter(|s| {
-                if s.tier > user_tier {
-                    return false;
-                }
-                if let Some(c) = country
-                    && !s.country_code.eq_ignore_ascii_case(c)
-                {
-                    return false;
-                }
-                if let Some(ci) = city
-                    && !s
-                        .city
-                        .as_deref()
-                        .is_some_and(|x| x.eq_ignore_ascii_case(ci))
-                {
-                    return false;
-                }
-                if let Some(f) = feature
-                    && !s.features.iter().any(|x| x.eq_ignore_ascii_case(f))
-                {
-                    return false;
-                }
-                true
-            })
-            .cloned()
-            .collect();
-        results.sort_by(|a, b| a.load.partial_cmp(&b.load).unwrap());
-        results
-    }
-
-    /// Lowest-load server across the whole list.
-    pub fn get_fastest_server(&self) -> Option<VPNServer> {
-        self.server_list
-            .iter()
-            .min_by(|a, b| a.load.partial_cmp(&b.load).unwrap())
-            .cloned()
-    }
 }
 
 /// Whether an `/auth` (or `/auth/refresh`) response's `Scopes` list means 2FA still needs to

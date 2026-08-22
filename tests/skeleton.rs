@@ -1,6 +1,0 @@
-#[test]
-fn empty_client_has_no_fastest_server() {
-    let client = gratis::client::ProtonVPNClient::new("user@example.com").unwrap();
-    assert!(client.server_list.is_empty());
-    assert!(client.get_fastest_server().is_none());
-}

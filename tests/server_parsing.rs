@@ -1,11 +1,8 @@
-//! Server-list parsing + `find_servers` filtering/sorting tests (Task 02, updated after
-//! live-account verification found the original `/vpn/v1/servers` flat-shape model was wrong
-//! — see `models.rs` doc comments).
+//! Server-list parsing tests (Task 02, updated after live-account verification found the
+//! original `/vpn/v1/servers` flat-shape model was wrong — see `models.rs` doc comments).
 //!
 //! No network access is required: these tests deserialize the checked-in fixtures in
-//! `tests/fixtures/` and exercise `ProtonVPNClient::find_servers` (a pure function over
-//! `server_list`) directly.
-use gratis::client::ProtonVPNClient;
+//! `tests/fixtures/`.
 use gratis::models::{
     CertificateResponse, LogicalServersResponse, PhysicalServer, VPNServer, features_to_strings,
 };
@@ -116,49 +113,4 @@ fn certificate_fixture_deserializes() {
 
     assert!(cert.certificate.contains("BEGIN CERTIFICATE"));
     assert_eq!(cert.expiration_time, 1999999999);
-}
-
-fn server(id: &str, country_code: &str, tier: i32, load: f64) -> VPNServer {
-    VPNServer {
-        id: id.into(),
-        name: id.into(),
-        country: country_code.into(),
-        country_code: country_code.into(),
-        city: None,
-        tier,
-        load,
-        features: vec![],
-        status: 1,
-        physical: vec![PhysicalServer {
-            entry_ip: "203.0.113.1".into(),
-            domain: format!("{id}.protonvpn.net"),
-            x25519_public_key: format!("{id}-pubkey"),
-            enabled: true,
-        }],
-    }
-}
-
-/// `find_servers` excludes servers above the caller's tier, excludes servers whose
-/// `country_code` doesn't match, and sorts the remainder ascending by `load`.
-#[test]
-fn find_servers_filters_tier_and_country_and_sorts_by_load() {
-    let mut client = ProtonVPNClient::new("test").unwrap();
-    client.server_list = vec![
-        server("us-1", "US", 0, 42.0),
-        server("us-2", "US", 0, 11.0),
-        server("us-3", "US", 2, 5.0), // tier 2, excluded when user_tier == 0
-        server("nl-1", "NL", 0, 1.0), // wrong country, excluded
-        server("us-4", "US", 0, 20.0),
-    ];
-
-    let results = client.find_servers(Some("US"), None, None, 0);
-
-    let ids: Vec<&str> = results.iter().map(|s| s.id.as_str()).collect();
-    assert_eq!(
-        ids,
-        vec!["us-2", "us-4", "us-1"],
-        "must be sorted ascending by load and exclude tier-2/non-US servers"
-    );
-    assert!(results.iter().all(|s| s.tier <= 0));
-    assert!(results.iter().all(|s| s.country_code == "US"));
 }
